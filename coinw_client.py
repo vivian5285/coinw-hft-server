@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# coinw_client.py (高频系统底层引擎 - V2 账户鉴权与余额测试版)
+# coinw_client.py (高频系统底层引擎 - V2.1 合约接口硬核探测版)
 import os
 import time
 import hmac
@@ -20,7 +20,7 @@ class CoinWClient:
         self.api_key = os.getenv("COINW_API_KEY")
         self.secret_key = os.getenv("COINW_SECRET_KEY")
         
-        # CoinW 合约/现货 API 基础域名
+        # CoinW API 基础域名
         self.base_url = "https://api.coinw.com" 
         
         if not self.api_key or not self.secret_key:
@@ -51,36 +51,28 @@ class CoinWClient:
         return params
 
     def get_account_balance(self):
-        """测试获取账户资产信息 (鉴权测试)"""
-        # 注意：这里我们先用一个通用的私有接口进行网络与签名打样探测
-        # 不同交易所的合约和现货私有路径不同，这一步主要是为了验证签名算法是否被 CoinW 认可
-        endpoint = f"{self.base_url}/api/v1/private/account/asset" 
+        """测试获取账户资产信息 (硬核探测版)"""
+        # 探测 CoinW 合约(Swap)账户接口
+        endpoint = f"{self.base_url}/api/v1/private/swap/account" 
         
         params = {}
         signed_params = self._sign_request(params)
         
         try:
-            logger.info("正在携带数字签名请求私有账户数据...")
-            # 私有接口通常需要 POST 请求
-            response = requests.post(endpoint, data=signed_params, timeout=5)
+            logger.info(f"正在探测接口: {endpoint}")
+            # 明确请求头，告诉服务器我们发送的是表单数据
+            headers = {"Content-Type": "application/x-www-form-urlencoded"}
             
-            # 如果 HTTP 状态码不是 200，这行会抛出异常
-            response.raise_for_status() 
-            data = response.json()
+            response = requests.post(endpoint, data=signed_params, headers=headers, timeout=5)
             
-            logger.info(f"[CoinWClient] 交易所返回原始数据: {data}")
-            
-            # 判断鉴权是否成功
-            code = str(data.get("code", ""))
-            if code == "200" or code == "0":
-                logger.info("✅ 鉴权完美通过！我们成功读取到了你的私有账户！")
-            else:
-                logger.warning(f"⚠️ 服务器连通了，但鉴权未通过，请留意返回的错误提示。")
+            # 去掉强硬的报错拦截，直接打印原始状态码和交易所的真实答复
+            logger.info(f"HTTP 状态码: {response.status_code}")
+            logger.info(f"[CoinWClient] 交易所底层原始答复: {response.text}")
                 
-        except requests.exceptions.RequestException as e:
-            logger.error(f"❌ 网络或接口路由请求失败 (可能是路由路径需按合约文档微调): {e}")
+        except Exception as e:
+            logger.error(f"❌ 探测发生严重异常: {e}")
 
 if __name__ == "__main__":
-    logger.info("=== 启动 V2 账户鉴权与余额探测 ===")
+    logger.info("=== 启动 V2.1 合约接口硬核探测 ===")
     client = CoinWClient()
     client.get_account_balance()
