@@ -1,58 +1,35 @@
 #!/usr/bin/env python3
-# coinw_client.py (高频系统底层引擎 - V3 降维打击 CCXT 版)
-import os
-import ccxt
+# coinw_client.py (高频系统底层引擎 - V4 官方原生探路版)
+import requests
 import logging
-from dotenv import load_dotenv
-
-# 自动加载隐藏的 .env 文件
-load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 class CoinWClient:
     def __init__(self):
-        api_key = os.getenv("COINW_API_KEY")
-        secret_key = os.getenv("COINW_SECRET_KEY")
+        # 基础 URL 完全对齐你找出的官方文档
+        self.base_url = "https://api.coinw.com" 
+
+    def test_public_endpoint(self):
+        """测试官方文档中的公共合约接口"""
+        endpoint = f"{self.base_url}/api/v1/perpum/instruments" 
         
-        if not api_key or not secret_key:
-            logger.error("❌ 未读取到 COINW_API_KEY 或 COINW_SECRET_KEY，请检查 .env 文件！")
-            return
-
-        # 使用 CCXT 实例化 CoinW 引擎
-        self.exchange = ccxt.coinw({
-            'apiKey': api_key,
-            'secret': secret_key,
-            'enableRateLimit': True, # 开启自动防封禁限频保护
-            'options': {
-                'defaultType': 'swap', # 核心：直接把枪口锁定为合约(Swap)账户！
-            }
-        })
-        logger.info("✅ 成功加载 CCXT 跨平台量化引擎 (CoinW 模块)！")
-
-    def get_account_balance(self):
-        """测试获取合约账户资产信息"""
         try:
-            logger.info("正在通过 CCXT 请求 CoinW 合约真实余额...")
-            # fetch_balance() 会自动处理一切复杂的签名和正确的路由解析
-            balance = self.exchange.fetch_balance()
+            logger.info(f"正在探测官方合约公共接口: {endpoint}")
+            response = requests.get(endpoint, timeout=5)
+            logger.info(f"HTTP 状态码: {response.status_code}")
             
-            # 提取 USDT 可用余额与总余额
-            usdt_free = balance.get('USDT', {}).get('free', 0.0)
-            usdt_total = balance.get('USDT', {}).get('total', 0.0)
-            
-            logger.info(f"🎉 成功打通！当前合约账户 USDT 可用余额: {usdt_free}")
-            logger.info(f"💰 当前合约账户 USDT 总权益: {usdt_total}")
-            
-            return usdt_free
+            # 如果成功，打印前 500 个字符看看长什么样
+            if response.status_code == 200:
+                logger.info(f"✅ 成功获取合约市场数据: {response.text[:500]}...")
+            else:
+                logger.error(f"❌ 请求失败: {response.text}")
                 
-        except ccxt.AuthenticationError as e:
-            logger.error(f"❌ 鉴权失败 (API Key 错误或未开放合约权限): {e}")
         except Exception as e:
             logger.error(f"❌ 探测发生严重异常: {e}")
 
 if __name__ == "__main__":
-    logger.info("=== 启动 V3 引擎降维探测 ===")
+    logger.info("=== 启动 V4 官方原生探路 ===")
     client = CoinWClient()
-    client.get_account_balance()
+    client.test_public_endpoint()
