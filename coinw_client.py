@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# coinw_client.py (高频系统底层引擎 - V6 交易执行版)
+# coinw_client.py (高频系统底层引擎 - V6.1 完美市价破解版)
 import os
 import time
 import hmac
@@ -96,7 +96,10 @@ class CoinWClient:
             "quantityUnit": "0",  # 0代表按 USDT 金额开仓
             "quantity": str(usdt_amount),
             "positionModel": "1", # 1: 全仓模式
-            "positionType": "plan"
+            "positionType": "plan",
+            # 【V6.1 破解补丁】：明确声明为市价单
+            "type": "market",
+            "openPrice": "0"      # 价格传0代表市价全吃
         }
         return self._request("POST", api_url, params)
 
@@ -117,8 +120,8 @@ if __name__ == "__main__":
     
     # --- ⚠️ 以下为实盘资金操作测试区 ---
     
-    # 【测试动作 2】：极小额开仓测试 (将前面 # 删掉即可执行)
-    # client.place_market_order("ETH", "long", 10.0, leverage=5)
+    # 【测试动作 2】：极小额开仓测试 (目前已开启！)
+    client.place_market_order("ETH", "long", 10.0, leverage=5)
     
-    # 【测试动作 3】：一键全平测试 (将前面 # 删掉即可执行)
+    # 【测试动作 3】：一键全平测试 (目前被注释保护中)
     # client.close_all_positions("ETH")
