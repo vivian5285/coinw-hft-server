@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# coinw_client.py (高频系统底层引擎 - V5 官方底层逻辑直连版)
+# coinw_client.py (高频系统底层引擎 - V6 交易执行版)
 import os
 import time
 import hmac
@@ -26,24 +26,21 @@ class CoinWClient:
             logger.error("❌ 未读取到 COINW_API_KEY 或 COINW_SECRET_KEY！")
 
     def _request(self, method: str, api_url: str, params: dict = None):
-        """完全按照官方 Python 示例重构的核心加密与请求发射器"""
+        """核心加密与请求发射器"""
         if params is None:
             params = {}
 
-        # 1. 生成时间戳
         timestamp = str(int(time.time() * 1000))
         request_url = f"{self.base_url}{api_url}"
 
-        # 2. 拼接加密前置字符串 (要求极度严苛，包含时间戳、方法和路径)
+        # 严格的拼接规则
         if method.upper() == "GET":
-            # GET 方法的参数必须用 & 拼接
             query_params = "&".join(f"{key}={value}" for key, value in params.items() if value is not None)
             encoded_params = f"{timestamp}{method.upper()}{api_url}?{query_params}" if query_params else f"{timestamp}{method.upper()}{api_url}"
         else:
-            # POST/DELETE/PUT 方法必须把参数转为 JSON 字符串拼接
             encoded_params = f"{timestamp}{method.upper()}{api_url}{json.dumps(params)}"
 
-        # 3. 生成 HMAC SHA256 并进行 Base64 编码 (破案核心)
+        # 终极 Base64 + HMAC-SHA256 加密
         signature = base64.b64encode(
             hmac.new(
                 bytes(self.sec_key, 'utf-8'), 
@@ -52,7 +49,6 @@ class CoinWClient:
             ).digest()
         ).decode("US-ASCII")
 
-        # 4. 组装请求头
         headers = {
             "sign": signature,
             "api_key": self.api_key,
@@ -62,14 +58,15 @@ class CoinWClient:
         if method.upper() in ["POST", "DELETE", "PUT"]:
             headers["Content-type"] = "application/json"
 
-        # 5. 发送最终请求
         try:
+            # 发送请求
             if method.upper() == "GET":
                 response = requests.get(request_url, params=params, headers=headers, timeout=5)
             elif method.upper() == "POST":
                 response = requests.post(request_url, data=json.dumps(params), headers=headers, timeout=5)
+            elif method.upper() == "DELETE":
+                response = requests.delete(request_url, data=json.dumps(params), headers=headers, timeout=5)
             
-            # 成功或失败，都将交易所的回答打印出来
             logger.info(f"HTTP 状态码: {response.status_code}")
             logger.info(f"交易所底层原始答复: {response.text}")
             
@@ -83,12 +80,45 @@ class CoinWClient:
             return None
 
     def get_account_balance(self):
-        """获取合约账户资产 (使用最新的绝密门牌号)"""
-        logger.info("=== 准备携带终极签名请求合约账户资产 ===")
-        # 绝密路由：获取合约账户资产
+        """获取合约账户资产"""
+        logger.info("=== 准备请求合约账户资产 ===")
         api_url = "/v1/perpum/account/getUserAssets"
         return self._request("GET", api_url)
 
+    def place_market_order(self, symbol: str, direction: str, usdt_amount: float, leverage: int = 5):
+        """极速市价开仓扳机"""
+        logger.info(f"=== 准备发射开仓指令: {symbol} {direction} 本金:{usdt_amount}U 杠杆:{leverage}X ===")
+        api_url = "/v1/perpum/order"
+        params = {
+            "instrument": symbol.lower(),
+            "direction": direction.lower(), 
+            "leverage": str(leverage),
+            "quantityUnit": "0",  # 0代表按 USDT 金额开仓
+            "quantity": str(usdt_amount),
+            "positionModel": "1", # 1: 全仓模式
+            "positionType": "plan"
+        }
+        return self._request("POST", api_url, params)
+
+    def close_all_positions(self, symbol: str = "eth"):
+        """一键极速全平扳机"""
+        logger.info(f"=== 触发紧急撤退！正在市价全平 {symbol} ===")
+        api_url = "/v1/perpum/allpositions"
+        params = {
+            "instrument": symbol.lower()
+        }
+        return self._request("DELETE", api_url, params)
+
 if __name__ == "__main__":
     client = CoinWClient()
+    
+    # 【测试动作 1】：获取余额 (安全，不花钱)
     client.get_account_balance()
+    
+    # --- ⚠️ 以下为实盘资金操作测试区 ---
+    
+    # 【测试动作 2】：极小额开仓测试 (将前面 # 删掉即可执行)
+    # client.place_market_order("ETH", "long", 10.0, leverage=5)
+    
+    # 【测试动作 3】：一键全平测试 (将前面 # 删掉即可执行)
+    # client.close_all_positions("ETH")
