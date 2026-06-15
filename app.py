@@ -1,47 +1,46 @@
-#!/usr/bin/env python3
-# app.py (CoinW 高频网关通讯塔 - 5002 端口)
 from flask import Flask, request, jsonify
-import os
-import threading
-import logging
-from dotenv import load_dotenv
-
-# 接入刚刚写好的交易大脑
-from position_supervisor import SignalProcessor
-
-load_dotenv()
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+# 导入我们两个独立的大脑
+from position_supervisor_coinw import SignalProcessor as CoinWProcessor
+from position_supervisor_binance import SignalProcessor as BinanceProcessor
 
 app = Flask(__name__)
 
-# 从 .env 读取你的专属防伪秘钥 (528586)
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
-processor = SignalProcessor()
+# 初始化大脑实例 (保持它们在内存中常驻，实现高频响应)
+coinw_bot = CoinWProcessor()
+binance_bot = BinanceProcessor()
+
+# ⚠️ 务必在这里配置你的统一密钥，用于验证 TV 的合法性
+SECRET_KEY = "528586" 
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
+    # 1. 解析 JSON 数据
     data = request.json
     if not data:
-        return jsonify({"status": "error", "message": "空负载"}), 400
+        return "Empty Payload", 400
 
-    # 1. 验证 TradingView 身份
-    if str(data.get("secret")) != str(WEBHOOK_SECRET):
-        logger.warning("⚠️ 收到非法 Webhook 请求，秘钥不匹配，已拦截！")
-        return jsonify({"status": "error", "message": "未授权"}), 401
+    # 2. 身份校验 (安全第一)
+    if data.get("secret") != SECRET_KEY:
+        return "Unauthorized: Wrong Secret", 401
 
-    action = data.get("action", "").upper()
-    logger.info(f"🚨 [网关] 成功接收 TV 信号: {action}")
-
-    # 2. 开启异步线程让大脑去处理交易，网关立刻给 TV 回复 200 OK，确保极速响应
-    threading.Thread(target=processor.process_signal, args=(data,)).start()
-
-    return jsonify({"status": "success", "message": "信号已接收并下发执行"}), 200
-
-@app.route('/health', methods=['GET'])
-def health_check():
-    return "CoinW HFT Gateway is running perfectly", 200
+    # 3. 路由分发 (分流逻辑)
+    platform = data.get("platform", "").upper() # TV 警报里需包含 "platform":"COINW"
+    
+    try:
+        if platform == "COINW":
+            coinw_bot.process_signal(data)
+            return jsonify({"status": "success", "platform": "CoinW"}), 200
+        
+        elif platform == "BINANCE":
+            binance_bot.process_signal(data)
+            return jsonify({"status": "success", "platform": "Binance"}), 200
+        
+        else:
+            return f"Unknown Platform: {platform}", 400
+            
+    except Exception as e:
+        return f"Internal Server Error: {str(e)}", 500
 
 if __name__ == '__main__':
-    logger.info("=== 🚀 CoinW 高频网关启动 (监听端口: 5002) ===")
+    # 生产环境我们用 Gunicorn，这里仅用于本地调试
     app.run(host='0.0.0.0', port=5002)
