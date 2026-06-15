@@ -50,3 +50,4 @@ fi
 
 echo -e "${GREEN}=== ✅ 全域部署完成，系统已进入全自动交易模式 ===${NC}"
 echo "输入 tail -f gateway.log 或 supervisor.log 查看运行状态。"
+0 * * * * /root/deploy_manager.sh >> /root/system_cron.log 2>&1
