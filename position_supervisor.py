@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# position_supervisor.py (V11 绝对执行版 - 拒绝加仓，单向净持仓)
+# position_supervisor.py (V12 绝对信号驱动 - 深度契合TV版)
 import logging
 import time
 import threading
@@ -15,52 +15,58 @@ class SignalProcessor:
         self.client = CoinWClient()
         self.leverage = 5
         self.symbol = "ETH"
-        # 启动 WebSocket 监控 (作为系统的备用观察者，不再作为主动决策者)
         self.start_websocket_monitor()
 
     def start_websocket_monitor(self):
+        """仅做辅助风控，绝对不干预TV的高优先指令"""
         def run_ws():
             ws = websocket.WebSocketApp(
                 "wss://ws.futurescw.com/perpum",
-                on_message=lambda ws, msg: logger.debug(f"监控信息: {msg}"),
+                on_message=self.on_ws_message,
                 on_close=lambda ws: time.sleep(5) or run_ws()
             )
             ws.run_forever()
         threading.Thread(target=run_ws, daemon=True).start()
 
+    def on_ws_message(self, ws, message):
+        # 仅在极端情况下自动平仓（例如单笔亏损超过 20%），平时一切听TV的
+        data = json.loads(message)
+        if data.get("type") == "position_change":
+            profit = float(data.get("data", {}).get("profit", 0))
+            if profit <= -50.0: # 极端熔断
+                logger.warning(f"🚨 触发极端熔断保护: {profit}U")
+                self.safe_close()
+
     def safe_close(self, retries=3):
-        """强制平仓，最高优先级"""
+        """强制全平，无视任何盈亏状态"""
         for i in range(retries):
             res = self.client.close_all_positions(self.symbol)
             if res and res.get("code") == 0:
-                logger.info("✅ 已执行绝对平仓指令")
+                logger.info("✅ 强制平仓指令已执行")
                 return True
             time.sleep(1)
         return False
 
-    def get_dynamic_amount(self):
-        assets = self.client.get_account_balance()
-        balance = float(assets.get("data", {}).get("availableUsdt", 10.0))
-        return balance * 0.8
-
     def process_signal(self, payload):
-        """绝对执行逻辑：任何信号即平仓"""
+        """绝对执行TV指令逻辑"""
         action = payload.get("action", "").upper()
         logger.info(f"⚡ 接收 TV 绝对信号: {action}")
         
         try:
-            # 1. 不管是 LONG, SHORT 还是 CLOSE，第一步永远是彻底清仓
-            # 这保证了“不同向加仓”，彻底抹除旧单
+            # 【核心逻辑】：收到任何TV指令，第一步永远是先平旧仓
             self.safe_close()
             time.sleep(0.5)
             
-            # 2. 如果信号是开仓，则根据新信号开单
+            # 【核心逻辑】：CLOSE信号到此结束，LONG/SHORT则执行刷新
             if action in ["LONG", "SHORT"]:
-                amount = self.get_dynamic_amount()
-                logger.info(f"⚖️ 执行开仓: {action} (规模: {amount:.2f}U)")
+                assets = self.client.get_account_balance()
+                balance = float(assets.get("data", {}).get("availableUsdt", 10.0))
+                amount = balance * 0.8
+                
+                logger.info(f"⚖️ 执行刷新式开单: {action} (本金: {amount:.2f}U)")
                 self.client.place_market_order(self.symbol, action, amount, self.leverage)
             else:
-                logger.info("✅ 信号为 CLOSE，已完成清仓，保持空仓状态")
+                logger.info("✅ CLOSE 信号执行完毕，系统保持空仓")
                 
         except Exception as e:
             logger.error(f"❌ 绝对指令执行异常: {e}")
