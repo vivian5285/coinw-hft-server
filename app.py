@@ -1,46 +1,36 @@
 from flask import Flask, request, jsonify
-# 导入我们两个独立的大脑
+# 直接导入对应币赢的大脑，确保逻辑完全隔离
 from position_supervisor_coinw import SignalProcessor as CoinWProcessor
-from position_supervisor_binance import SignalProcessor as BinanceProcessor
 
 app = Flask(__name__)
 
-# 初始化大脑实例 (保持它们在内存中常驻，实现高频响应)
+# 初始化币赢的大脑实例
 coinw_bot = CoinWProcessor()
-binance_bot = BinanceProcessor()
 
-# ⚠️ 务必在这里配置你的统一密钥，用于验证 TV 的合法性
-SECRET_KEY = "528586" 
+# TV 警报的统一安全密钥
+SECRET_KEY = "528586"
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    # 1. 解析 JSON 数据
+    # 1. 安全校验
     data = request.json
-    if not data:
-        return "Empty Payload", 400
+    if not data or data.get("secret") != SECRET_KEY:
+        return "Unauthorized", 401
 
-    # 2. 身份校验 (安全第一)
-    if data.get("secret") != SECRET_KEY:
-        return "Unauthorized: Wrong Secret", 401
-
-    # 3. 路由分发 (分流逻辑)
-    platform = data.get("platform", "").upper() # TV 警报里需包含 "platform":"COINW"
-    
+    # 2. 信号处理
+    # 因为这个 app.py 专门部署在 5002 端口，处理币赢流量
+    # 所以不需要额外的 platform 判断，进来的一律交给 coinw_bot
     try:
-        if platform == "COINW":
-            coinw_bot.process_signal(data)
-            return jsonify({"status": "success", "platform": "CoinW"}), 200
-        
-        elif platform == "BINANCE":
-            binance_bot.process_signal(data)
-            return jsonify({"status": "success", "platform": "Binance"}), 200
-        
-        else:
-            return f"Unknown Platform: {platform}", 400
-            
+        coinw_bot.process_signal(data)
+        return jsonify({"status": "success", "msg": "CoinW Order Processed"}), 200
     except Exception as e:
-        return f"Internal Server Error: {str(e)}", 500
+        return jsonify({"status": "error", "msg": str(e)}), 500
+
+@app.route('/health', methods=['GET'])
+def health():
+    # 给 deploy_check.sh 用的健康检测接口
+    return "healthy", 200
 
 if __name__ == '__main__':
-    # 生产环境我们用 Gunicorn，这里仅用于本地调试
-    app.run(host='0.0.0.0', port=5002)
+    # 注意：生产环境使用 Gunicorn 启动
+    app.run(host='127.0.0.1', port=5002)
