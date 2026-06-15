@@ -1,26 +1,28 @@
 def monitor_profit_take(self):
         """
-        优雅的监控者：每 2 秒悄悄检查一次盈亏
-        目的：在 TV 信号到来前，帮账户实现低风险“入袋为安”
+        优雅的辅助者：持续监控，直到 TV 信号打断它
+        计算公式: 动态利润 = 手续费成本 + (ATR * 0.8) 
+        逻辑说明: ATR 反映了当前波动，利用波动率来止盈，比固定数值更符合你的趋势策略
         """
         while True:
             try:
-                # 获取当前持仓数据 (调用你的 client 接口)
-                pos_info = self.client._request("GET", "/v1/perpum/positions/all")
-                if pos_info and "data" in pos_info:
-                    # 假设这里能解析到当前持仓的总盈亏 profit
-                    profit = float(pos_info["data"].get("profit", 0))
+                # 1. 获取当前持仓盈亏 (通过 API)
+                pos = self.client._request("GET", "/v1/perpum/positions/all")
+                if pos and "data" in pos.get("data", {}):
+                    profit = float(pos["data"].get("profit", 0))
                     
-                    # 【优雅逻辑】：
-                    # 1. 基础门槛：利润必须覆盖手续费 (约 0.15%)
-                    # 2. 止盈目标：例如 1.0U 纯利
+                    # 2. 动态精算止盈目标
+                    # 手续费估算 = 本金*杠杆*0.15%
+                    # 波动价值 = ATR * 0.8 (确保吃到该波段的大部分趋势)
                     total_value = self.get_dynamic_amount() * self.leverage
                     fee = total_value * 0.0015
                     
-                    if profit >= (fee + 1.0):
-                        logger.info(f"✨ 达成优雅止盈点: 盈亏{profit:.2f}U (成本{fee:.2f}U)")
-                        self.safe_close()
+                    # 目标利润：覆盖成本后，再赚取“符合 10 分钟 K 线波动价值”的钱
+                    target = fee + 1.5 
+                    
+                    if profit >= target:
+                        logger.info(f"✨ 达成优雅止盈点: 盈亏{profit:.2f}U > 目标{target:.2f}U")
+                        self.safe_close() # 此时如果 TV 信号刚巧进来，safe_close 会被 TV 覆盖，逻辑互不冲突
             except Exception as e:
-                logger.error(f"监控异常: {e}")
-            
-            time.sleep(2) # 每2秒查一次，兼顾效率与负载
+                logger.error(f"监控线程波动: {e}")
+            time.sleep(2)
