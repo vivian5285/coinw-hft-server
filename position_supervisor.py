@@ -1,28 +1,42 @@
-def monitor_profit_take(self):
-        """
-        优雅的辅助者：持续监控，直到 TV 信号打断它
-        计算公式: 动态利润 = 手续费成本 + (ATR * 0.8) 
-        逻辑说明: ATR 反映了当前波动，利用波动率来止盈，比固定数值更符合你的趋势策略
-        """
-        while True:
-            try:
-                # 1. 获取当前持仓盈亏 (通过 API)
-                pos = self.client._request("GET", "/v1/perpum/positions/all")
-                if pos and "data" in pos.get("data", {}):
-                    profit = float(pos["data"].get("profit", 0))
-                    
-                    # 2. 动态精算止盈目标
-                    # 手续费估算 = 本金*杠杆*0.15%
-                    # 波动价值 = ATR * 0.8 (确保吃到该波段的大部分趋势)
-                    total_value = self.get_dynamic_amount() * self.leverage
-                    fee = total_value * 0.0015
-                    
-                    # 目标利润：覆盖成本后，再赚取“符合 10 分钟 K 线波动价值”的钱
-                    target = fee + 1.5 
-                    
-                    if profit >= target:
-                        logger.info(f"✨ 达成优雅止盈点: 盈亏{profit:.2f}U > 目标{target:.2f}U")
-                        self.safe_close() # 此时如果 TV 信号刚巧进来，safe_close 会被 TV 覆盖，逻辑互不冲突
-            except Exception as e:
-                logger.error(f"监控线程波动: {e}")
-            time.sleep(2)
+class SignalProcessor:
+    def __init__(self):
+        self.client = CoinWClient()
+        self.status = "EMPTY"  # 状态锁：EMPTY, HOLDING, CLOSED
+        # ... 其他初始化 ...
+
+    def safe_close(self, reason=""):
+        """带状态锁的平仓"""
+        if self.status == "EMPTY": # 如果已经是空仓，直接静默
+            return True
+            
+        res = self.client.close_all_positions(self.symbol)
+        if res and res.get("code") == 0:
+            self.status = "EMPTY" # 平仓后解锁
+            logger.info(f"✅ 执行平仓成功 (原因: {reason})")
+            return True
+        return False
+
+    def on_ws_message(self, ws, message):
+        """自动止盈监控"""
+        # ... 解析利润 ...
+        if profit >= target_profit: # 这里 target_profit 设为你想要的 3U-5U
+            logger.info(f"💰 目标{target_profit}U 达成，执行止盈")
+            if self.safe_close(reason="系统止盈"):
+                self.status = "CLOSED" # 标记为已止盈
+
+    def process_signal(self, payload):
+        action = payload.get("action", "").upper()
+        
+        # 【状态对齐逻辑】
+        if action == "CLOSE":
+            if self.status == "CLOSED": # 如果系统已经止盈，这里保持静默
+                logger.info("ℹ️ 收到 CLOSE 指令，但系统已提前止盈，保持静默")
+                self.status = "EMPTY" # 重置锁
+                return
+            self.safe_close(reason="TV 指令")
+            self.status = "EMPTY"
+        
+        elif action in ["LONG", "SHORT"]:
+            self.safe_close(reason="TV 换向")
+            # ... 执行开仓 ...
+            self.status = "HOLDING"
