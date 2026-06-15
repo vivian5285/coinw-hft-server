@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# position_supervisor.py (V7 高频终极自动化版)
+# position_supervisor.py (V8 终极强化版 - 带重试、重连、精算逻辑)
 import logging
 import time
 import threading
@@ -16,35 +16,47 @@ class SignalProcessor:
         self.trade_amount = 10.0
         self.leverage = 5
         self.symbol = "ETH"
-        # 启动 WebSocket 监听耳目
         self.start_websocket_monitor()
 
     def start_websocket_monitor(self):
-        """开启 WebSocket 盈亏监听，时刻守候平仓良机"""
-        def on_message(ws, message):
-            data = json.loads(message)
-            # 监听持仓频道，当盈亏达到目标即触发
-            if data.get("type") == "position_change":
-                profit = data.get("data", {}).get("profit") 
-                if profit and float(profit) >= 2.0: # 目标利润 2U
-                    logger.info(f"💰 触发自动止盈: 当前盈亏 {profit}U")
-                    self.client.close_all_positions(self.symbol)
+        """带自动重连机制的 WebSocket 守护进程"""
+        def run_ws():
+            ws = websocket.WebSocketApp(
+                "wss://ws.futurescw.com/perpum",
+                on_message=self.on_ws_message,
+                on_close=lambda ws: (logger.warning("⚠️ WS 断开，5秒后重连..."), time.sleep(5), run_ws()),
+                on_error=lambda ws, e: logger.error(f"❌ WS 异常: {e}")
+            )
+            ws.run_forever()
+        
+        threading.Thread(target=run_ws, daemon=True).start()
 
-        # 启动后台线程监听盈亏
-        ws = websocket.WebSocketApp("wss://ws.futurescw.com/perpum", on_message=on_message)
-        threading.Thread(target=ws.run_forever, daemon=True).start()
-        logger.info("👂 高频耳目已开启，实时监控中...")
+    def on_ws_message(self, ws, message):
+        data = json.loads(message)
+        if data.get("type") == "position_change":
+            profit = float(data.get("data", {}).get("profit", 0))
+            # 【精算模型】：利润需覆盖手续费 (估算值) + 预期纯利 2U
+            fee_cost = self.trade_amount * self.leverage * 0.0015
+            if profit >= (2.0 + fee_cost):
+                logger.info(f"💰 精算达标: 盈亏{profit}U > 成本{fee_cost:.2f}U, 立即斩仓")
+                self.safe_close()
+
+    def safe_close(self, retries=3):
+        """带重试机制的平仓保护"""
+        for i in range(retries):
+            res = self.client.close_all_positions(self.symbol)
+            if res and res.get("code") == 0:
+                logger.info("✅ 斩仓成功")
+                return
+            logger.warning(f"⚠️ 斩仓失败，第 {i+1} 次重试...")
+            time.sleep(1)
 
     def process_signal(self, payload):
-        """解析 TV 信号并执行"""
+        """解析指令"""
         action = payload.get("action", "").upper()
-        try:
-            if action == "CLOSE":
-                self.client.close_all_positions(self.symbol)
-            elif action in ["LONG", "SHORT"]:
-                # 策略：先全平旧仓，再开新仓，保证单向持仓
-                self.client.close_all_positions(self.symbol)
-                time.sleep(0.5) 
-                self.client.place_market_order(self.symbol, action, self.trade_amount, self.leverage)
-        except Exception as e:
-            logger.error(f"❌ 交易指令执行异常: {e}")
+        if action == "CLOSE":
+            self.safe_close()
+        elif action in ["LONG", "SHORT"]:
+            self.safe_close() # 强制平旧
+            time.sleep(1)
+            self.client.place_market_order(self.symbol, action, self.trade_amount, self.leverage)
