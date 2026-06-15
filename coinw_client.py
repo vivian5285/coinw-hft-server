@@ -119,7 +119,7 @@ if __name__ == "__main__":
     client.get_account_balance()
     
     # 【测试动作 2】：极小额开仓测试
-    client.place_market_order("ETH", "long", 10.0, leverage=5)
+    # client.place_market_order("ETH", "long", 10.0, leverage=5)
     
     # 【测试动作 3】：一键全平测试 (目前被注释保护中)
     # client.close_all_positions("ETH")
