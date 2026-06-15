@@ -1,72 +1,26 @@
-#!/usr/bin/env python3
-# position_supervisor.py (V12 绝对信号驱动 - 深度契合TV版)
-import logging
-import time
-import threading
-import json
-import websocket
-from coinw_client import CoinWClient
-
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
-
-class SignalProcessor:
-    def __init__(self):
-        self.client = CoinWClient()
-        self.leverage = 5
-        self.symbol = "ETH"
-        self.start_websocket_monitor()
-
-    def start_websocket_monitor(self):
-        """仅做辅助风控，绝对不干预TV的高优先指令"""
-        def run_ws():
-            ws = websocket.WebSocketApp(
-                "wss://ws.futurescw.com/perpum",
-                on_message=self.on_ws_message,
-                on_close=lambda ws: time.sleep(5) or run_ws()
-            )
-            ws.run_forever()
-        threading.Thread(target=run_ws, daemon=True).start()
-
-    def on_ws_message(self, ws, message):
-        # 仅在极端情况下自动平仓（例如单笔亏损超过 20%），平时一切听TV的
-        data = json.loads(message)
-        if data.get("type") == "position_change":
-            profit = float(data.get("data", {}).get("profit", 0))
-            if profit <= -50.0: # 极端熔断
-                logger.warning(f"🚨 触发极端熔断保护: {profit}U")
-                self.safe_close()
-
-    def safe_close(self, retries=3):
-        """强制全平，无视任何盈亏状态"""
-        for i in range(retries):
-            res = self.client.close_all_positions(self.symbol)
-            if res and res.get("code") == 0:
-                logger.info("✅ 强制平仓指令已执行")
-                return True
-            time.sleep(1)
-        return False
-
-    def process_signal(self, payload):
-        """绝对执行TV指令逻辑"""
-        action = payload.get("action", "").upper()
-        logger.info(f"⚡ 接收 TV 绝对信号: {action}")
-        
-        try:
-            # 【核心逻辑】：收到任何TV指令，第一步永远是先平旧仓
-            self.safe_close()
-            time.sleep(0.5)
+def monitor_profit_take(self):
+        """
+        优雅的监控者：每 2 秒悄悄检查一次盈亏
+        目的：在 TV 信号到来前，帮账户实现低风险“入袋为安”
+        """
+        while True:
+            try:
+                # 获取当前持仓数据 (调用你的 client 接口)
+                pos_info = self.client._request("GET", "/v1/perpum/positions/all")
+                if pos_info and "data" in pos_info:
+                    # 假设这里能解析到当前持仓的总盈亏 profit
+                    profit = float(pos_info["data"].get("profit", 0))
+                    
+                    # 【优雅逻辑】：
+                    # 1. 基础门槛：利润必须覆盖手续费 (约 0.15%)
+                    # 2. 止盈目标：例如 1.0U 纯利
+                    total_value = self.get_dynamic_amount() * self.leverage
+                    fee = total_value * 0.0015
+                    
+                    if profit >= (fee + 1.0):
+                        logger.info(f"✨ 达成优雅止盈点: 盈亏{profit:.2f}U (成本{fee:.2f}U)")
+                        self.safe_close()
+            except Exception as e:
+                logger.error(f"监控异常: {e}")
             
-            # 【核心逻辑】：CLOSE信号到此结束，LONG/SHORT则执行刷新
-            if action in ["LONG", "SHORT"]:
-                assets = self.client.get_account_balance()
-                balance = float(assets.get("data", {}).get("availableUsdt", 10.0))
-                amount = balance * 0.8
-                
-                logger.info(f"⚖️ 执行刷新式开单: {action} (本金: {amount:.2f}U)")
-                self.client.place_market_order(self.symbol, action, amount, self.leverage)
-            else:
-                logger.info("✅ CLOSE 信号执行完毕，系统保持空仓")
-                
-        except Exception as e:
-            logger.error(f"❌ 绝对指令执行异常: {e}")
+            time.sleep(2) # 每2秒查一次，兼顾效率与负载
