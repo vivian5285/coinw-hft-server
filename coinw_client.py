@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# coinw_client.py（生产版 - 基于下午成功版本）
+# coinw_client.py（生产版 - 修复反向对冲与容错）
 import os
 import time
 import hmac
@@ -10,7 +10,6 @@ import requests
 from dotenv import load_dotenv
 
 load_dotenv()
-
 
 class CoinWClient:
     def __init__(self):
@@ -28,7 +27,6 @@ class CoinWClient:
         timestamp = str(int(time.time() * 1000))
         request_url = f"{self.base_url}{endpoint}"
 
-        # 构造签名
         if method.upper() == "GET":
             query_params = "&".join(f"{k}={v}" for k, v in sorted(params.items()) if v is not None)
             encoded_params = f"{timestamp}{method}{endpoint}?{query_params}" if query_params else f"{timestamp}{method}{endpoint}"
@@ -50,7 +48,7 @@ class CoinWClient:
                 resp = requests.get(request_url, params=params, headers=headers, timeout=10)
             else:
                 headers["Content-type"] = "application/json"
-                resp = requests.post(request_url, data=json.dumps(params), headers=headers, timeout=10)
+                resp = requests.request(method.upper(), request_url, data=json.dumps(params), headers=headers, timeout=10)
             return resp.json()
         except Exception as e:
             return {"code": -1, "msg": str(e)}
@@ -61,7 +59,6 @@ class CoinWClient:
         return self._request("GET", "/v1/perpum/account/available")
 
     def get_available_balance(self):
-        """获取可用 USDT 余额"""
         res = self.get_account_balance()
         try:
             data = res.get("data", {})
@@ -70,7 +67,6 @@ class CoinWClient:
             return 0.0
 
     def get_current_price(self, symbol="ETH"):
-        """获取最新成交价"""
         res = self._request("GET", "/v1/perpumPublic/ticker", {"instrument": symbol})
         try:
             data = res.get("data", [])
@@ -84,43 +80,37 @@ class CoinWClient:
         return self._request("GET", "/v1/perpum/positions", {"instrument": symbol})
 
     def place_market_order(self, symbol, side, amount, leverage=5):
-        """
-        市价开仓（USDT 模式 + 传入 openPrice）
-        amount: USDT 金额
-        """
         current_price = self.get_current_price(symbol)
-        open_price = round(current_price, 2)   # 保留两位小数
+        open_price = round(current_price, 2)
 
-        return self._request("POST", "/v1/perpum/order", {
-            "instrument": symbol,
-            "direction": side.lower(),
-            "quantityUnit": "0",           # 0 = USDT 金额模式
-            "quantity": str(amount),
-            "leverage": str(leverage),
-            "positionModel": "1",
-            "positionType": "plan",
-            "openPrice": str(open_price)   # 传入当前价格（关键）
-        })
-
-    def place_limit_order(self, symbol, side, price, amount):
-        """挂限价止盈单"""
         return self._request("POST", "/v1/perpum/order", {
             "instrument": symbol,
             "direction": side.lower(),
             "quantityUnit": "0",
             "quantity": str(amount),
-            "openPrice": str(price),
-            "leverage": "1",
+            "leverage": str(leverage),
+            "positionModel": "1",
+            "positionType": "plan",
+            "openPrice": str(open_price)
+        })
+
+    def place_limit_order(self, symbol, side, price, amount, leverage=5):
+        """挂限价单 (通过下达反向订单来对冲平仓)"""
+        return self._request("POST", "/v1/perpum/order", {
+            "instrument": symbol,
+            "direction": side.lower(), # 必须是 long 或 short
+            "quantityUnit": "0",       # 维持 USDT 金额模式
+            "quantity": str(amount),
+            "openPrice": str(round(price, 2)),
+            "leverage": str(leverage),
             "positionModel": "1",
             "positionType": "plan"
         })
 
     def close_all_positions(self, symbol="ETH"):
-        """一键全平"""
         self.cancel_all_open_orders(symbol)
         time.sleep(0.5)
         return self._request("DELETE", "/v1/perpum/allpositions", {"instrument": symbol})
 
     def cancel_all_open_orders(self, symbol="ETH"):
-        """撤销所有挂单"""
         return self._request("DELETE", "/v1/perpum/order", {"instrument": symbol})
