@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# position_supervisor_coinw.py（完整最终版 - 混合模式 + 固定盈利反推）
+# position_supervisor_coinw.py（最终优化版）
 import logging
 import time
 import threading
@@ -18,13 +18,13 @@ class SignalProcessor:
 
         self.current_position_qty = 0.0
         self.entry_price = 0.0
+        self.PRICE_PRECISION = 2   # CoinW ETHUSDT 价格精度（通常为2位小数）
 
-    # ==================== 信号入口（必须先撤单） ====================
     def process_signal(self, data: dict):
         action = data.get("action", "").upper()
         logger.info(f"[CoinW] 收到信号: {action}")
 
-        # ========== 第一步：必须先撤销所有未成交限价单 ==========
+        # 第一步：必须先撤销所有未成交限价单
         self._cancel_all_tp_orders()
 
         if action == "CLOSE":
@@ -32,7 +32,6 @@ class SignalProcessor:
         elif action in ["LONG", "SHORT"]:
             self._handle_entry_signal(action)
 
-    # ==================== 撤销所有限价单 ====================
     def _cancel_all_tp_orders(self):
         try:
             self.client.cancel_all_open_orders(self.symbol)
@@ -40,17 +39,14 @@ class SignalProcessor:
         except Exception as e:
             logger.error(f"[CoinW] 撤销限价单失败: {e}")
 
-    # ==================== 处理开仓信号 ====================
     def _handle_entry_signal(self, action: str):
         try:
-            # 检查当前是否有持仓，有则先平
             position = self.client.get_position_info(self.symbol)
             if position and float(position.get("positionAmt", 0)) != 0:
                 logger.info("[CoinW] 检测到持仓，先执行全平")
                 self.client.close_all_positions(self.symbol)
                 time.sleep(1.8)
 
-            # 计算仓位（可用余额 × 80% × 5倍杠杆）
             available = self.client.get_available_balance()
             current_price = self.client.get_current_price(self.symbol)
 
@@ -60,7 +56,6 @@ class SignalProcessor:
 
             target_qty = round((available * 0.8 * 5) / current_price, 3)
 
-            # 执行市价开仓
             order = self.client.place_market_order(
                 symbol=self.symbol,
                 side=action,
@@ -73,10 +68,8 @@ class SignalProcessor:
                 self.current_position_qty = target_qty
                 self.entry_price = current_price
 
-                # 开仓后挂限价止盈单（固定盈利金额反推）
+                # 挂限价止盈单（固定盈利金额反推 + 精度控制）
                 self._place_tp_limit_order_by_profit(action, target_qty, current_price)
-
-                # 启动辅助止盈监控线程
                 self._start_profit_monitor()
             else:
                 logger.error(f"[CoinW] 开仓失败: {order}")
@@ -84,19 +77,21 @@ class SignalProcessor:
         except Exception as e:
             logger.error(f"[CoinW] 处理 {action} 信号异常: {e}")
 
-    # ==================== 按固定盈利金额反推止盈价格 ====================
     def _place_tp_limit_order_by_profit(self, side: str, qty: float, entry_price: float):
         try:
             target_profit = self.get_target_profit()
-            fee = qty * entry_price * 0.0006 * 2          # 粗略估算往返手续费
+            fee = qty * entry_price * 0.0006 * 2
             actual_profit = max(target_profit - fee, target_profit * 0.7)
 
             if side == "LONG":
-                tp_price = round(entry_price + (actual_profit / qty), 2)
+                tp_price = entry_price + (actual_profit / qty)
                 close_side = "CLOSE_LONG"
             else:
-                tp_price = round(entry_price - (actual_profit / qty), 2)
+                tp_price = entry_price - (actual_profit / qty)
                 close_side = "CLOSE_SHORT"
+
+            # 关键：按 CoinW 支持的精度进行 round
+            tp_price = round(tp_price, self.PRICE_PRECISION)
 
             self.client.place_limit_order(
                 symbol=self.symbol,
@@ -109,7 +104,6 @@ class SignalProcessor:
         except Exception as e:
             logger.error(f"[CoinW] 挂限价止盈单失败: {e}")
 
-    # ==================== 混合模式止盈目标 ====================
     def get_target_profit(self) -> float:
         """混合模式：max(保底4U, 可用余额 × 3%)"""
         try:
@@ -120,7 +114,6 @@ class SignalProcessor:
             logger.error(f"[CoinW] 计算止盈目标失败: {e}")
             return 4.0
 
-    # ==================== 处理 CLOSE 信号 ====================
     def _handle_close_signal(self):
         try:
             self.client.close_all_positions(self.symbol)
@@ -130,7 +123,6 @@ class SignalProcessor:
         except Exception as e:
             logger.error(f"[CoinW] 全平失败: {e}")
 
-    # ==================== 启动辅助止盈监控线程 ====================
     def _start_profit_monitor(self):
         if self.is_monitoring:
             return
@@ -139,11 +131,7 @@ class SignalProcessor:
         self.monitor_thread.start()
         logger.info("[CoinW] 辅助止盈监控线程已启动")
 
-    # ==================== 辅助止盈监控线程 ====================
     def monitor_profit_take(self):
-        """
-        辅助止盈监控（当限价单未成交时的兜底方案）
-        """
         while self.is_monitoring:
             try:
                 res = self.client.get_position_info(self.symbol)
@@ -161,5 +149,4 @@ class SignalProcessor:
             time.sleep(3)
 
 
-# 全局单例
 coinw_processor = SignalProcessor()
