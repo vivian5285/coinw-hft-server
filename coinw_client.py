@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# coinw_client.py（最终尝试版）
+# coinw_client.py（最终版）
 import os
 import time
 import hmac
@@ -79,13 +79,10 @@ class CoinWClient:
         return self._request("GET", "/v1/perpum/positions", {"instrument": symbol})
 
     def place_market_order(self, symbol, side, amount, leverage=5):
-        """
-        通用接口 + USDT 金额模式
-        """
         return self._request("POST", "/v1/perpum/order", {
             "instrument": symbol,
             "direction": side.lower(),
-            "quantityUnit": "0",           # 0 = USDT 金额
+            "quantityUnit": "0",           # USDT 模式
             "quantity": str(amount),
             "leverage": str(leverage),
             "positionModel": "1",
