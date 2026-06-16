@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# coinw_client.py（完整优化版）
+# coinw_client.py（完整最终版）
 import time
 import hmac
 import hashlib
@@ -44,11 +44,7 @@ class CoinWClient:
             else:
                 response = requests.post(url, data=params, timeout=10)
 
-            res_json = response.json()
-            if res_json.get("code") != 0:
-                logger.warning(f"[CoinW] 请求返回异常: {res_json}")
-            return res_json
-
+            return response.json()
         except Exception as e:
             logger.error(f"[CoinW] 请求异常: {e}")
             return {"code": -1, "msg": str(e)}
@@ -79,7 +75,7 @@ class CoinWClient:
         """市价开仓"""
         return self._request("POST", "/v1/perpum/order/market", {
             "symbol": symbol,
-            "side": side,           # LONG / SHORT
+            "side": side,
             "amount": amount,
             "leverage": leverage
         })
@@ -88,7 +84,7 @@ class CoinWClient:
         """挂限价单（用于止盈）"""
         return self._request("POST", "/v1/perpum/order/limit", {
             "symbol": symbol,
-            "side": side,           # CLOSE_LONG / CLOSE_SHORT
+            "side": side,
             "price": price,
             "amount": amount,
             "type": "limit",
@@ -96,15 +92,13 @@ class CoinWClient:
         })
 
     def close_all_positions(self, symbol: str = "ETHUSDT"):
-        """全平仓位（并撤销挂单）"""
-        # 先撤销所有挂单
+        """全平仓位"""
         self.cancel_all_open_orders(symbol)
         time.sleep(0.5)
-        # 再市价全平
         return self._request("POST", "/v1/perpum/position/close_all", {"symbol": symbol})
 
     def cancel_all_open_orders(self, symbol: str = "ETHUSDT"):
-        """撤销指定交易对的所有挂单"""
+        """撤销所有挂单"""
         return self._request("POST", "/v1/perpum/order/cancel_all", {"symbol": symbol})
 
 
