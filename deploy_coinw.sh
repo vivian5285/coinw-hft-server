@@ -1,57 +1,72 @@
 #!/bin/bash
-# ==============================================
-# 币赢系统全域部署脚本 (V2.5 完整版)
-# 作用: 精确清理、强制同步、环境部署、全域自检
-# ==============================================
+# deploy_coinw.sh（币赢最终部署脚本）
 
-# 配置区域
+set -e
+
 PROJECT_DIR="/home/coinw/coinw-hft-server"
 PORT=5002
-LOG_FILE="supervisor_coinw.log"
-GATEWAY_LOG="gateway_coinw.log"
+LOG_DIR="$PROJECT_DIR/logs"
 
-echo -e "\033[1;32m=== 🚀 正在启动：币赢系统全域部署 (Port: $PORT) ===\033[0m"
+echo -e "\033[1;36m=== 🚀 开始部署币赢系统 (Port: $PORT) ===\033[0m"
 
-# 1. 切换到项目目录
-cd $PROJECT_DIR || { echo "❌ 目录 $PROJECT_DIR 不存在，请检查！"; exit 1; }
+cd $PROJECT_DIR || { echo "❌ 项目目录不存在"; exit 1; }
 
-# 2. 强力清理：通过进程名精准匹配，避免误杀
-echo "[1/5] 正在清理旧进程..."
-sudo pkill -f "gunicorn -b 127.0.0.1:$PORT"
-sudo pkill -f "position_supervisor_coinw.py"
+# 1. 清理旧进程
+echo "[1/6] 正在清理旧进程..."
+pkill -f "gunicorn -b 127.0.0.1:$PORT" || true
+pkill -f "position_supervisor_coinw.py" || true
 sleep 2
 
-# 3. 强制同步最新代码 (抹平本地差异)
-echo "[2/5] 正在同步最新代码..."
+# 2. 拉取最新代码
+echo "[2/6] 正在同步最新代码..."
 git fetch --all
 git reset --hard origin/main
 
-# 4. 环境准备与后台启动
-echo "[3/5] 正在激活环境并启动服务..."
+# 3. 激活虚拟环境并安装依赖
+echo "[3/6] 正在准备环境..."
 source venv/bin/activate
 pip install -r requirements.txt --quiet
 
-# 启动信号网关
-nohup gunicorn -b 127.0.0.1:$PORT app:app > $GATEWAY_LOG 2>&1 &
-# 启动交易大脑
-nohup python3 -u position_supervisor_coinw.py > $LOG_FILE 2>&1 &
+# 4. 创建日志目录
+mkdir -p $LOG_DIR
 
-# 5. 全域健康审计
-echo "[4/5] 正在执行全域链路自检..."
+# 5. 启动服务
+echo "[4/6] 正在启动服务..."
+
+# 启动 Gunicorn
+nohup gunicorn -b 127.0.0.1:$PORT \
+    --workers 2 \
+    --timeout 120 \
+    --access-logfile "$LOG_DIR/gunicorn_access.log" \
+    --error-logfile "$LOG_DIR/gateway_coinw.log" \
+    app:app > /dev/null 2>&1 &
+
+# 启动交易大脑
+nohup python3 -u position_supervisor_coinw.py > "$LOG_DIR/supervisor_coinw.log" 2>&1 &
+
 sleep 3
 
-# 检查端口监听
+# 6. 健康检查
+echo "[5/6] 正在进行健康检查..."
+
 if netstat -tuln | grep -q ":$PORT "; then
-    echo -e "\033[0;32m✅ 端口 $PORT 监听正常\033[0m"
+    echo "✅ 端口 $PORT 监听正常"
 else
-    echo -e "\033[0;31m❌ 端口 $PORT 启动失败！请查看 $GATEWAY_LOG\033[0m"
+    echo "❌ 端口 $PORT 未监听，请检查日志"
+    exit 1
 fi
 
-# 检查大脑进程
 if pgrep -f "position_supervisor_coinw.py" > /dev/null; then
-    echo -e "\033[0;32m✅ 币赢交易大脑运行中\033[0m"
+    echo "✅ 交易大脑运行中"
 else
-    echo -e "\033[0;31m❌ 交易大脑未能启动！请查看 $LOG_FILE\033[0m"
+    echo "❌ 交易大脑未启动"
+    exit 1
 fi
 
-echo -e "\033[1;32m=== ✅ 部署完成，币赢系统已就绪 ===\033[0m"
+echo -e "\033[1;32m=== ✅ 币赢系统部署完成 ===\033[0m"
+echo ""
+echo "常用命令："
+echo "  tail -f $LOG_DIR/supervisor_coinw.log"
+echo "  tail -f $LOG_DIR/gateway_coinw.log"
+echo "  curl http://127.0.0.1:$PORT/health"
+echo ""
