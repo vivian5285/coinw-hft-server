@@ -82,17 +82,14 @@ class CoinWClient:
 
     def place_market_order(self, symbol, side, amount, leverage=5):
         """
-        USDT 金额模式下单（推荐）
+        使用专用市价单接口 + USDT 金额下单
         amount = USDT 金额
         """
-        return self._request("POST", "/v1/perpum/order", {
-            "instrument": symbol,
-            "direction": side.lower(),
-            "quantityUnit": "0",           # 0 = USDT 金额
-            "quantity": str(amount),
-            "leverage": str(leverage),
-            "positionModel": "1",
-            "positionType": "plan"
+        return self._request("POST", "/v1/perpum/order/market", {
+            "symbol": symbol,
+            "side": side,
+            "amount": str(amount),
+            "leverage": str(leverage)
         })
 
     def close_all_positions(self, symbol="ETH"):
