@@ -13,6 +13,7 @@ class SignalProcessor:
         self.client = CoinWClient()
         self.symbol = "ETH"
         self.leverage = 5
+        self.contract_size = 0.01          # ETH 合约大小（可根据 ticker 确认）
 
     def process_signal(self, data: dict):
         action = data.get("action", "").upper()
@@ -30,17 +31,21 @@ class SignalProcessor:
             self.client.close_all_positions(self.symbol)
             time.sleep(1.2)
 
-            # 计算下单 USDT 金额（余额的 80%）
             available = self.client.get_available_balance()
-            usdt_amount = round(available * 0.8, 2)
+            price = self.client.get_current_price(self.symbol)
 
-            if usdt_amount < 10:                    # 提高最小下单金额
-                logger.warning(f"可用余额过小（{usdt_amount} USDT），放弃开仓")
+            if available <= 0 or price <= 0:
+                logger.warning("余额或价格异常，放弃开仓")
                 return
 
-            logger.info(f"下单 USDT 金额: {usdt_amount}")
+            # 计算合约张数（取整）
+            usdt_value = available * 0.8 * self.leverage
+            eth_amount = usdt_value / price
+            contract_qty = max(1, int(eth_amount / self.contract_size))   # 至少 1 张
 
-            result = self.client.place_market_order(self.symbol, side, usdt_amount, self.leverage)
+            logger.info(f"下单合约张数: {contract_qty}")
+
+            result = self.client.place_market_order(self.symbol, side, contract_qty, self.leverage)
             logger.info(f"开仓结果: {result}")
 
         except Exception as e:
