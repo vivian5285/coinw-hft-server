@@ -25,22 +25,22 @@ class SignalProcessor:
 
     def _open(self, side: str):
         try:
-            # 先清理
+            # 先清理持仓和挂单
             self.client.cancel_all_open_orders(self.symbol)
             self.client.close_all_positions(self.symbol)
             time.sleep(1.2)
 
-            # 计算下单金额（余额的80%）
+            # 计算下单 USDT 金额（余额的 80%）
             available = self.client.get_available_balance()
             usdt_amount = round(available * 0.8, 2)
 
-            if usdt_amount <= 0:
-                logger.warning("可用余额不足，放弃开仓")
+            if usdt_amount < 5:
+                logger.warning(f"可用余额不足（{usdt_amount} USDT），放弃开仓")
                 return
 
             logger.info(f"下单 USDT 金额: {usdt_amount}")
 
-            # 下单（USDT 模式）
+            # 调用市价单接口下单
             result = self.client.place_market_order(self.symbol, side, usdt_amount, self.leverage)
             logger.info(f"开仓结果: {result}")
 
