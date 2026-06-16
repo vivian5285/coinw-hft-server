@@ -13,7 +13,7 @@ class SignalProcessor:
         self.client = CoinWClient()
         self.symbol = "ETH"
         self.leverage = 5
-        self.contract_size = 0.01          # ETH 合约大小（可根据 ticker 确认）
+        self.contract_size = 0.01
 
     def process_signal(self, data: dict):
         action = data.get("action", "").upper()
@@ -26,7 +26,6 @@ class SignalProcessor:
 
     def _open(self, side: str):
         try:
-            # 先清理
             self.client.cancel_all_open_orders(self.symbol)
             self.client.close_all_positions(self.symbol)
             time.sleep(1.2)
@@ -38,10 +37,9 @@ class SignalProcessor:
                 logger.warning("余额或价格异常，放弃开仓")
                 return
 
-            # 计算合约张数（取整）
             usdt_value = available * 0.8 * self.leverage
             eth_amount = usdt_value / price
-            contract_qty = max(1, int(eth_amount / self.contract_size))   # 至少 1 张
+            contract_qty = max(1, int(eth_amount / self.contract_size))
 
             logger.info(f"下单合约张数: {contract_qty}")
 
