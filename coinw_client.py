@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# coinw_client.py（短线高频原生限价版）
 import os
 import time
 import hmac
@@ -47,7 +48,7 @@ class CoinWClient:
                 resp = requests.get(request_url, params=params, headers=headers, timeout=10)
             else:
                 headers["Content-type"] = "application/json"
-                resp = requests.request(method.upper(), request_url, data=json.dumps(params), headers=headers, timeout=10)
+                resp = requests.post(request_url, data=json.dumps(params), headers=headers, timeout=10)
             return resp.json()
         except Exception as e:
             return {"code": -1, "msg": str(e)}
@@ -79,57 +80,60 @@ class CoinWClient:
         return self._request("GET", "/v1/perpum/positions", {"instrument": symbol})
 
     def get_open_orders(self, symbol="ETH"):
+        """获取所有当前挂在盘口的未成交限价止盈单"""
         return self._request("GET", "/v1/perpum/orders/open", {
             "instrument": symbol,
             "positionType": "plan" 
         })
 
-    # ==================== 开平仓核心指令 ====================
+    # ==================== 交易核心指令 ====================
 
-    def place_market_order(self, symbol, side, amount, leverage=5):
+    def place_market_order(self, symbol, side, amount, leverage=20):
+        """市价开仓"""
         current_price = self.get_current_price(symbol)
         open_price = round(current_price, 2)
 
         return self._request("POST", "/v1/perpum/order", {
             "instrument": symbol,
             "direction": side.lower(),
-            "quantityUnit": "0",
+            "quantityUnit": "0",           # USDT模式
             "quantity": str(amount),
             "leverage": str(leverage),
-            "positionModel": "1",
+            "positionModel": "1",          # 全仓模式
             "positionType": "plan",
             "openPrice": str(open_price)
         })
 
-    def close_partial_position_market(self, symbol, rate="0.5"):
-        """【恢复市价止盈】获取持仓ID并按比例执行市价平仓"""
+    def place_limit_close_order(self, symbol, price, rate="1.0"):
+        """原生持仓限价平仓单（不占用任何保证金，防9008错误）"""
         pos_info = self.get_position_info(symbol)
         try:
             data = pos_info.get("data", [])
             if data and len(data) > 0:
                 pos_id = data[0].get("id")
                 if pos_id:
-                    # 不带 orderPrice 参数，币赢将按市价处理
                     return self._request("DELETE", "/v1/perpum/positions", {
                         "id": pos_id,
                         "positionType": "plan",
-                        "closeRate": str(rate)
+                        "orderPrice": str(round(price, 2)), # 止盈价格
+                        "closeRate": str(rate)              # 1.0 代表 100% 一刀切全平
                     })
         except Exception as e:
-            return {"code": -1, "msg": f"解析持仓异常: {e}"}
-        return {"code": -1, "msg": "未找到有效持仓 ID"}
+            return {"code": -1, "msg": f"绑定持仓ID限价止盈异常: {e}"}
+        return {"code": -1, "msg": "未找到有效持仓，无法挂出限价单"}
 
     def close_all_positions(self, symbol="ETH"):
+        """强制市价全平"""
         return self._request("DELETE", "/v1/perpum/allpositions", {"instrument": symbol})
 
     def cancel_all_open_orders(self, symbol="ETH"):
-        """索敌与摧毁：精准逐一撤销当前挂单"""
+        """全域撤单：扫描盘口所有属于该品种的限价单并彻底抹去"""
         res = self.get_open_orders(symbol)
         cancel_count = 0
         try:
             data = res.get("data")
             if not data:
-                return {"code": 0, "msg": "当前盘口无任何遗留挂单"}
+                return {"code": 0, "msg": "当前无任何遗留限价单"}
                 
             order_list = []
             if isinstance(data, list):
@@ -144,5 +148,5 @@ class CoinWClient:
                     cancel_count += 1
                     time.sleep(0.1) 
         except Exception as e:
-            return {"code": -1, "msg": f"撤单异常: {e}"}
-        return {"code": 0, "msg": f"成功摧毁 {cancel_count} 笔挂单"}
+            return {"code": -1, "msg": f"撤单流水线异常: {e}"}
+        return {"code": 0, "msg": f"成功扫描并清空了 {cancel_count} 笔未成交限价单"}
