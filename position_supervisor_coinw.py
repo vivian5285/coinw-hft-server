@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# position_supervisor_coinw.py（合约张数模式 + 余额恢复优化版）
+# position_supervisor_coinw.py（最终推荐版 - 通用接口 + 合约张数）
 import time
 import logging
 from coinw_client import CoinWClient
@@ -14,7 +14,7 @@ class SignalProcessor:
         self.symbol = "ETH"
         self.leverage = 5
         self.risk_ratio = 0.80
-        self.contract_size = 0.01          # ETH合约大小
+        self.contract_size = 0.01
         self.tp_fixed_usdt = 5.0
         self.tp_percent = 0.03
 
@@ -34,14 +34,13 @@ class SignalProcessor:
             self.client.cancel_all_open_orders(self.symbol)
             time.sleep(0.8)
 
-            # 2. 全平 + 记录平仓前余额
+            # 2. 全平 + 等待余额恢复
             before_balance = self.client.get_available_balance()
             logger.info(f"平仓前可用余额: {before_balance:.2f} USDT")
-            self.client.close_all_positions(self.symbol)
 
-            # 3. 等待余额恢复
-            logger.info("等待余额恢复...")
+            self.client.close_all_positions(self.symbol)
             time.sleep(3.0)
+
             for i in range(5):
                 available = self.client.get_available_balance()
                 logger.info(f"平仓后第 {i+1} 次查询余额: {available:.2f} USDT")
@@ -54,7 +53,7 @@ class SignalProcessor:
                 logger.info("=" * 60)
                 return
 
-            # 4. 计算合约张数（使用恢复后的余额）
+            # 3. 计算合约张数
             current_price = self.client.get_current_price(self.symbol)
             usdt_value = available * self.risk_ratio * self.leverage
             eth_amount = usdt_value / current_price
@@ -62,8 +61,10 @@ class SignalProcessor:
 
             logger.info(f"最终下单合约张数: {contract_qty} 张")
 
-            # 5. 使用 /order/market 接口开仓
-            open_result = self.client.place_market_order(self.symbol, side, contract_qty, self.leverage)
+            # 4. 使用通用接口 + 完整参数开仓
+            open_result = self.client.place_market_order(
+                self.symbol, side, contract_qty, self.leverage
+            )
             logger.info(f"开仓结果: {open_result}")
 
             if open_result.get("code") != 0:
@@ -73,7 +74,7 @@ class SignalProcessor:
 
             time.sleep(2.0)
 
-            # 6. 挂双笔止盈（暂时保留，后面可根据需要调整）
+            # 5. 挂双笔止盈（可后续完善）
             self._place_dual_tp_orders(side, available * self.risk_ratio)
 
             logger.info("处理完成")
@@ -83,7 +84,7 @@ class SignalProcessor:
             logger.error(f"异常: {e}", exc_info=True)
 
     def _place_dual_tp_orders(self, side: str, position_usdt: float):
-        # 这里暂时保留之前的双笔止盈逻辑，你可以后续告诉我是否要改成合约张数止盈
+        # 暂时保留，后续可根据需要完善为合约张数止盈
         pass
 
 
