@@ -79,11 +79,14 @@ class CoinWClient:
         return self._request("GET", "/v1/perpum/positions", {"instrument": symbol})
 
     def place_market_order(self, symbol, side, amount, leverage=5):
-        """使用你昨晚能用的专用市价单接口"""
+        """
+        合约张数模式下单（推荐）
+        amount = 合约张数（必须是正整数）
+        """
         return self._request("POST", "/v1/perpum/order/market", {
             "symbol": symbol,
             "side": side,
-            "amount": str(amount),
+            "amount": str(int(amount)),      # 必须是整数
             "leverage": str(leverage)
         })
 
