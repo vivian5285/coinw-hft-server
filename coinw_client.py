@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# coinw_client.py（最终完整版）
+# coinw_client.py（最终完整版 - 使用通用下单接口）
 import os
 import time
 import hmac
@@ -80,14 +80,17 @@ class CoinWClient:
 
     def place_market_order(self, symbol, side, amount, leverage=5):
         """
-        合约张数模式下单（推荐）
-        amount = 合约张数（必须是正整数）
+        使用通用下单接口（推荐）
+        amount = 合约张数（整数）
         """
-        return self._request("POST", "/v1/perpum/order/market", {
-            "symbol": symbol,
-            "side": side,
-            "amount": str(int(amount)),      # 必须是整数
-            "leverage": str(leverage)
+        return self._request("POST", "/v1/perpum/order", {
+            "instrument": symbol,
+            "direction": side.lower(),
+            "quantityUnit": "1",           # 1 = 合约张数
+            "quantity": str(int(amount)),
+            "leverage": str(leverage),
+            "positionModel": "1",
+            "positionType": "plan"
         })
 
     def close_all_positions(self, symbol="ETH"):
