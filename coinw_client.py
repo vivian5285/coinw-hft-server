@@ -54,8 +54,6 @@ class CoinWClient:
         except Exception as e:
             return {"code": -1, "msg": str(e)}
 
-    # ==================== 常用方法 ====================
-
     def get_account_balance(self):
         return self._request("GET", "/v1/perpum/account/available")
 
@@ -81,10 +79,7 @@ class CoinWClient:
         return self._request("GET", "/v1/perpum/positions", {"instrument": symbol})
 
     def place_market_order(self, symbol, side, amount, leverage=5):
-        """
-        使用专用市价单接口 + USDT 金额下单
-        amount = USDT 金额
-        """
+        """使用你昨晚能用的专用市价单接口"""
         return self._request("POST", "/v1/perpum/order/market", {
             "symbol": symbol,
             "side": side,
