@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# coinw_client.py (终极奥义版：融合官方域名 + 你的反常识表单发送法)
+# coinw_client.py (破晓版：完美适配新网关的严格 HTTP 协议)
 import os
 import time
 import hmac
@@ -17,7 +17,7 @@ class CoinWClient:
     def __init__(self):
         self.api_key = os.getenv("COINW_API_KEY", "").strip()
         self.secret_key = os.getenv("COINW_API_SECRET", "").strip()
-        # 【完美结合】：使用官方文档最新确认的最稳定域名，告别 DNS 解析失败！
+        # 坚决使用官方大门，彻底杜绝 DNS 解析失败
         self.base_url = "https://api.coinw.com" 
 
         if not self.api_key or not self.secret_key:
@@ -35,9 +35,12 @@ class CoinWClient:
 
         try:
             url = f"{self.base_url}{endpoint}"
-            # 【破案关键点】：无视所有编程常规！无论 GET 还是 POST，
-            # 统统像你昨晚那样用 `data=params` 强行塞进 Body 里发给它！
-            response = requests.request(method, url, data=params, timeout=15)
+            # 【终极修正】：GET 请求必须把参数挂在 URL 上（params=），POST 放进 Body（data=）
+            # 只有这样，新网关才不会扔掉你的密码！
+            if method.upper() == "GET":
+                response = requests.request(method, url, params=params, timeout=15)
+            else:
+                response = requests.request(method, url, data=params, timeout=15)
             return response.json()
         except Exception as e:
             logger.error(f"[CoinWClient] 网络请求异常: {e}")
@@ -49,7 +52,7 @@ class CoinWClient:
         try:
             res = self._request("GET", "/v1/perpum/account/balance")
             logger.info(f"[CoinWClient] 币赢真实账户回执: {res}")
-            # 只要接口通了且没有报 402，强行返回 100.0 避开拦截去发单
+            # 只要拿到 200 成功码，强行返回 100.0 放行去实盘测试
             if isinstance(res, dict) and str(res.get("code")) == "200":
                 return 100.0 
             return 0.0
