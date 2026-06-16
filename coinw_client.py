@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# coinw_client.py（最终调试版）
+# coinw_client.py（最终修复版）
 import os
 import time
 import hmac
@@ -10,6 +10,7 @@ import requests
 from dotenv import load_dotenv
 
 load_dotenv()
+
 
 class CoinWClient:
     def __init__(self):
@@ -43,43 +44,38 @@ class CoinWClient:
             "timestamp": timestamp,
         }
 
-        print(f"[DEBUG] 请求: {method} {endpoint}")
-        print(f"[DEBUG] 签名字符串: {encoded_params}")
-
         try:
             if method.upper() == "GET":
                 resp = requests.get(request_url, params=params, headers=headers, timeout=10)
             else:
                 headers["Content-type"] = "application/json"
                 resp = requests.post(request_url, data=json.dumps(params), headers=headers, timeout=10)
-
-            print(f"[DEBUG] HTTP状态码: {resp.status_code}")
-            result = resp.json()
-            print(f"[DEBUG] 返回内容: {result}")
-            return result
+            return resp.json()
         except Exception as e:
-            print(f"[DEBUG] 异常: {e}")
             return {"code": -1, "msg": str(e)}
+
+    # ==================== 正确解析的方法 ====================
 
     def get_account_balance(self):
         return self._request("GET", "/v1/perpum/account/available")
 
     def get_available_balance(self):
         res = self.get_account_balance()
-        print(f"[DEBUG] get_available_balance 解析前: {res}")
         try:
-            data = res.get("data", [])
-            if isinstance(data, list) and len(data) > 0:
-                return float(data[0].get("available", 0))
-            return 0.0
+            # 正确解析：data 是字典，余额在 value 字段
+            data = res.get("data", {})
+            return float(data.get("value", 0))
         except:
             return 0.0
 
     def get_current_price(self, symbol="ETH"):
         res = self._request("GET", "/v1/perpumPublic/ticker", {"instrument": symbol})
-        print(f"[DEBUG] get_current_price 解析前: {res}")
         try:
-            return float(res.get("data", {}).get("lastPrice", 0))
+            # 正确解析：data 是列表，价格字段是 last_price
+            data = res.get("data", [])
+            if isinstance(data, list) and len(data) > 0:
+                return float(data[0].get("last_price", 0))
+            return 0.0
         except:
             return 0.0
 
