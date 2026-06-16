@@ -1,90 +1,157 @@
-#!/usr/bin/env python3
-# coinw_client.py (破晓版：完美适配新网关的严格 HTTP 协议)
 import os
 import time
 import hmac
 import hashlib
 import requests
-import logging
+import json
+import base64
 from dotenv import load_dotenv
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-load_dotenv(os.path.join(BASE_DIR, '.env'))
-
-logger = logging.getLogger(__name__)
+# 自动寻找并加载项目根目录下的 .env 文件
+load_dotenv()
 
 class CoinWClient:
     def __init__(self):
-        self.api_key = os.getenv("COINW_API_KEY", "").strip()
-        self.secret_key = os.getenv("COINW_API_SECRET", "").strip()
-        # 坚决使用官方大门，彻底杜绝 DNS 解析失败
-        self.base_url = "https://api.coinw.com" 
-
+        # 动态从 .env 中读取 API 凭证
+        self.api_key = os.getenv("COINW_API_KEY")
+        self.secret_key = os.getenv("COINW_API_SECRET")
+        
         if not self.api_key or not self.secret_key:
-            logger.error("[CoinWClient] 严重错误：未找到 COINW_API_KEY 或 SECRET！")
+            print("❌ 致命错误: 未能读取到 API 密钥，请检查 .env 文件。")
+            
+        self.base_url = "https://api.futurescw.com" 
 
-    def _sign(self, params):
-        query = "&".join([f"{k}={v}" for k, v in sorted(params.items())])
-        return hmac.new(self.secret_key.encode(), query.encode(), hashlib.sha256).hexdigest()
+    def _request(self, method, endpoint, params=None, is_public=False):
+        """
+        底层请求封装，兼容公有行情接口与私有交易接口
+        """
+        # --- 公有接口处理（如获取现价，不需要签名） ---
+        if is_public:
+            url = f"{self.base_url}{endpoint}"
+            try:
+                res = requests.request(method, url, params=params)
+                return res.json()
+            except Exception as e:
+                return {"code": -1, "msg": str(e)}
 
-    def _request(self, method, endpoint, params=None):
-        if params is None: params = {}
-        params['timestamp'] = int(time.time() * 1000)
-        params['api_key'] = self.api_key
-        params['sign'] = self._sign(params)
+        # --- 私有接口处理（严格遵循官方 V1 签名规范） ---
+        if params is None: 
+            params = {}
+            
+        method = method.upper()
+        timestamp = str(int(time.time() * 1000))
+        request_url = f"{self.base_url}{endpoint}"
+
+        if method == "GET":
+            query_params = "&".join(f"{key}={value}" for key, value in params.items() if value is not None)
+            encoded_params = f'{timestamp}{method}{endpoint}?{query_params}' if query_params else f'{timestamp}{method}{endpoint}'
+        else:
+            encoded_params = f'{timestamp}{method}{endpoint}{json.dumps(params)}'
+
+        signature = base64.b64encode(
+            hmac.new(
+                bytes(self.secret_key, 'utf-8'), 
+                msg=bytes(encoded_params, 'utf-8'), 
+                digestmod=hashlib.sha256
+            ).digest()
+        ).decode("US-ASCII")
+
+        headers = {
+            "sign": signature,
+            "api_key": self.api_key,
+            "timestamp": timestamp,
+        }
 
         try:
-            url = f"{self.base_url}{endpoint}"
-            # 【终极修正】：GET 请求必须把参数挂在 URL 上（params=），POST 放进 Body（data=）
-            # 只有这样，新网关才不会扔掉你的密码！
-            if method.upper() == "GET":
-                response = requests.request(method, url, params=params, timeout=15)
+            if method == "GET":
+                response = requests.get(request_url, params=params, headers=headers)
             else:
-                response = requests.request(method, url, data=params, timeout=15)
+                headers["Content-type"] = "application/json"
+                response = requests.request(method, request_url, data=json.dumps(params), headers=headers)
             return response.json()
         except Exception as e:
-            logger.error(f"[CoinWClient] 网络请求异常: {e}")
             return {"code": -1, "msg": str(e)}
 
-    # ================= 核心业务接口 =================
+    # ================= 辅助功能：现价与精度 =================
 
-    def get_available_balance(self, asset="USDT"):
+    def format_price(self, price, decimals=2):
+        """强制格式化价格精度（ETH通常为2位小数，BTC为1位）"""
+        format_str = "{:." + str(decimals) + "f}"
+        return format_str.format(float(price))
+
+    def get_latest_price(self, symbol):
+        """获取盘口最新成交价 (现价)"""
+        res = self._request("GET", "/v1/perpumPublic/ticker", {"instrument": symbol}, is_public=True)
         try:
-            res = self._request("GET", "/v1/perpum/account/balance")
-            logger.info(f"[CoinWClient] 币赢真实账户回执: {res}")
-            # 只要拿到 200 成功码，强行返回 100.0 放行去实盘测试
-            if isinstance(res, dict) and str(res.get("code")) == "200":
-                return 100.0 
-            return 0.0
+            # 官方公共行情接口解析
+            data = res.get("data", {})
+            return float(data.get("lastPrice", 0))
         except Exception:
             return 0.0
 
-    def get_current_price(self, symbol="ETHUSDT"):
+    # ================= 核心交易接口 =================
+
+    def place_current_price_order(self, symbol, side, amount, decimals=2):
+        """
+        【现价发送指令】
+        先获取最新现价，再以该价格下达限价单（滑动价差点位极低，且精度绝对安全）
+        """
+        current_price = self.get_latest_price(symbol)
+        if current_price <= 0:
+            return {"code": -1, "msg": "获取现价失败，触发熔断停止开仓"}
+        
+        formatted_price = self.format_price(current_price, decimals)
+        print(f"📡 捕获 {symbol} 现价: {formatted_price}，正在执行 {side.upper()} 指令...")
+        
+        return self._request("POST", "/v1/perpum/order", {
+            "instrument": symbol,
+            "direction": side.lower(),
+            "quantityUnit": "1",           # 1代表合约张数
+            "quantity": str(amount),
+            "openPrice": formatted_price,  # 已经过精度截断的安全现价
+            "positionModel": "1"
+        })
+
+    def place_limit_order(self, symbol, side, price, amount, decimals=2):
+        """标准指定价格限价单"""
+        formatted_price = self.format_price(price, decimals)
+        return self._request("POST", "/v1/perpum/order", {
+            "instrument": symbol,
+            "direction": side.lower(),
+            "quantityUnit": "1",
+            "quantity": str(amount),
+            "openPrice": formatted_price,
+            "positionModel": "1"
+        })
+
+    def place_market_order(self, symbol, side, amount, leverage):
+        """纯市价单开仓（不吃价格精度，但容易产生滑点）"""
+        return self._request("POST", "/v1/perpum/order", {
+            "instrument": symbol,
+            "direction": side.lower(),
+            "quantityUnit": "1",
+            "quantity": str(amount),
+            "leverage": str(leverage),
+            "positionModel": "1"
+        })
+
+    def close_all_positions(self, symbol):
+        """系统安全基石：一键全平"""
+        return self._request("DELETE", "/v1/perpum/allpositions", {
+            "instrument": symbol
+        })
+
+    def get_account_balance(self):
+        """获取可用余额"""
+        return self._request("GET", "/v1/perpum/account/available")
+
+    def get_avg_price(self, symbol):
+        """获取持仓均价"""
+        res = self._request("GET", "/v1/perpum/positions", {"instrument": symbol})
         try:
-            res = self._request("GET", "/v1/perpum/position/info", {"symbol": symbol})
-            return 1800.0
+            data = res.get("data", [])
+            if isinstance(data, list) and len(data) > 0:
+                return float(data[0].get("openPrice", 0))
+            return 0.0
         except Exception:
-            return 1800.0
-
-    def place_market_order(self, action, quantity, symbol="ETHUSDT"):
-        try:
-            action_upper = action.upper()
-            coinw_side = "LONG" if action_upper in ["BUY", "LONG"] else "SHORT"
-            leverage = os.getenv("COINW_LEVERAGE", "5")
-
-            logger.info(f"[CoinWClient] 🚀 向币赢实盘发送市价单 -> 方向: {coinw_side} | 数量: {quantity}")
-
-            res = self._request("POST", "/v1/perpum/order/market", {
-                "symbol": symbol,
-                "side": coinw_side,
-                "amount": str(quantity),
-                "leverage": str(leverage)
-            })
-
-            logger.info(f"[CoinWClient] 🎯 实盘开仓最终响应: {res}")
-            return res
-        except Exception as e:
-            logger.error(f"[CoinWClient] 实盘下单执行异常: {e}")
-            return None
-
-coinw_client = CoinWClient()
+            return 0.0
