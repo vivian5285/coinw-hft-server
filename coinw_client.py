@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# coinw_client.py（基于你昨晚能用的版本 + 最小修改）
+# coinw_client.py（带调试打印完整版）
 import os
 import time
 import hmac
@@ -38,18 +38,21 @@ class CoinWClient:
                 resp = requests.get(url, params=params, timeout=10)
             else:
                 resp = requests.post(url, data=params, timeout=10)
-            return resp.json()
+            result = resp.json()
+            print(f"[DEBUG] {method} {endpoint} 返回: {result}")   # 调试打印
+            return result
         except Exception as e:
+            print(f"[DEBUG] {method} {endpoint} 异常: {e}")
             return {"code": -1, "msg": str(e)}
 
-    # ==================== 补全的方法 ====================
+    # ==================== 常用方法（带调试） ====================
 
     def get_account_balance(self):
         return self._request("GET", "/v1/perpum/account/balance")
 
     def get_available_balance(self):
-        """获取可用 USDT 余额"""
         res = self.get_account_balance()
+        print(f"[DEBUG] get_available_balance 解析前: {res}")
         try:
             data = res.get("data", {})
             return float(data.get("availableUsdt", 0))
@@ -57,8 +60,8 @@ class CoinWClient:
             return 0.0
 
     def get_current_price(self, symbol="ETHUSDT"):
-        """获取最新成交价"""
         res = self._request("GET", "/v1/perpum/market/ticker", {"symbol": symbol})
+        print(f"[DEBUG] get_current_price 解析前: {res}")
         try:
             return float(res.get("data", {}).get("lastPrice", 0))
         except:
@@ -86,7 +89,6 @@ class CoinWClient:
         })
 
     def close_all_positions(self, symbol="ETHUSDT"):
-        """一键全平（先撤单再平仓）"""
         self.cancel_all_open_orders(symbol)
         time.sleep(0.5)
         return self._request("POST", "/v1/perpum/position/close_all", {"symbol": symbol})
