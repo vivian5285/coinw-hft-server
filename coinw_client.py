@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# coinw_client.py（临时调试版 - 带详细打印）
+# coinw_client.py（最终推荐版 - 贴近官方签名）
 import os
 import time
 import hmac
@@ -19,82 +19,63 @@ class CoinWClient:
         self.base_url = "https://api.coinw.com"
 
         if not self.api_key or not self.secret_key:
-            raise ValueError("请在 .env 中配置 COINW_API_KEY 和 COINW_API_SECRET")
+            raise ValueError("请检查 .env 中的 COINW_API_KEY 和 COINW_API_SECRET")
 
-    def _sign(self, method: str, endpoint: str, params: dict, timestamp: str) -> str:
-        if method.upper() == "GET":
-            query = "&".join([f"{k}={v}" for k, v in sorted(params.items()) if v is not None])
-            sign_str = f"{timestamp}{method}{endpoint}?{query}" if query else f"{timestamp}{method}{endpoint}"
-        else:
-            sign_str = f"{timestamp}{method}{endpoint}{json.dumps(params)}"
-
-        signature = base64.b64encode(
-            hmac.new(self.secret_key.encode(), sign_str.encode(), hashlib.sha256).digest()
-        ).decode("US-ASCII")
-        return signature
-
-    def _request(self, method: str, endpoint: str, params: dict = None, is_public: bool = False):
+    def _request(self, method: str, endpoint: str, params: dict = None):
         if params is None:
             params = {}
 
         timestamp = str(int(time.time() * 1000))
-        url = f"{self.base_url}{endpoint}"
+        request_url = f"{self.base_url}{endpoint}"
 
-        print(f"[DEBUG] 请求: {method} {url}")
-        print(f"[DEBUG] 参数: {params}")
+        # 构造签名字符串（严格按照官方示例）
+        if method.upper() == "GET":
+            query = "&".join(f"{k}={v}" for k, v in sorted(params.items()) if v is not None)
+            encoded_params = f"{timestamp}{method}{endpoint}?{query}" if query else f"{timestamp}{method}{endpoint}"
+        else:
+            encoded_params = f"{timestamp}{method}{endpoint}{json.dumps(params)}"
 
-        if is_public:
-            try:
-                resp = requests.request(method, url, params=params, timeout=10)
-                result = resp.json()
-                print(f"[DEBUG] 公共接口返回: {result}")
-                return result
-            except Exception as e:
-                print(f"[DEBUG] 公共接口异常: {e}")
-                return {"code": -1, "msg": str(e)}
+        signature = base64.b64encode(
+            hmac.new(self.secret_key.encode(), encoded_params.encode(), hashlib.sha256).digest()
+        ).decode("US-ASCII")
 
-        # 私有接口
-        sign = self._sign(method, endpoint, params, timestamp)
         headers = {
-            "sign": sign,
+            "sign": signature,
             "api_key": self.api_key,
             "timestamp": timestamp,
         }
 
         try:
             if method.upper() == "GET":
-                resp = requests.get(url, params=params, headers=headers, timeout=10)
+                resp = requests.get(request_url, params=params, headers=headers, timeout=10)
             else:
                 headers["Content-type"] = "application/json"
-                resp = requests.request(method, url, data=json.dumps(params), headers=headers, timeout=10)
+                resp = requests.post(request_url, data=json.dumps(params), headers=headers, timeout=10)
 
             result = resp.json()
-            print(f"[DEBUG] 接口返回: {result}")   # ← 重点看这里
+            print(f"[API返回] {endpoint} → {result}")   # 调试用，正式版可删
             return result
         except Exception as e:
-            print(f"[DEBUG] 请求异常: {e}")
+            print(f"[API异常] {endpoint} → {e}")
             return {"code": -1, "msg": str(e)}
 
-    # ==================== 常用方法（带调试） ====================
+    # ==================== 常用方法 ====================
 
     def get_account_balance(self):
         return self._request("GET", "/v1/perpum/account/available")
 
     def get_available_balance(self):
         res = self.get_account_balance()
-        print(f"[DEBUG] get_available_balance 解析前: {res}")
         try:
             data = res.get("data", [])
             if isinstance(data, list) and len(data) > 0:
                 return float(data[0].get("available", 0))
             return 0.0
-        except Exception as e:
-            print(f"[DEBUG] 解析余额异常: {e}")
+        except:
             return 0.0
 
     def get_current_price(self, symbol="ETH"):
-        res = self._request("GET", "/v1/perpumPublic/ticker", {"instrument": symbol}, is_public=True)
-        print(f"[DEBUG] get_current_price 解析前: {res}")
+        res = self._request("GET", "/v1/perpumPublic/ticker", {"instrument": symbol})
         try:
             return float(res.get("data", {}).get("lastPrice", 0))
         except:
