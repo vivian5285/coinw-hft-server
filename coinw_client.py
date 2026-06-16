@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# coinw_client.py（最终完整稳定版）
+# coinw_client.py（临时调试版 - 带详细打印）
 import os
 import time
 import hmac
@@ -22,7 +22,6 @@ class CoinWClient:
             raise ValueError("请在 .env 中配置 COINW_API_KEY 和 COINW_API_SECRET")
 
     def _sign(self, method: str, endpoint: str, params: dict, timestamp: str) -> str:
-        """按照官方文档的签名方式"""
         if method.upper() == "GET":
             query = "&".join([f"{k}={v}" for k, v in sorted(params.items()) if v is not None])
             sign_str = f"{timestamp}{method}{endpoint}?{query}" if query else f"{timestamp}{method}{endpoint}"
@@ -41,15 +40,20 @@ class CoinWClient:
         timestamp = str(int(time.time() * 1000))
         url = f"{self.base_url}{endpoint}"
 
-        # 公共接口（不需要签名）
+        print(f"[DEBUG] 请求: {method} {url}")
+        print(f"[DEBUG] 参数: {params}")
+
         if is_public:
             try:
                 resp = requests.request(method, url, params=params, timeout=10)
-                return resp.json()
+                result = resp.json()
+                print(f"[DEBUG] 公共接口返回: {result}")
+                return result
             except Exception as e:
+                print(f"[DEBUG] 公共接口异常: {e}")
                 return {"code": -1, "msg": str(e)}
 
-        # 私有接口（需要签名）
+        # 私有接口
         sign = self._sign(method, endpoint, params, timestamp)
         headers = {
             "sign": sign,
@@ -63,41 +67,43 @@ class CoinWClient:
             else:
                 headers["Content-type"] = "application/json"
                 resp = requests.request(method, url, data=json.dumps(params), headers=headers, timeout=10)
-            return resp.json()
+
+            result = resp.json()
+            print(f"[DEBUG] 接口返回: {result}")   # ← 重点看这里
+            return result
         except Exception as e:
+            print(f"[DEBUG] 请求异常: {e}")
             return {"code": -1, "msg": str(e)}
 
-    # ==================== 常用方法 ====================
+    # ==================== 常用方法（带调试） ====================
 
     def get_account_balance(self):
-        """获取账户余额"""
         return self._request("GET", "/v1/perpum/account/available")
 
     def get_available_balance(self):
-        """获取可用 USDT 余额"""
         res = self.get_account_balance()
+        print(f"[DEBUG] get_available_balance 解析前: {res}")
         try:
             data = res.get("data", [])
             if isinstance(data, list) and len(data) > 0:
                 return float(data[0].get("available", 0))
             return 0.0
-        except:
+        except Exception as e:
+            print(f"[DEBUG] 解析余额异常: {e}")
             return 0.0
 
     def get_current_price(self, symbol="ETH"):
-        """获取最新成交价"""
         res = self._request("GET", "/v1/perpumPublic/ticker", {"instrument": symbol}, is_public=True)
+        print(f"[DEBUG] get_current_price 解析前: {res}")
         try:
             return float(res.get("data", {}).get("lastPrice", 0))
         except:
             return 0.0
 
     def get_position_info(self, symbol="ETH"):
-        """获取当前持仓"""
         return self._request("GET", "/v1/perpum/positions", {"instrument": symbol})
 
     def place_market_order(self, symbol, side, amount, leverage=5):
-        """市价开仓"""
         return self._request("POST", "/v1/perpum/order", {
             "instrument": symbol,
             "direction": side.lower(),
@@ -108,9 +114,7 @@ class CoinWClient:
         })
 
     def close_all_positions(self, symbol="ETH"):
-        """一键全平"""
         return self._request("DELETE", "/v1/perpum/allpositions", {"instrument": symbol})
 
     def cancel_all_open_orders(self, symbol="ETH"):
-        """撤销所有挂单"""
         return self._request("DELETE", "/v1/perpum/order", {"instrument": symbol})
