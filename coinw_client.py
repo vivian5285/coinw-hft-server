@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# coinw_client.py（生产推荐版）
+# coinw_client.py（生产版 - 基于下午成功版本）
 import os
 import time
 import hmac
@@ -28,7 +28,7 @@ class CoinWClient:
         timestamp = str(int(time.time() * 1000))
         request_url = f"{self.base_url}{endpoint}"
 
-        # 构造签名字符串（官方推荐方式）
+        # 构造签名
         if method.upper() == "GET":
             query_params = "&".join(f"{k}={v}" for k, v in sorted(params.items()) if v is not None)
             encoded_params = f"{timestamp}{method}{endpoint}?{query_params}" if query_params else f"{timestamp}{method}{endpoint}"
@@ -85,21 +85,25 @@ class CoinWClient:
 
     def place_market_order(self, symbol, side, amount, leverage=5):
         """
-        市价开仓（合约张数模式 - 推荐）
-        amount: 合约张数（必须是正整数）
+        市价开仓（USDT 模式 + 传入 openPrice）
+        amount: USDT 金额
         """
+        current_price = self.get_current_price(symbol)
+        open_price = round(current_price, 2)   # 保留两位小数
+
         return self._request("POST", "/v1/perpum/order", {
             "instrument": symbol,
             "direction": side.lower(),
-            "quantityUnit": "1",           # 1 = 合约张数
-            "quantity": str(int(amount)),
+            "quantityUnit": "0",           # 0 = USDT 金额模式
+            "quantity": str(amount),
             "leverage": str(leverage),
             "positionModel": "1",
-            "positionType": "plan"
+            "positionType": "plan",
+            "openPrice": str(open_price)   # 传入当前价格（关键）
         })
 
     def place_limit_order(self, symbol, side, price, amount):
-        """挂限价单（用于止盈）"""
+        """挂限价止盈单"""
         return self._request("POST", "/v1/perpum/order", {
             "instrument": symbol,
             "direction": side.lower(),
