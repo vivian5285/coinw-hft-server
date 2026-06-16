@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-# position_supervisor_coinw.py（调试版 - 带详细打印）
-import logging
+# position_supervisor_coinw.py（最小可运行版 - 基于你测试过的 coinw_client.py）
 import time
+import logging
 from coinw_client import CoinWClient
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
@@ -12,68 +12,47 @@ class SignalProcessor:
     def __init__(self):
         self.client = CoinWClient()
         self.symbol = "ETHUSDT"
-        self.leverage = 5
 
-    def process_signal(self, data):
+    def process_signal(self, data: dict):
         action = data.get("action", "").upper()
-        print(f"[DEBUG] ========== 收到信号: {action} ==========")
-
-        # 先撤销限价单
-        try:
-            self.client.cancel_all_open_orders(self.symbol)
-            print("[DEBUG] 已撤销所有限价单")
-        except Exception as e:
-            print(f"[DEBUG] 撤销限价单异常: {e}")
+        logger.info(f"[CoinW] 收到信号: {action}")
 
         if action == "CLOSE":
-            self._handle_close()
+            self._close_position()
         elif action in ["LONG", "SHORT"]:
-            self._handle_entry(action)
+            self._open_position(action)
 
-    def _handle_entry(self, action):
+    def _open_position(self, side: str):
         try:
-            print("[DEBUG] 进入开仓流程")
+            # 先撤销所有挂单 + 平仓（保证干净）
+            self.client.close_all_positions(self.symbol)
+            time.sleep(1)
 
-            # 检查持仓
-            pos = self.client.get_position_info(self.symbol)
-            print(f"[DEBUG] 当前持仓信息: {pos}")
-
-            if pos and float(pos.get("positionAmt", 0)) != 0:
-                print("[DEBUG] 发现持仓，先全平")
-                self.client.close_all_positions(self.symbol)
-                time.sleep(1.5)
-
-            # 计算仓位
-            available = self.client.get_available_balance()
-            price = self.client.get_current_price(self.symbol)
-            print(f"[DEBUG] 可用余额: {available}, 当前价格: {price}")
+            # 获取余额计算仓位（80% * 5倍）
+            balance_info = self.client.get_account_balance()
+            available = float(balance_info.get("data", {}).get("availableUsdt", 0))
+            price = self.client.get_current_price(self.symbol)  # 需要你在 coinw_client.py 里加上这个方法
 
             if available <= 0 or price <= 0:
-                print("[DEBUG] 余额或价格异常，放弃开仓")
+                logger.warning("[CoinW] 余额或价格异常")
                 return
 
             qty = round((available * 0.8 * 5) / price, 3)
-            print(f"[DEBUG] 计算下单数量: {qty}")
 
             # 下单
-            order = self.client.place_market_order(self.symbol, action, qty, self.leverage)
-            print(f"[DEBUG] 下单返回结果: {order}")
-
-            if order and order.get("code") == 0:
-                print("[DEBUG] 下单成功！")
-                # 这里可以继续挂限价单（暂时先打日志）
-            else:
-                print("[DEBUG] 下单失败或返回结构异常")
+            result = self.client.place_market_order(self.symbol, side, qty, 5)
+            logger.info(f"[CoinW] 下单结果: {result}")
 
         except Exception as e:
-            print(f"[DEBUG] 开仓流程异常: {e}")
+            logger.error(f"[CoinW] 开仓失败: {e}")
 
-    def _handle_close(self):
+    def _close_position(self):
         try:
-            self.client.close_all_positions(self.symbol)
-            print("[DEBUG] 全平成功")
+            result = self.client.close_all_positions(self.symbol)
+            logger.info(f"[CoinW] 平仓结果: {result}")
         except Exception as e:
-            print(f"[DEBUG] 全平异常: {e}")
+            logger.error(f"[CoinW] 平仓失败: {e}")
 
 
+# 全局实例，供 app.py 导入
 coinw_processor = SignalProcessor()
