@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
-# coinw_client.py（基于你昨晚能用的版本 + 补全必要方法）
+# coinw_client.py（基于你昨晚能用的版本 + 最小修改）
 import os
 import time
 import hmac
 import hashlib
 import requests
-import json
-import base64
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -22,7 +20,7 @@ class CoinWClient:
             raise ValueError("请在 .env 中配置 COINW_API_KEY 和 COINW_API_SECRET")
 
     def _sign(self, params: dict) -> str:
-        """你原来能用的签名方式"""
+        """保持你原来能用的签名方式"""
         query = "&".join([f"{k}={v}" for k, v in sorted(params.items())])
         return hmac.new(self.secret_key.encode(), query.encode(), hashlib.sha256).hexdigest()
 
@@ -50,7 +48,7 @@ class CoinWClient:
         return self._request("GET", "/v1/perpum/account/balance")
 
     def get_available_balance(self):
-        """获取可用余额"""
+        """获取可用 USDT 余额"""
         res = self.get_account_balance()
         try:
             data = res.get("data", {})
@@ -59,7 +57,7 @@ class CoinWClient:
             return 0.0
 
     def get_current_price(self, symbol="ETHUSDT"):
-        """获取最新价格"""
+        """获取最新成交价"""
         res = self._request("GET", "/v1/perpum/market/ticker", {"symbol": symbol})
         try:
             return float(res.get("data", {}).get("lastPrice", 0))
@@ -88,6 +86,7 @@ class CoinWClient:
         })
 
     def close_all_positions(self, symbol="ETHUSDT"):
+        """一键全平（先撤单再平仓）"""
         self.cancel_all_open_orders(symbol)
         time.sleep(0.5)
         return self._request("POST", "/v1/perpum/position/close_all", {"symbol": symbol})
