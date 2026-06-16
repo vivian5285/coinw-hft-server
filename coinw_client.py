@@ -79,10 +79,9 @@ class CoinWClient:
         return self._request("GET", "/v1/perpum/positions", {"instrument": symbol})
 
     def get_open_orders(self, symbol="ETH"):
-        """【新增索敌】获取该品种下的所有当前未成交挂单"""
         return self._request("GET", "/v1/perpum/orders/open", {
             "instrument": symbol,
-            "positionType": "plan" # 官方文档说明必须带有此参数
+            "positionType": "plan" 
         })
 
     # ==================== 开平仓核心指令 ====================
@@ -102,17 +101,18 @@ class CoinWClient:
             "openPrice": str(open_price)
         })
 
-    def place_limit_close_order(self, symbol, price, rate="0.5"):
+    def close_partial_position_market(self, symbol, rate="0.5"):
+        """【恢复市价止盈】获取持仓ID并按比例执行市价平仓"""
         pos_info = self.get_position_info(symbol)
         try:
             data = pos_info.get("data", [])
             if data and len(data) > 0:
                 pos_id = data[0].get("id")
                 if pos_id:
+                    # 不带 orderPrice 参数，币赢将按市价处理
                     return self._request("DELETE", "/v1/perpum/positions", {
                         "id": pos_id,
                         "positionType": "plan",
-                        "orderPrice": str(round(price, 2)),
                         "closeRate": str(rate)
                     })
         except Exception as e:
@@ -120,20 +120,17 @@ class CoinWClient:
         return {"code": -1, "msg": "未找到有效持仓 ID"}
 
     def close_all_positions(self, symbol="ETH"):
-        """一键市价全平"""
         return self._request("DELETE", "/v1/perpum/allpositions", {"instrument": symbol})
 
     def cancel_all_open_orders(self, symbol="ETH"):
-        """【终极修复】先索敌获取所有单号，再逐一精准摧毁"""
+        """索敌与摧毁：精准逐一撤销当前挂单"""
         res = self.get_open_orders(symbol)
         cancel_count = 0
-        
         try:
             data = res.get("data")
             if not data:
                 return {"code": 0, "msg": "当前盘口无任何遗留挂单"}
                 
-            # 兼容币赢可能返回的嵌套结构 (列表，或者包装在 rows 里)
             order_list = []
             if isinstance(data, list):
                 order_list = data
@@ -143,12 +140,9 @@ class CoinWClient:
             for order in order_list:
                 order_id = order.get("id")
                 if order_id:
-                    # 逐一向交易所发送带 ID 的精准撤单指令
                     self._request("DELETE", "/v1/perpum/order", {"id": str(order_id)})
                     cancel_count += 1
-                    time.sleep(0.1) # 保护性延迟，防止瞬间并发导致API超载报错
-                    
+                    time.sleep(0.1) 
         except Exception as e:
-            return {"code": -1, "msg": f"解析或撤销挂单时异常: {e}"}
-            
-        return {"code": 0, "msg": f"成功扫描并摧毁了 {cancel_count} 笔遗留挂单"}
+            return {"code": -1, "msg": f"撤单异常: {e}"}
+        return {"code": 0, "msg": f"成功摧毁 {cancel_count} 笔挂单"}
