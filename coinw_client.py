@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# coinw_client.py（最终版）
+# coinw_client.py（优化 openPrice 版）
 import os
 import time
 import hmac
@@ -79,6 +79,11 @@ class CoinWClient:
         return self._request("GET", "/v1/perpum/positions", {"instrument": symbol})
 
     def place_market_order(self, symbol, side, amount, leverage=5):
+        current_price = self.get_current_price(symbol)
+        
+        # 让价格更“清晰”：保留 2 位小数，并转字符串
+        open_price = round(current_price, 2)
+
         return self._request("POST", "/v1/perpum/order", {
             "instrument": symbol,
             "direction": side.lower(),
@@ -86,7 +91,8 @@ class CoinWClient:
             "quantity": str(amount),
             "leverage": str(leverage),
             "positionModel": "1",
-            "positionType": "plan"
+            "positionType": "plan",
+            "openPrice": str(open_price)   # 清晰的现价
         })
 
     def close_all_positions(self, symbol="ETH"):
