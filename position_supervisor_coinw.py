@@ -13,7 +13,7 @@ class SignalProcessor:
         self.client = CoinWClient()
         self.symbol = "ETH"
         self.leverage = 5
-        self.test_amount = 20.0          # 固定测试金额（20 USDT）
+        self.test_amount = 20.0          # 固定测试金额
 
     def process_signal(self, data: dict):
         action = data.get("action", "").upper()
