@@ -16,8 +16,8 @@ class SignalProcessor:
         self.leverage = 5
         
         self.risk_ratio = 0.80           
-        self.tp1_fixed_usdt = 2.0        
-        self.tp2_balance_percent = 0.01  
+        self.tp1_fixed_usdt = 0.5        # 第一防线：覆盖手续费后多赚 0.5U，极速保本
+        self.tp2_balance_percent = 0.05  # 【修改】第二防线：拉开距离，赚取总本金的 5%
         
         self.monitor_thread = None
         self.status = "IDLE"
@@ -65,7 +65,7 @@ class SignalProcessor:
                 f"**开仓均价**: `{open_price}`\n\n"
                 f"---\n\n"
                 f"🎯 **[防线一]**: `{tp1_price}` *(落袋 {self.tp1_fixed_usdt}U + 覆盖手续费)*\n\n"
-                f"🎯 **[防线二]**: `{tp2_price}` *(全平，赚取总本金 1%)*"
+                f"🎯 **[防线二]**: `{tp2_price}` *(全平，赚取总本金 5%)*"
             )
             self.notifier.send_markdown(f"开仓战报 {side}", report)
 
@@ -86,9 +86,15 @@ class SignalProcessor:
         half_notional = total_notional * 0.5 
         estimated_fee = total_notional * 0.0015 
         
+        # 涨跌幅计算
         tp1_pct = (self.tp1_fixed_usdt + estimated_fee) / half_notional
         tp2_target_usdt = total_balance * self.tp2_balance_percent
         tp2_pct = tp2_target_usdt / half_notional
+
+        # 防呆机制：确保防线二永远在防线一之后
+        if tp1_pct >= tp2_pct:
+            logger.warning("⚠️ 侦测到资金量过小导致止盈倒挂，已强制修正防线二目标！")
+            tp2_pct = tp1_pct * 1.5
 
         if side == "LONG":
             tp1_price = round(open_price * (1 + tp1_pct), 2)
@@ -123,7 +129,7 @@ class SignalProcessor:
                         self.notifier.send_markdown("止盈捷报 TP1", msg)
                         tp1_done = True
                     elif current_price >= tp2_price and tp1_done:
-                        self._close_all("🎯 达成 1% 终极收益目标，落袋为安")
+                        self._close_all("🎯 达成 5% 终极收益目标，落袋为安")
                         break
                 else: 
                     if current_price <= tp1_price and not tp1_done:
@@ -132,7 +138,7 @@ class SignalProcessor:
                         self.notifier.send_markdown("止盈捷报 TP1", msg)
                         tp1_done = True
                     elif current_price <= tp2_price and tp1_done:
-                        self._close_all("🎯 达成 1% 终极收益目标，落袋为安")
+                        self._close_all("🎯 达成 5% 终极收益目标，落袋为安")
                         break
             except Exception:
                 pass
@@ -145,7 +151,7 @@ class SignalProcessor:
         time.sleep(0.5) 
         close_res = self.client.close_all_positions(self.symbol)
         
-        if self.status == "OPEN":  # 只在有仓位被平掉时发送清场报告，防止日志刷屏
+        if self.status == "OPEN": 
             msg = f"### 💥 [CoinW] 焦土清场\n\n**触发原因**: {reason}\n\n**执行动作**: 已撤销所有遗留挂单并市价全平。"
             self.notifier.send_markdown("系统清场", msg)
             
