@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-# position_supervisor_coinw.py（短线刺客 - 原生限价一刀切完全体）
+# position_supervisor_coinw.py（短线刺客 - 原生限价 + 钉钉捷报闭环）
 import time
+import threading
 import logging
 from coinw_client import CoinWClient
 from dingtalk_notifier import DingTalkNotifier
@@ -18,6 +19,9 @@ class SignalProcessor:
         self.leverage = 20               # 20倍重装杠杆
         self.risk_ratio = 0.80           # 动用可用余额的 80%
         self.tp_eth_price_diff = 10.0    # 严格死锁 10 美金盘口差价
+        
+        self.monitor_thread = None
+        self.status = "IDLE"
 
     def process_signal(self, data: dict):
         action = data.get("action", "").upper()
@@ -52,6 +56,7 @@ class SignalProcessor:
                 self.notifier.send_markdown("报警: 开仓失败", f"交易所拒单回执:\n\n`{open_result}`")
                 return
 
+            self.status = "OPEN"
             logger.info(f"✅ {side} 开仓成功! 正在等待交易所仓位 ID 记账...")
             time.sleep(2.0) # 核心延迟：必须等待撮合引擎生成精确的持仓条目
 
@@ -65,8 +70,7 @@ class SignalProcessor:
                 f"**开仓动用**: `{usdt_amount} USDT` (80%)\n\n"
                 f"**开仓均价**: `{open_price}`\n\n"
                 f"---\n\n"
-                f"🎯 **交易所原生限价止盈**: `{tp_price}` *(10刀差价·一刀切全平)*\n\n"
-                f"💡 *状态: 限价单已死死钉入币赢订单簿，VPS 已释放盯盘线程，纯静默等待成交。*"
+                f"🎯 **限价止盈已钉入盘口**: `{tp_price}` *(10刀差价·一刀切)*\n\n"
             )
             self.notifier.send_markdown(f"短线开仓 {side}", report)
 
@@ -95,20 +99,65 @@ class SignalProcessor:
         res = self.client.place_limit_close_order(self.symbol, tp_price, rate="1.0")
         logger.info(f"🛡️ 盘口原生限价护盾建立状态: [{res.get('code')}] | 回执: {res}")
         
+        # 激活轻量级止盈巡逻犬，为钉钉捷报做准备
+        if self.monitor_thread is None or not self.monitor_thread.is_alive():
+            self.monitor_thread = threading.Thread(
+                target=self._victory_monitor_daemon, 
+                args=(tp_price,)
+            )
+            self.monitor_thread.daemon = True
+            self.monitor_thread.start()
+            
         return tp_price, open_price
+
+    def _victory_monitor_daemon(self, tp_price):
+        """【新增】轻量级巡逻犬：静默检查仓位是否被交易所撮合吃掉"""
+        logger.info("🐶 钉钉捷报巡逻犬已放出，静默监控限价单成交状态...")
+        while self.status == "OPEN":
+            time.sleep(4.0) # 每 4 秒查一次持仓状态，极低性能消耗
+            
+            # 状态一旦被主线程改成 CLOSING/CLOSED，立刻终止巡逻，防止误报
+            if self.status != "OPEN":
+                break
+                
+            try:
+                pos_info = self.client.get_position_info(self.symbol)
+                data = pos_info.get("data", [])
+                
+                # 如果查不到任何持仓，说明限价单被交易所成功吃掉了
+                if not data or len(data) == 0:
+                    logger.info("🎉 仓位已空！判定为原生限价止盈已触发！")
+                    msg = (
+                        f"### 🎉 [CoinW] 刺客捷报\n\n"
+                        f"**战况**: 10刀差价限价单 (`{tp_price}`) 已被交易所成功吃掉！\n\n"
+                        f"**结果**: 利润已落袋为安，仓位彻底清空，静待下一次 TV 号角。"
+                    )
+                    self.notifier.send_markdown("止盈捷报", msg)
+                    self.status = "CLOSED"
+                    break
+            except Exception:
+                pass
 
     def _close_all(self, reason):
         """焦土护城河：先撤销所有挂单，再强制清空持仓"""
         logger.info(f"🧹 {reason}")
         
+        # 先切断状态，防止止盈巡逻犬误报
+        was_open = (self.status == "OPEN")
+        self.status = "CLOSING" 
+        
         # 1. 索敌并逐一强制干掉盘口上没成交的限价单
         cancel_res = self.client.cancel_all_open_orders(self.symbol)
-        logger.info(f"🗑️ 盘口未成交挂单清理报告: {cancel_res.get('msg')}")
         time.sleep(0.5) 
         
         # 2. 市价强平现存仓位
         close_res = self.client.close_all_positions(self.symbol)
         
         # 发送清场战报
-        msg = f"### 💥 [CoinW] 短线全平清场\n\n**触发原因**: {reason}\n\n**执行状态**: 原生限价单已全撤，持仓已强制市价清空。"
-        self.notifier.send_markdown("系统清场", msg)
+        if was_open: 
+            msg = f"### 💥 [CoinW] 短线全平清场\n\n**触发原因**: {reason}\n\n**执行状态**: 原生限价单已全撤，持仓已强制市价清空。"
+            self.notifier.send_markdown("系统清场", msg)
+            
+        self.status = "CLOSED"
+
+coinw_processor = SignalProcessor()
