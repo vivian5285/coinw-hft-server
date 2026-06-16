@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# position_supervisor_coinw.py（最终完整版）
+# position_supervisor_coinw.py（最终更新版）
 import time
 import logging
 from coinw_client import CoinWClient
@@ -13,7 +13,6 @@ class SignalProcessor:
         self.client = CoinWClient()
         self.symbol = "ETH"
         self.leverage = 5
-        self.contract_size = 0.01
 
     def process_signal(self, data: dict):
         action = data.get("action", "").upper()
@@ -31,19 +30,15 @@ class SignalProcessor:
             time.sleep(1.2)
 
             available = self.client.get_available_balance()
-            price = self.client.get_current_price(self.symbol)
 
-            if available <= 0 or price <= 0:
-                logger.warning("余额或价格异常，放弃开仓")
+            if available < 10:
+                logger.warning(f"可用余额过小（{available} USDT），放弃开仓")
                 return
 
-            usdt_value = available * 0.8 * self.leverage
-            eth_amount = usdt_value / price
-            contract_qty = max(1, int(eth_amount / self.contract_size))
+            usdt_amount = round(available * 0.8, 2)
+            logger.info(f"下单 USDT 金额: {usdt_amount}")
 
-            logger.info(f"下单合约张数: {contract_qty}")
-
-            result = self.client.place_market_order(self.symbol, side, contract_qty, self.leverage)
+            result = self.client.place_market_order(self.symbol, side, usdt_amount, self.leverage)
             logger.info(f"开仓结果: {result}")
 
         except Exception as e:
