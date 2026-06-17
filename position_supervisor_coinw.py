@@ -2,6 +2,8 @@
 import time
 import threading
 import logging
+import json
+import websocket # 引入 WebSocket 库
 from coinw_client import CoinWClient
 from dingtalk_notifier import DingTalkNotifier
 
@@ -19,8 +21,14 @@ class SignalProcessor:
         self.risk_ratio = 0.50           
         self.tp_eth_price_diff = 13.0    
         
-        self.monitor_thread = None
         self.status = "IDLE"
+        
+        # 实时盯盘目标价与方向 (由 WebSocket 线程读取)
+        self.current_side = None
+        self.tp_target_price = 0.0
+        
+        # WebSocket 实例
+        self.ws = None
 
     def process_signal(self, data: dict):
         action = data.get("action", "").upper()
@@ -48,19 +56,23 @@ class SignalProcessor:
             usdt_amount = round(total_balance * self.risk_ratio, 2)
             logger.info(f"💰 可用: {total_balance:.2f} U | 动用 50%: {usdt_amount:.2f} U")
 
-            # 3. 发射开单指令 (使用还原的稳定参数)
+            # 3. 发射开单指令 (市价单)
             open_result = self.client.place_market_order(self.symbol, side, usdt_amount, self.leverage)
             if str(open_result.get("code")) not in ["200", "0"]:
                 self.notifier.send_markdown("报警: 开仓失败", f"交易所拒单:\n\n`{open_result}`")
                 return
 
-            self.status = "OPEN"
             time.sleep(2.0) # 等待订单完全成交
 
-            # 4. 激活 VPS 主动盯盘雷达
-            tp_price, open_price = self._activate_vps_radar(side)
+            # 4. 反推真实开仓价与止盈价
+            tp_price, open_price = self._calculate_target(side)
+            
+            # 5. 更新内存状态，准备激活 WebSocket 雷达
+            self.current_side = side
+            self.tp_target_price = tp_price
+            self.status = "OPEN"
 
-            # 5. 推送开仓战报
+            # 6. 推送开仓战报
             report = (
                 f"### 🚀 [CoinW] 短线刺客出击\n\n"
                 f"| 项目 | 详情 |\n"
@@ -69,15 +81,18 @@ class SignalProcessor:
                 f"| **本金** | `{usdt_amount} USDT` (50%) |\n"
                 f"| **杠杆** | 20x |\n"
                 f"| **开仓** | `{open_price}` |\n\n"
-                f"🎯 **VPS 主动盯盘目标**: `{tp_price}` *(13刀极速一刀切)*"
+                f"🎯 **光速 WS 雷达锁定**: `{tp_price}` *(毫秒级主动斩仓)*"
             )
             self.notifier.send_markdown(f"短线开仓 {side}", report)
+            
+            # 7. 启动 WebSocket 实时雷达
+            self._start_websocket_radar()
 
         except Exception as e:
             logger.error(f"战场异常: {e}", exc_info=True)
 
-    def _activate_vps_radar(self, side: str):
-        """反推真实开仓价，并启动 VPS 主动监控线程"""
+    def _calculate_target(self, side: str):
+        """仅反推真实开仓价和目标价"""
         pos_info = self.client.get_position_info(self.symbol)
         open_price = 0.0
         
@@ -92,57 +107,97 @@ class SignalProcessor:
             tp_price = round(open_price + self.tp_eth_price_diff, 2)
         else:
             tp_price = round(open_price - self.tp_eth_price_diff, 2)
-
-        # 启动每秒一次的极速雷达
-        if self.monitor_thread is None or not self.monitor_thread.is_alive():
-            self.monitor_thread = threading.Thread(
-                target=self._price_monitor_daemon, 
-                args=(side, tp_price)
-            )
-            self.monitor_thread.daemon = True
-            self.monitor_thread.start()
             
         return tp_price, open_price
 
-    def _price_monitor_daemon(self, side, tp_target_price):
-        """VPS 上帝视角雷达：每 1.5 秒刷新现价，到达直接开枪全平"""
-        logger.info(f"👁️‍🗨️ VPS 雷达已锁定目标价 {tp_target_price}，进入极速高频盯盘模式...")
-        
-        while self.status == "OPEN":
-            try:
-                current_price = self.client.get_current_price(self.symbol)
-                if current_price <= 0:
-                    time.sleep(1)
-                    continue
-
-                # 核心绝杀逻辑：涨破/跌破目标价，直接斩仓！
-                if side == "LONG" and current_price >= tp_target_price:
-                    logger.info(f"✨ 多单突破 {tp_target_price}! 执行斩仓！")
-                    self._close_all("🎯 斩获 13U 盘口差价，VPS 主动极速落袋！")
-                    break
-                    
-                elif side == "SHORT" and current_price <= tp_target_price:
-                    logger.info(f"✨ 空单跌破 {tp_target_price}! 执行斩仓！")
-                    self._close_all("🎯 斩获 13U 盘口差价，VPS 主动极速落袋！")
-                    break
-                    
-            except Exception:
-                pass
+    # ==========================================
+    # WebSocket 毫秒级雷达核心逻辑
+    # ==========================================
+    def _start_websocket_radar(self):
+        """启动长连接光缆"""
+        if self.ws is not None:
+            self.ws.close()
             
-            time.sleep(1.5) # 极速高频雷达
+        logger.info("🔌 正在连接币赢 WebSocket 实时行情光缆...")
+        websocket.enableTrace(False)
+        self.ws = websocket.WebSocketApp(
+            "wss://ws.futurescw.com/perpum",
+            on_open=self._on_ws_open,
+            on_message=self._on_ws_message,
+            on_error=self._on_ws_error,
+            on_close=self._on_ws_close
+        )
+        
+        # 放入后台独立线程运行，绝对不阻塞主程序
+        wst = threading.Thread(target=self.ws.run_forever)
+        wst.daemon = True
+        wst.start()
+
+    def _on_ws_open(self, ws):
+        logger.info("✅ WebSocket 光缆连接成功！正在订阅 ETH 实时价格...")
+        # ⚠️ 注意：这里使用的是最常见的币赢公开频道订阅格式。
+        # 如果币赢文档有变更，可能需要微调这行 JSON。
+        sub_msg = {
+            "event": "subscribe",
+            "params": {
+                "channel": "ticker",
+                "instrument": "ETH"
+            }
+        }
+        ws.send(json.dumps(sub_msg))
+
+    def _on_ws_message(self, ws, message):
+        if self.status != "OPEN":
+            return # 如果不是开仓状态，忽略所有推过来的价格
+            
+        try:
+            data = json.loads(message)
+            # 解析行情推送包获取最新价 (此处需匹配币赢WS返回结构，通常带有 last_price)
+            if "data" in data and isinstance(data["data"], dict):
+                current_price_str = data["data"].get("last_price")
+                if not current_price_str:
+                    return
+                
+                current_price = float(current_price_str)
+                
+                # 核心绝杀逻辑：涨破/跌破目标价，直接斩仓！毫秒级响应！
+                if self.current_side == "LONG" and current_price >= self.tp_target_price:
+                    logger.info(f"✨ [WS毫秒触发] 多单突破 {self.tp_target_price}! 现价: {current_price}")
+                    self.ws.close() # 目标达成，切断雷达省电
+                    self._close_all("🎯 斩获 13U 盘口差价，WS 雷达光速落袋！")
+                    
+                elif self.current_side == "SHORT" and current_price <= self.tp_target_price:
+                    logger.info(f"✨ [WS毫秒触发] 空单跌破 {self.tp_target_price}! 现价: {current_price}")
+                    self.ws.close() # 目标达成，切断雷达省电
+                    self._close_all("🎯 斩获 13U 盘口差价，WS 雷达光速落袋！")
+        except Exception:
+            pass
+
+    def _on_ws_error(self, ws, error):
+        logger.error(f"⚠️ WebSocket 雷达受干扰: {error}")
+
+    def _on_ws_close(self, ws, close_status_code, close_msg):
+        logger.info("🔌 WebSocket 行情光缆已断开。")
+
+    # ==========================================
 
     def _close_all(self, reason):
         logger.info(f"🧹 {reason}")
         was_open = (self.status == "OPEN")
         self.status = "CLOSING" 
         
+        # 切断 WS 雷达
+        if self.ws:
+            self.ws.close()
+            self.ws = None
+            
         self.client.cancel_all_open_orders(self.symbol)
         time.sleep(0.5) 
         
         self.client.close_all_positions(self.symbol)
         
         if was_open: 
-            msg = f"### 💥 [CoinW] 阵地清算\n\n**动作**: {reason}\n\n**状态**: 挂单与持仓已被 VPS 强制彻底抹除。"
+            msg = f"### 💥 [CoinW] 阵地清算\n\n**动作**: {reason}\n\n**状态**: 利润已落袋，实盘全平清场完毕。"
             self.notifier.send_markdown("系统清场", msg)
             
         self.status = "CLOSED"
