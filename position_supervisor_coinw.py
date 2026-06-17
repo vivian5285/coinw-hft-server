@@ -14,7 +14,7 @@ class SignalProcessor:
         self.notifier = DingTalkNotifier()
         self.symbol = "ETH"
         
-        # 极速快进快出核心风控配置
+        # 50%本金 / 20倍 / 13刀主动盯盘
         self.leverage = 20               
         self.risk_ratio = 0.50           
         self.tp_eth_price_diff = 13.0    
@@ -35,50 +35,49 @@ class SignalProcessor:
 
     def _refresh_position(self, side: str):
         try:
-            # 1. 焦土重置：无论是多接多，还是多接空，一律无差别先撤单再全平！
+            # 1. 焦土重置
             self._close_all(f"🔄 强制重置阵地：准备执行新方向 {side}")
             time.sleep(1.5) 
 
-            # 2. 盘点子弹
+            # 2. 算子弹
             total_balance = self.client.get_available_balance()
             if total_balance < 10:
-                msg = f"❌ **资金枯竭**\n\n当前余额 `{total_balance:.2f} U` 不足，系统拒绝开仓！"
-                self.notifier.send_markdown("报警: 余额不足", msg)
+                self.notifier.send_markdown("报警: 余额不足", f"当前余额 `{total_balance:.2f} U` 不足！")
                 return
 
             usdt_amount = round(total_balance * self.risk_ratio, 2)
-            logger.info(f"💰 账户可用: {total_balance:.2f} USDT | 动用 50%: {usdt_amount:.2f} USDT")
+            logger.info(f"💰 可用: {total_balance:.2f} U | 动用 50%: {usdt_amount:.2f} U")
 
-            # 3. 闪电市价开仓 (20倍)
+            # 3. 发射开单指令 (使用还原的稳定参数)
             open_result = self.client.place_market_order(self.symbol, side, usdt_amount, self.leverage)
             if str(open_result.get("code")) not in ["200", "0"]:
-                self.notifier.send_markdown("报警: 开仓失败", f"交易所拒单回执:\n\n`{open_result}`")
+                self.notifier.send_markdown("报警: 开仓失败", f"交易所拒单:\n\n`{open_result}`")
                 return
 
             self.status = "OPEN"
-            logger.info(f"✅ {side} 纯市价开仓成功! 正在等待交易所生成持仓 ID...")
-            time.sleep(2.0) # 留出时间让交易所生成真实的持仓，保证下一步挂止盈必定成功
+            time.sleep(2.0) # 等待订单完全成交
 
-            # 4. 提取真实开仓价并挂出原生的限价止盈单 (13刀)
-            tp_price, open_price = self._execute_native_limit_tp(side)
+            # 4. 激活 VPS 主动盯盘雷达
+            tp_price, open_price = self._activate_vps_radar(side)
 
-            # 5. 推送战报
+            # 5. 推送开仓战报
             report = (
-                f"### 🚀 [CoinW] 短线刺客·新局开启\n\n"
+                f"### 🚀 [CoinW] 短线刺客出击\n\n"
                 f"| 项目 | 详情 |\n"
                 f"| :--- | :--- |\n"
                 f"| **方向** | <font color='#FF0000'>{side}</font> |\n"
                 f"| **本金** | `{usdt_amount} USDT` (50%) |\n"
                 f"| **杠杆** | 20x |\n"
-                f"| **开仓均价** | `{open_price}` |\n\n"
-                f"🎯 **限价止盈已挂出**: `{tp_price}` *(13刀差价·一刀切)*"
+                f"| **开仓** | `{open_price}` |\n\n"
+                f"🎯 **VPS 主动盯盘目标**: `{tp_price}` *(13刀极速一刀切)*"
             )
             self.notifier.send_markdown(f"短线开仓 {side}", report)
 
         except Exception as e:
             logger.error(f"战场异常: {e}", exc_info=True)
 
-    def _execute_native_limit_tp(self, side: str):
+    def _activate_vps_radar(self, side: str):
+        """反推真实开仓价，并启动 VPS 主动监控线程"""
         pos_info = self.client.get_position_info(self.symbol)
         open_price = 0.0
         
@@ -87,7 +86,6 @@ class SignalProcessor:
             open_price = float(data[0].get("openPrice", 0))
 
         if open_price <= 0:
-            logger.warning("未获取到持仓均价，改用现价计算止盈！")
             open_price = self.client.get_current_price(self.symbol)
 
         if side == "LONG":
@@ -95,60 +93,56 @@ class SignalProcessor:
         else:
             tp_price = round(open_price - self.tp_eth_price_diff, 2)
 
-        res = self.client.place_limit_close_order(self.symbol, tp_price, rate="1.0")
-        logger.info(f"🛡️ 盘口原生限价挂单状态: [{res.get('code')}] | 回执: {res}")
-        
+        # 启动每秒一次的极速雷达
         if self.monitor_thread is None or not self.monitor_thread.is_alive():
             self.monitor_thread = threading.Thread(
-                target=self._victory_monitor_daemon, 
-                args=(tp_price,)
+                target=self._price_monitor_daemon, 
+                args=(side, tp_price)
             )
             self.monitor_thread.daemon = True
             self.monitor_thread.start()
             
         return tp_price, open_price
 
-    def _victory_monitor_daemon(self, tp_price):
-        logger.info("🐶 钉钉捷报巡逻犬已放出，静默监控限价单成交状态...")
+    def _price_monitor_daemon(self, side, tp_target_price):
+        """VPS 上帝视角雷达：每 1.5 秒刷新现价，到达直接开枪全平"""
+        logger.info(f"👁️‍🗨️ VPS 雷达已锁定目标价 {tp_target_price}，进入极速高频盯盘模式...")
+        
         while self.status == "OPEN":
-            time.sleep(4.0) 
-            
-            if self.status != "OPEN":
-                break
-                
             try:
-                pos_info = self.client.get_position_info(self.symbol)
-                data = pos_info.get("data", [])
-                
-                if not data or len(data) == 0:
-                    logger.info("🎉 仓位已空！判定为原生限价止盈已触发！")
-                    msg = (
-                        f"### 🎉 [CoinW] 刺客捷报\n\n"
-                        f"**战况**: 13刀差价限价单 (`{tp_price}`) 已被顺利吃掉！\n\n"
-                        f"**结果**: 利润已落袋，仓位彻底清空，静待下次号角。"
-                    )
-                    self.notifier.send_markdown("止盈捷报", msg)
-                    self.status = "CLOSED"
+                current_price = self.client.get_current_price(self.symbol)
+                if current_price <= 0:
+                    time.sleep(1)
+                    continue
+
+                # 核心绝杀逻辑：涨破/跌破目标价，直接斩仓！
+                if side == "LONG" and current_price >= tp_target_price:
+                    logger.info(f"✨ 多单突破 {tp_target_price}! 执行斩仓！")
+                    self._close_all("🎯 斩获 13U 盘口差价，VPS 主动极速落袋！")
                     break
+                    
+                elif side == "SHORT" and current_price <= tp_target_price:
+                    logger.info(f"✨ 空单跌破 {tp_target_price}! 执行斩仓！")
+                    self._close_all("🎯 斩获 13U 盘口差价，VPS 主动极速落袋！")
+                    break
+                    
             except Exception:
                 pass
+            
+            time.sleep(1.5) # 极速高频雷达
 
     def _close_all(self, reason):
         logger.info(f"🧹 {reason}")
         was_open = (self.status == "OPEN")
         self.status = "CLOSING" 
         
-        # 1. 彻底撤销未成交的限价单
-        cancel_res = self.client.cancel_all_open_orders(self.symbol)
-        logger.info(f"清理挂单: {cancel_res}")
+        self.client.cancel_all_open_orders(self.symbol)
         time.sleep(0.5) 
         
-        # 2. 逐一绞杀所有持仓（哪怕乌龙多空双开了，也会一个个杀干净）
-        close_res = self.client.close_all_positions(self.symbol)
-        logger.info(f"清理持仓: {close_res}")
+        self.client.close_all_positions(self.symbol)
         
         if was_open: 
-            msg = f"### 💥 [CoinW] 阵地重置\n\n**动作**: {reason}\n\n**状态**: 历史限价单已全撤，旧仓位已强制市价清空。"
+            msg = f"### 💥 [CoinW] 阵地清算\n\n**动作**: {reason}\n\n**状态**: 挂单与持仓已被 VPS 强制彻底抹除。"
             self.notifier.send_markdown("系统清场", msg)
             
         self.status = "CLOSED"
