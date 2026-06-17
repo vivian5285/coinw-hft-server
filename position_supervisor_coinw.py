@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# position_supervisor_coinw.py（短线刺客 - 原生限价 + 钉钉捷报闭环）
+# position_supervisor_coinw.py（50%仓位 + 20倍杠杆 + 13刀一刀切止盈）
 import time
 import threading
 import logging
@@ -15,10 +15,10 @@ class SignalProcessor:
         self.notifier = DingTalkNotifier()
         self.symbol = "ETH"
         
-        # 10分钟短线超频核心风控配置
+        # 极速快进快出核心风控配置
         self.leverage = 20               # 20倍重装杠杆
-        self.risk_ratio = 0.80           # 动用可用余额的 80%
-        self.tp_eth_price_diff = 10.0    # 严格死锁 10 美金盘口差价
+        self.risk_ratio = 0.50           # 【更新】动用可用余额的 50%
+        self.tp_eth_price_diff = 13.0    # 【更新】严格死锁 13 美金盘口差价
         
         self.monitor_thread = None
         self.status = "IDLE"
@@ -36,9 +36,10 @@ class SignalProcessor:
 
     def _refresh_position(self, side: str):
         try:
-            # 1. 斩断过往：先扫射所有未成交限价单，再强制市价全平当前持仓
-            self._close_all(f"🔄 接收到反转新指令 {side}，前置焦土清理")
-            time.sleep(1.5) # 给予交易所系统释放保证金的硬缓冲时间
+            # 1. 斩断过往（同向/反向无差别处理）：
+            # 只要有新信号，绝对优先撤销没成交的13刀限价单，并强制市价全平现存持仓，保证永远只有一手
+            self._close_all(f"🔄 强制重置阵地：准备执行新方向 {side}")
+            time.sleep(1.5) # 给予交易所系统释放冻结资金的缓冲时间
 
             # 2. 盘点子弹
             total_balance = self.client.get_available_balance()
@@ -47,10 +48,11 @@ class SignalProcessor:
                 self.notifier.send_markdown("报警: 余额不足", msg)
                 return
 
+            # 【核心逻辑】使用 50% 可用余额
             usdt_amount = round(total_balance * self.risk_ratio, 2)
-            logger.info(f"💰 账户可用: {total_balance:.2f} USDT | 准星锁定 80%: {usdt_amount:.2f} USDT")
+            logger.info(f"💰 账户可用: {total_balance:.2f} USDT | 准星锁定 50%: {usdt_amount:.2f} USDT")
 
-            # 3. 闪电市价开仓
+            # 3. 闪电市价开仓 (20倍)
             open_result = self.client.place_market_order(self.symbol, side, usdt_amount, self.leverage)
             if str(open_result.get("code")) not in ["200", "0"]:
                 self.notifier.send_markdown("报警: 开仓失败", f"交易所拒单回执:\n\n`{open_result}`")
@@ -58,19 +60,21 @@ class SignalProcessor:
 
             self.status = "OPEN"
             logger.info(f"✅ {side} 开仓成功! 正在等待交易所仓位 ID 记账...")
-            time.sleep(2.0) # 核心延迟：必须等待撮合引擎生成精确的持仓条目
+            time.sleep(2.0)
 
-            # 4. 提取真实开仓价并挂出原生的限价止盈单
+            # 4. 提取真实开仓价并挂出原生的限价止盈单 (13刀)
             tp_price, open_price = self._execute_native_limit_tp(side)
 
-            # 5. 推送战报
+            # 5. 推送战报 (适配美学排版)
             report = (
-                f"### 🚀 [CoinW] 短线刺客·全自动挂单\n\n"
-                f"**作战方向**: <font color='#FF0000'>{side}</font> *(20x 杠杆)*\n\n"
-                f"**开仓动用**: `{usdt_amount} USDT` (80%)\n\n"
-                f"**开仓均价**: `{open_price}`\n\n"
-                f"---\n\n"
-                f"🎯 **限价止盈已钉入盘口**: `{tp_price}` *(10刀差价·一刀切)*\n\n"
+                f"### 🚀 [CoinW] 短线刺客·新局开启\n\n"
+                f"| 项目 | 详情 |\n"
+                f"| :--- | :--- |\n"
+                f"| **方向** | <font color='#FF0000'>{side}</font> |\n"
+                f"| **本金** | `{usdt_amount} USDT` (50%) |\n"
+                f"| **杠杆** | 20x |\n"
+                f"| **开仓** | `{open_price}` |\n\n"
+                f"🎯 **限价止盈**: `{tp_price}` *(13刀差价·一刀切)*"
             )
             self.notifier.send_markdown(f"短线开仓 {side}", report)
 
@@ -78,7 +82,7 @@ class SignalProcessor:
             logger.error(f"战场异常: {e}", exc_info=True)
 
     def _execute_native_limit_tp(self, side: str):
-        """精准反推并直接向交易所报单簿投递限价平仓单"""
+        """精准反推并直接向交易所报单簿投递 13刀 极速限价平仓单"""
         pos_info = self.client.get_position_info(self.symbol)
         open_price = 0.0
         
@@ -89,7 +93,7 @@ class SignalProcessor:
         if open_price <= 0:
             open_price = self.client.get_current_price(self.symbol)
 
-        # 绝对价格反推
+        # 【核心逻辑】绝对价格反推：13刀差价
         if side == "LONG":
             tp_price = round(open_price + self.tp_eth_price_diff, 2)
         else:
@@ -111,12 +115,11 @@ class SignalProcessor:
         return tp_price, open_price
 
     def _victory_monitor_daemon(self, tp_price):
-        """【新增】轻量级巡逻犬：静默检查仓位是否被交易所撮合吃掉"""
+        """轻量级巡逻犬：静默检查仓位是否被交易所撮合吃掉"""
         logger.info("🐶 钉钉捷报巡逻犬已放出，静默监控限价单成交状态...")
         while self.status == "OPEN":
-            time.sleep(4.0) # 每 4 秒查一次持仓状态，极低性能消耗
+            time.sleep(4.0) 
             
-            # 状态一旦被主线程改成 CLOSING/CLOSED，立刻终止巡逻，防止误报
             if self.status != "OPEN":
                 break
                 
@@ -124,13 +127,13 @@ class SignalProcessor:
                 pos_info = self.client.get_position_info(self.symbol)
                 data = pos_info.get("data", [])
                 
-                # 如果查不到任何持仓，说明限价单被交易所成功吃掉了
+                # 如果查不到任何持仓，说明 13 刀限价单被交易所成功吃掉了
                 if not data or len(data) == 0:
                     logger.info("🎉 仓位已空！判定为原生限价止盈已触发！")
                     msg = (
                         f"### 🎉 [CoinW] 刺客捷报\n\n"
-                        f"**战况**: 10刀差价限价单 (`{tp_price}`) 已被交易所成功吃掉！\n\n"
-                        f"**结果**: 利润已落袋为安，仓位彻底清空，静待下一次 TV 号角。"
+                        f"**战况**: 13刀差价限价单 (`{tp_price}`) 已被顺利吃掉！\n\n"
+                        f"**结果**: 利润已落袋，仓位清空，静待下次号角。"
                     )
                     self.notifier.send_markdown("止盈捷报", msg)
                     self.status = "CLOSED"
@@ -146,16 +149,16 @@ class SignalProcessor:
         was_open = (self.status == "OPEN")
         self.status = "CLOSING" 
         
-        # 1. 索敌并逐一强制干掉盘口上没成交的限价单
-        cancel_res = self.client.cancel_all_open_orders(self.symbol)
+        # 1. 索敌并逐一强制干掉盘口上没成交的 13刀 限价单
+        self.client.cancel_all_open_orders(self.symbol)
         time.sleep(0.5) 
         
         # 2. 市价强平现存仓位
-        close_res = self.client.close_all_positions(self.symbol)
+        self.client.close_all_positions(self.symbol)
         
         # 发送清场战报
         if was_open: 
-            msg = f"### 💥 [CoinW] 短线全平清场\n\n**触发原因**: {reason}\n\n**执行状态**: 原生限价单已全撤，持仓已强制市价清空。"
+            msg = f"### 💥 [CoinW] 阵地重置\n\n**动作**: {reason}\n\n**状态**: 历史限价单已全撤，旧仓位已强制市价清空。"
             self.notifier.send_markdown("系统清场", msg)
             
         self.status = "CLOSED"
