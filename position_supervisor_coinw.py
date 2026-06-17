@@ -1,208 +1,200 @@
 #!/usr/bin/env python3
+# position_supervisor_coinw.py（V3.0 终极黄金耐心 + 极速内存雷达版）
+import logging
 import time
 import threading
-import logging
-import json
-import websocket 
 from coinw_client import CoinWClient
-from dingtalk_notifier import DingTalkNotifier
+import dingtalk
 
-logging.basicConfig(level=logging.INFO, format='[%(asctime)s] [%(levelname)s] %(message)s')
+# 配置日志
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] Supervisor: %(message)s')
 logger = logging.getLogger(__name__)
 
-class SignalProcessor:
+# 实例化币赢专属通信网关
+coinw_client = CoinWClient()
+
+class CoinWProcessor:
     def __init__(self):
-        self.client = CoinWClient()
-        self.notifier = DingTalkNotifier()
-        self.symbol = "ETH"
-        
-        # 50%本金 / 20倍 / 13刀主动盯盘
-        self.leverage = 20               
-        self.risk_ratio = 0.50           
-        self.tp_eth_price_diff = 13.0    
-        
-        self.status = "IDLE"
-        
-        self.current_side = None
-        self.tp_target_price = 0.0
-        self.ws = None
+        self.monitoring = False
+        self.target_profit_diff = 13.0  # 核心战略：死磕 13U 差价
+        self.leverage = 20
+        self.monitor_thread = None
+        self._lock = threading.Lock()
+        logger.info("🟢 [CoinW] 高频刺客引擎初始化完成，极速雷达待命。")
 
-    def process_signal(self, data: dict):
-        action = data.get("action", "").upper()
-        logger.info(f"========== 收到新TV信号: {action} ==========")
-
-        if action == "CLOSE":
-            self._close_all("📡 接收到 TV 主动平仓信号")
+    def process_signal(self, payload: dict):
+        """处理来自 TV 的纯净 JSON 信号"""
+        action = payload.get("action", "").upper()
+        if not action:
             return
 
+        # 只要有新信号，立刻切断现有的极速雷达，防止多线程打架
+        with self._lock:
+            self.monitoring = False 
+
+        # ==========================================
+        # 场景一：TV 下发全平指令 (CLOSE)
+        # ==========================================
+        if action == "CLOSE":
+            self._close_all("接收到 TV 主动平仓信号")
+            return
+
+        # ==========================================
+        # 场景二：TV 下发开仓指令 (LONG / SHORT)
+        # ==========================================
         if action in ["LONG", "SHORT"]:
-            self._refresh_position(action)
+            # 1. 前置焦土清场（绝对护城河）
+            self._close_all(f"强制重置阵地: 准备执行新方向 {action}")
 
-    def _refresh_position(self, side: str):
-        try:
-            # 1. 铁律：任何新信号到达，绝对前置清场！清剿所有幽灵挂单，斩平所有历史仓位！
-            self._close_all(f"🔄 强制重置阵地：准备执行新方向 {side}")
-            time.sleep(1.5) 
-
-            # 2. 算子弹
-            total_balance = self.client.get_available_balance()
-            if total_balance < 10:
-                self.notifier.send_markdown("报警: 余额不足", f"当前余额 `{total_balance:.2f} U` 不足！")
+            # 2. 核心资金核算 (动用 50% 可用余额，20倍杠杆)
+            balance = coinw_client.get_available_balance()
+            if balance < 10:
+                logger.warning(f"[CoinW] 账户余额不足 ({balance} USDT)，放弃建仓。")
                 return
-
-            usdt_amount = round(total_balance * self.risk_ratio, 2)
-            logger.info(f"💰 可用: {total_balance:.2f} U | 动用 50%: {usdt_amount:.2f} U")
-
-            # 3. 发射开单指令 (带价格的限价伪市价单)
-            open_result = self.client.place_market_order(self.symbol, side, usdt_amount, self.leverage)
-            if str(open_result.get("code")) not in ["200", "0"]:
-                self.notifier.send_markdown("报警: 开仓失败", f"交易所拒单:\n\n`{open_result}`")
-                return
-
-            # 4. 【核心升级】死盯实盘核实是否成交 (最大等待 15 秒)
-            logger.info(f"⏳ 订单已挂入盘口，正在核实实盘是否真正吃单成交...")
-            filled_price = self._wait_for_position_fill(timeout=15)
-
-            # 如果 15 秒了还没成交，启动防呆机制
-            if filled_price is None:
-                logger.warning(f"⚠️ 开仓挂单未能在 15 秒内成交，执行超时强撤！防呆机制触发！")
-                self.client.cancel_all_open_orders(self.symbol) # 杀掉这个幽灵订单
-                self.notifier.send_markdown(
-                    "⚠️ 开仓超时强撤", 
-                    f"**方向**: {side}\n\n指令发出后 **15秒** 仍未被交易所撮合，为防挂单被意外吃掉，系统已主动撤销此单并退回空仓待命。"
-                )
-                self.status = "CLOSED"
-                return
-
-            # 走到这里，说明 100% 真正实盘有持仓了！
-            self.status = "OPEN"
-            self.current_side = side
-
-            # 5. 反推目标价
-            if side == "LONG":
-                self.tp_target_price = round(filled_price + self.tp_eth_price_diff, 2)
-            else:
-                self.tp_target_price = round(filled_price - self.tp_eth_price_diff, 2)
-
-            # 6. 【只发真捷报】推送到钉钉
-            report = (
-                f"### 🚀 [CoinW] 短线刺客·真实建仓\n\n"
-                f"| 项目 | 详情 |\n"
-                f"| :--- | :--- |\n"
-                f"| **方向** | <font color='#FF0000'>{side}</font> |\n"
-                f"| **本金** | `{usdt_amount} USDT` (50%) |\n"
-                f"| **杠杆** | 20x |\n"
-                f"| **真实开仓价** | `{filled_price}` |\n\n"
-                f"🎯 **WS 极速雷达锁定**: `{self.tp_target_price}` *(主动斩仓)*"
-            )
-            self.notifier.send_markdown(f"短线开仓 {side}", report)
-            
-            # 7. 开启 WS 雷达
-            self._start_websocket_radar()
-
-        except Exception as e:
-            logger.error(f"战场异常: {e}", exc_info=True)
-
-    def _wait_for_position_fill(self, timeout=15):
-        """死循环轮询实盘，确认仓位是否真实建立。建立则返回开仓价，未建立返回 None"""
-        for _ in range(timeout):
-            try:
-                pos_info = self.client.get_position_info(self.symbol)
-                data = pos_info.get("data", [])
-                for pos in data:
-                    open_price = float(pos.get("openPrice", 0))
-                    if open_price > 0:
-                        return open_price  # 只要查到了有均价大于 0 的持仓，证明成交了！
-            except Exception:
-                pass
-            time.sleep(1) # 每秒查一次实盘
-        return None
-
-    # ==========================================
-    # WebSocket 毫秒级雷达核心逻辑
-    # ==========================================
-    def _start_websocket_radar(self):
-        if self.ws is not None:
-            self.ws.close()
-            
-        logger.info("🔌 正在连接币赢 WebSocket 实时行情光缆...")
-        websocket.enableTrace(False)
-        self.ws = websocket.WebSocketApp(
-            "wss://ws.futurescw.com/perpum",
-            on_open=self._on_ws_open,
-            on_message=self._on_ws_message,
-            on_error=self._on_ws_error,
-            on_close=self._on_ws_close
-        )
-        
-        wst = threading.Thread(target=self.ws.run_forever)
-        wst.daemon = True
-        wst.start()
-
-    def _on_ws_open(self, ws):
-        logger.info("✅ WebSocket 光缆连接成功！正在订阅 ETH 实时价格...")
-        sub_msg = {
-            "event": "subscribe",
-            "params": {
-                "channel": "ticker",
-                "instrument": "ETH"
-            }
-        }
-        ws.send(json.dumps(sub_msg))
-
-    def _on_ws_message(self, ws, message):
-        if self.status != "OPEN":
-            return 
-            
-        try:
-            data = json.loads(message)
-            if "data" in data and isinstance(data["data"], dict):
-                current_price_str = data["data"].get("last_price")
-                if not current_price_str:
-                    return
                 
-                current_price = float(current_price_str)
-                
-                if self.current_side == "LONG" and current_price >= self.tp_target_price:
-                    logger.info(f"✨ [WS触发] 多单突破 {self.tp_target_price}! 现价: {current_price}")
-                    self.ws.close()
-                    self._close_all("🎯 斩获 13U 盘口差价，WS 雷达光速落袋！")
+            margin = balance * 0.50
+            amount = margin * self.leverage  # 转化为 API 能够识别的名义价值
+            
+            # 3. 稳定下达开仓指令
+            logger.info(f"[CoinW] 发射开仓指令: {action} (本金: {margin:.2f}U, 杠杆: {self.leverage}x)")
+            coinw_client.place_market_order(symbol="ETH", side=action, amount=amount, leverage=self.leverage)
+            
+            # 4. 【黄金 60 秒】实盘死等核实机制
+            filled = False
+            entry_price = 0.0
+            
+            for attempt in range(60):
+                time.sleep(1) # 每秒查一次账本
+                pos = self._get_active_position()
+                if pos:
+                    filled = True
+                    entry_price = pos['entry_price']
+                    break
                     
-                elif self.current_side == "SHORT" and current_price <= self.tp_target_price:
-                    logger.info(f"✨ [WS触发] 空单跌破 {self.tp_target_price}! 现价: {current_price}")
-                    self.ws.close()
-                    self._close_all("🎯 斩获 13U 盘口差价，WS 雷达光速落袋！")
-        except Exception:
-            pass
-
-    def _on_ws_error(self, ws, error):
-        pass
-
-    def _on_ws_close(self, ws, close_status_code, close_msg):
-        logger.info("🔌 WebSocket 行情光缆已断开。")
+            # 5. 防呆强撤兜底
+            if not filled:
+                coinw_client.cancel_all_open_orders(symbol="ETH")
+                logger.warning(f"[CoinW] 60秒未成交，执行防呆强撤。")
+                self._report_timeout()
+                return
+                
+            # 6. 真实建仓成功，钉钉播报
+            target_price = entry_price + self.target_profit_diff if action == "LONG" else entry_price - self.target_profit_diff
+            self._report_open(action, margin, entry_price, target_price)
+            
+            # 7. 唤醒极速内存雷达
+            self._start_radar(action, entry_price, target_price)
 
     # ==========================================
+    # 核心动作与雷达追踪模块
+    # ==========================================
 
-    def _close_all(self, reason):
-        logger.info(f"🧹 {reason}")
-        was_open = (self.status == "OPEN")
-        self.status = "CLOSING" 
-        
-        if self.ws:
-            self.ws.close()
-            self.ws = None
-            
-        # 1. 绝对优先：撤掉所有盘口幽灵挂单
-        self.client.cancel_all_open_orders(self.symbol)
-        time.sleep(0.5) 
-        
-        # 2. 强平所有仓位
-        self.client.close_all_positions(self.symbol)
-        
-        if was_open: 
-            msg = f"### 💥 [CoinW] 阵地清算\n\n**动作**: {reason}\n\n**状态**: 幽灵挂单与现有持仓已被彻底清理归零。"
-            self.notifier.send_markdown("系统清场", msg)
-            
-        self.status = "CLOSED"
+    def _close_all(self, reason: str):
+        """绝对焦土清场：撤单 + 全平"""
+        coinw_client.cancel_all_open_orders(symbol="ETH")
+        time.sleep(0.5) # 给交易所撮合引擎 0.5 秒缓冲
+        coinw_client.close_all_positions(symbol="ETH")
+        self._report_clear(reason)
 
-coinw_processor = SignalProcessor()
+    def _get_active_position(self) -> dict:
+        """精准提取实盘持仓均价"""
+        try:
+            res = coinw_client.get_position_info("ETH")
+            data = res.get("data", [])
+            if not data: return None
+            
+            for pos in data:
+                # 兼容币赢可能返回的各种仓位字段名
+                size = float(pos.get("position", pos.get("volume", pos.get("size", pos.get("holdVolume", 0)))))
+                if size > 0:
+                    entry = float(pos.get("openPrice", pos.get("avgPrice", pos.get("price", 0))))
+                    return {"size": size, "entry_price": entry}
+            return None
+        except Exception as e:
+            logger.error(f"[CoinW] 解析实盘持仓异常: {e}")
+            return None
+
+    def _start_radar(self, action: str, entry_price: float, target_price: float):
+        """拉起后台微线程，200ms 极速轮询盯盘"""
+        with self._lock:
+            self.monitoring = True
+            
+        self.monitor_thread = threading.Thread(
+            target=self._radar_loop, 
+            args=(action, entry_price, target_price), 
+            daemon=True
+        )
+        self.monitor_thread.start()
+
+    def _radar_loop(self, action: str, entry_price: float, target_price: float):
+        """极速内存雷达：每秒 5 次扫描接口，无视 WS 假死"""
+        logger.info(f"🎯 [极速雷达] 已锁定目标: {target_price:.2f} (200ms 高频模式)")
+        
+        while self.monitoring:
+            try:
+                current_price = coinw_client.get_current_price("ETH")
+                if current_price <= 0:
+                    time.sleep(0.2)
+                    continue
+                    
+                # 扣动扳机条件
+                if action == "LONG" and current_price >= target_price:
+                    self._execute_tp(action, entry_price, current_price)
+                    break
+                elif action == "SHORT" and current_price <= target_price:
+                    self._execute_tp(action, entry_price, current_price)
+                    break
+                    
+            except Exception as e:
+                pass # 忽略网络波动，继续疯狂轮询
+                
+            time.sleep(0.2) # 关键核心：200 毫秒极限探测间隔
+
+    def _execute_tp(self, action: str, entry_price: float, current_price: float):
+        """触发 13U 斩仓指令"""
+        with self._lock:
+            self.monitoring = False # 销毁雷达
+            
+        logger.info(f"✨ [极速雷达] 破局！现价: {current_price}，立即市价全平！")
+        coinw_client.close_all_positions("ETH")
+        self._report_tp(action, entry_price, current_price)
+
+    # ==========================================
+    # 钉钉美学战报模块
+    # ==========================================
+
+    def _report_clear(self, reason: str):
+        text = f"**动作**：🔄 {reason}\n**状态**：幽灵挂单与现有持仓已被彻底清理归零。"
+        dingtalk.send_markdown_message("💥 [CoinW] 阵地清算", text)
+
+    def _report_timeout(self):
+        text = f"**动作**：强制撤销指令\n**原因**：受限于盘口深度，挂单满 60 秒仍未排到成交，系统已安全强撤并退回空仓待命。"
+        dingtalk.send_markdown_message("⏳ [CoinW] 60秒防呆强撤", text)
+
+    def _report_open(self, action: str, margin: float, entry_price: float, target_price: float):
+        emoji = "🟩" if action == "LONG" else "🟥"
+        text = f"""
+| 项目 | 详情 |
+| :--- | :--- |
+| **方向** | {emoji} <font color="{'#32CD32' if action=='LONG' else '#FF0000'}">**{action}**</font> |
+| **本金** | **{margin:.2f} USDT** (50%) |
+| **杠杆** | **20x** |
+| **真实开仓价** | **{entry_price:.2f}** |
+
+🎯 **极速内存雷达锁定**: `{target_price:.2f}` *(全自动斩仓)*
+"""
+        dingtalk.send_markdown_message("🚀 [CoinW] 短线刺客·真实建仓", text)
+
+    def _report_tp(self, action: str, entry: float, trigger: float):
+        text = f"""
+**💰 利润落袋**：13U 差价已被雷达瞬间吃掉！
+- **方向**：{action}
+- **开仓均价**：{entry}
+- **触发斩仓价**：{trigger}
+
+*(等待 TV 下达下一个入场信号...)*
+"""
+        dingtalk.send_markdown_message("🎉 [CoinW] 刺客捷报", text)
+
+# 全局单例
+coinw_processor = CoinWProcessor()
