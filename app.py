@@ -9,7 +9,8 @@ from position_supervisor_coinw import coinw_processor
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] app: %(message)s')
 app = Flask(__name__)
 
-@app.route('/coinw/webhook', methods=['POST'])
+# 修复点：去掉了 /coinw，匹配 Nginx 的内部转发路径
+@app.route('/webhook', methods=['POST'])
 def webhook():
     # 1. 提取 JSON 包裹 (终极兼容模式：无视 TV 的 Header 标签，强制暴力解析)
     data = request.get_json(force=True, silent=True)
