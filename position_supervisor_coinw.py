@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# position_supervisor_coinw.py（V7.0 黄金60秒三段狙击 + 信号锚定止盈版）
+# position_supervisor_coinw.py（V7.0 黄金60秒三段狙击 + 信号锚定止盈 + 实盘看门狗版）
 import logging
 import time
 import threading
@@ -22,7 +22,7 @@ class CoinWProcessor:
         self.tp1_diff = 7.0   # 到达 7U，切除 50%
         self.tp2_diff = 15.0  # 到达 15U，全平收网
         
-        logger.info("🟢 [CoinW] 1h波段极核引擎初始化，三段狙击与锚定防线就绪。")
+        logger.info("🟢 [CoinW] 1h波段极核引擎初始化，三段狙击、锚定防线与实盘看门狗已就绪。")
 
     def process_signal(self, payload: dict):
         action = payload.get("action", "").upper()
@@ -179,8 +179,19 @@ class CoinWProcessor:
         logger.info(f"🎯 [智能锚定雷达] TV信号锚定: {signal_price:.2f} | 实际入场: {entry_price:.2f}")
         logger.info(f"🎯 锁定 7U/15U 防线: TP1={tp1_price:.2f}, TP2={tp2_price:.2f}")
         
+        watchdog_counter = 0 # 🐶 新增：看门狗计数器
+        
         while self.monitoring:
             try:
+                # 🐶 每循环 25 次 (约 5 秒)，向交易所查一次岗，看仓位是不是被人工平掉了
+                watchdog_counter += 1
+                if watchdog_counter >= 25:
+                    watchdog_counter = 0
+                    if not self._get_active_position():
+                        logger.info("👀 [雷达巡更] 发现实盘仓位已清零 (可能触发止损或被人工干预)，雷达自动休眠待命！")
+                        self.monitoring = False
+                        break
+
                 current_price = coinw_client.get_current_price("ETH")
                 if current_price <= 0:
                     time.sleep(0.2); continue
@@ -211,7 +222,7 @@ class CoinWProcessor:
         dingtalk.send_markdown_message("💥 [CoinW] 阵地焦土清算", text)
 
     def _report_timeout(self):
-        text = f"**战况报告**：黄金60秒三段狙击全部落空。\n**原因**：盘口流动性枯竭且价格飞速偏离，为防止高位站岗，系统已撤回空仓。"
+        text = f"**战况报告**：黄金60秒三段狙击全部落空。\n**原因**：盘口流动性枯竭且价格飞速偏离，为防止高位站岗，系统已撤单并重置为空仓。"
         dingtalk.send_markdown_message("⏳ [CoinW] 狙击建仓落空保护", text)
 
     def _report_open(self, action: str, margin: float, signal_price: float, entry_price: float, attempts: int):
