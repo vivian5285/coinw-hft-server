@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ETH 万亿战神 AI 量化交易引擎 - 币赢 (CoinW) V8.0 限价刺客版
-专属适配：防双向对冲、双重撤单清场
+ETH 万亿战神 AI 量化交易引擎 - 币赢 (CoinW) V8.1 限价刺客版
+专属适配：防双向对冲、双重撤单清场 (彻底修复API特殊字段与拒单问题)
 """
 
 import os
@@ -78,7 +78,7 @@ class CoinWClient:
     def get_open_orders(self, symbol="ETH", position_type="plan"):
         return self._request("GET", "/v1/perpum/orders/open", {"instrument": symbol, "positionType": position_type})
 
-    # ==================== V8.0 核心新增：币赢专属防对冲限价引擎 ====================
+    # ==================== V8.1 修复版：币赢专属防对冲限价引擎 ====================
     def place_limit_order(self, symbol, side, price, amount, leverage=20, is_close=False):
         """
         is_close=False -> 正常开仓建仓
@@ -86,27 +86,29 @@ class CoinWClient:
         """
         direction = side.lower()
         if is_close:
-            # 币赢特殊逻辑：如果持有多单，止盈必须挂空单指令 (在单向模式下自动抵消)
+            # 币赢特殊逻辑：单向模式下，多单的止盈就是下空单
             direction = "short" if side.upper() == "LONG" else "long"
 
         params = {
             "instrument": symbol,
             "direction": direction,
             "quantityUnit": "0",           
-            "quantity": str(round(amount, 4)), # 保证精度安全
+            "quantity": str(round(amount, 4)), 
             "leverage": str(leverage),
-            "positionModel": "1",          # 强锁定：1=单向持仓模式
-            "orderType": "limit",          # 纯净限价单
-            "price": str(round(price, 2))
+            "positionModel": "1",             # 强锁定：1=单向持仓模式
+            "positionType": "1",              # 👑 核心修复：币赢限价单标识
+            "openPrice": str(round(price, 2)) # 👑 核心修复：币赢委托价格标识
         }
 
-        # 如果平台支持底层 reduceOnly 标识，直接挂载
-        if is_close:
-            params["reduceOnly"] = True 
+        # 注意：这里彻底去掉了 reduceOnly 字段，防对冲依靠 positionModel=1 与 Sentinel 哨兵实现！
 
         action_msg = "止盈减仓" if is_close else "开仓建仓"
         logger.info(f"⚔️ 币赢限价指令 [{action_msg}]: {direction} {amount} 筹码 @ {price}")
-        return self._request("POST", "/v1/perpum/order", params)
+        
+        # 记录 API 返回结果，方便后续排障
+        res = self._request("POST", "/v1/perpum/order", params)
+        logger.info(f"📦 币赢下单接口响应: {res}")
+        return res
 
     def close_all_positions(self, symbol="ETH"):
         pos_info = self.get_position_info(symbol)
