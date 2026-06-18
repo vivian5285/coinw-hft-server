@@ -1,257 +1,188 @@
 #!/usr/bin/env python3
-# position_supervisor_coinw.py（V7.0 黄金60秒三段狙击 + 信号锚定止盈 + 实盘看门狗版）
+# position_supervisor_coinw.py（CoinW V8.0 限价防对冲 + 实盘哨兵巡更版）
 import logging
 import time
 import threading
-from coinw_client import CoinWClient
+from coinw_client import coinw_client
 import dingtalk
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] Supervisor: %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] CoinWSupervisor: %(message)s')
 logger = logging.getLogger(__name__)
-
-coinw_client = CoinWClient()
 
 class CoinWProcessor:
     def __init__(self):
-        self.monitoring = False
         self.leverage = 20
-        self.monitor_thread = None
+        self.symbol = "ETH"
+        
+        # 哨兵状态管理
+        self.sentinel_thread = None
+        self.monitoring = False
+        self.watched_side = None
+        self.watched_qty = 0.0
         self._lock = threading.Lock()
         
-        # 👑 币赢严格锁定：分批止盈目标 (距离 TV 信号锚定点的 U 数)
-        self.tp1_diff = 7.0   # 到达 7U，切除 50%
-        self.tp2_diff = 15.0  # 到达 15U，全平收网
-        
-        logger.info("🟢 [CoinW] 1h波段极核引擎初始化，三段狙击、锚定防线与实盘看门狗已就绪。")
+        logger.info("🟢 [CoinW] V8.0 刺客引擎就绪：开仓即挂 7U/15U 限价单，杜绝对冲！")
 
     def process_signal(self, payload: dict):
         action = payload.get("action", "").upper()
         if not action: return
 
-        with self._lock:
-            self.monitoring = False 
-
         if action == "CLOSE":
             self._close_all("接收到 TV 主动平仓信号，执行绝对清场")
+            self._stop_sentinel()
             return
 
         if action in ["LONG", "SHORT"]:
-            signal_price = payload.get("price")
-            if not signal_price:
-                signal_price = coinw_client.get_current_price("ETH")
-            
-            logger.info(f"📡 接收到 TV {action} 信号！当前理论锚定预期价: {signal_price}")
+            signal_price = payload.get("price", coinw_client.get_current_price(self.symbol))
+            logger.info(f"📡 接收到 TV {action} 信号！当前理论预期价: {signal_price}")
 
-            # 1. 绝对先决条件：强制重置阵地，确保纯净单向一手
+            # 1. 强制重置阵地：不管多空，先撤挂单再全平！(保持纯净一手)
+            self._stop_sentinel()
             self._close_all(f"强制重置阵地: 准备执行新方向 {action}")
             
-            # 2. 调用黄金60秒三段狙击引擎 (放弃市价单，采用递进限价)
-            success, entry_price, margin, attempts = self._execute_escalating_open(action)
+            # 2. 调用三段狙击引擎开仓
+            success, entry_price, margin, final_qty = self._execute_escalating_open(action)
             
-            if success:
-                # 真实建仓成功，启动 7U/15U 专属止盈雷达 (传入 signal_price 作为锚点)
-                self._report_open(action, margin, signal_price, entry_price, attempts)
-                self._start_radar(action, signal_price, entry_price)
+            if success and final_qty > 0:
+                # 3. 计算 7U / 15U 止盈防线
+                tp1_qty = round(final_qty * 0.5, 4)
+                tp2_qty = round(final_qty - tp1_qty, 4) # 剩余全部给 TP2
+                
+                tp1_price = round(entry_price + 7.0 if action == "LONG" else entry_price - 7.0, 2)
+                tp2_price = round(entry_price + 15.0 if action == "LONG" else entry_price - 15.0, 2)
+                
+                logger.info(f"🛡️ 正在挂载币赢极速限价防线... TP1: {tp1_price}({tp1_qty}), TP2: {tp2_price}({tp2_qty})")
+                
+                # 投递止盈减仓单 (is_close=True 确保防对冲机制激活)
+                if tp1_qty > 0:
+                    coinw_client.place_limit_order(self.symbol, action, tp1_price, tp1_qty, self.leverage, is_close=True)
+                if tp2_qty > 0:
+                    coinw_client.place_limit_order(self.symbol, action, tp2_price, tp2_qty, self.leverage, is_close=True)
+                
+                # 4. 汇报战果并启动防悬空哨兵
+                tp_dict = {"tp1": tp1_price, "tp2": tp2_price}
+                dingtalk.report_coinw_open(action, entry_price, final_qty, tp_dict, margin)
+                
+                self._start_sentinel(action, final_qty)
             else:
                 self._report_timeout()
 
     def _close_all(self, reason: str):
-        logger.info(f"🧹 开始执行绝对清场: {reason}")
+        logger.info(f"🧹 执行清场: {reason}")
         for attempt in range(3):
-            coinw_client.cancel_all_open_orders(symbol="ETH")
+            coinw_client.cancel_all_open_orders(self.symbol)
             time.sleep(0.5)
-            coinw_client.close_all_positions(symbol="ETH")
+            coinw_client.close_all_positions(self.symbol)
             time.sleep(1.0)
+            
             if not self._get_active_position():
-                if reason:
-                    self._report_clear(reason)
+                if reason: dingtalk.report_coinw_clear(reason)
                 return
-            logger.warning(f"⚠️ 第 {attempt+1} 次清场后仍发现残余仓位，继续清剿！")
-        logger.error("🚨 警告：经过 3 轮极致扫荡，阵地仍未彻底清空！")
+            logger.warning(f"⚠️ 第 {attempt+1} 次清场仍有残余，继续清剿！")
 
-    # ==========================================
-    # 黄金 60 秒三段递进狙击机制 (Escalating Limit Orders)
-    # ==========================================
     def _execute_escalating_open(self, action: str):
         balance = coinw_client.get_available_balance()
         if balance < 10:
-            logger.warning(f"[CoinW] 账户余额不足 ({balance} USDT)，放弃建仓。")
+            logger.warning("[CoinW] 账户余额不足，放弃建仓。")
             return False, 0.0, 0.0, 0
             
-        margin = balance * 0.50
+        margin = balance * 0.50  # 动用50%本金
         total_amount = margin * self.leverage
         
-        # 定义三段狙击的让利幅度 (U)
-        # 第一枪: 不让利；第二枪: 让 1.5U；第三枪: 让 3.0U
         escalation_steps = [0.0, 1.5, 3.0]
-        wait_time_per_strike = 20 # 每次挂单等待 20 秒
-        
-        logger.info(f"🐺 [三段狙击] 启动！总目标筹码 {total_amount:.2f}，准备分梯次拦截盘口！")
-
         final_pos = None
         
         for strike_idx, slippage in enumerate(escalation_steps, 1):
-            current_price = coinw_client.get_current_price("ETH")
-            if current_price <= 0:
-                time.sleep(1); continue
+            curr_px = coinw_client.get_current_price(self.symbol)
+            if curr_px <= 0: continue
                 
-            # 计算本轮的狙击限价
-            target_price = current_price + slippage if action == "LONG" else current_price - slippage
+            target_price = curr_px + slippage if action == "LONG" else curr_px - slippage
+            coinw_client.place_limit_order(self.symbol, action, target_price, total_amount, self.leverage, is_close=False)
             
-            logger.info(f"🔫 第 {strike_idx} 枪测距完毕：挂出限价 {target_price:.2f} (让利 {slippage}U)")
-            
-            # 发射限价单
-            coinw_client.place_limit_order(symbol="ETH", side=action, price=target_price, amount=total_amount, leverage=self.leverage)
-            
-            # 扫描盘口等待成交 (每秒扫一次，总计 20 秒)
             filled = False
-            for _ in range(wait_time_per_strike):
+            for _ in range(20): 
                 time.sleep(1.0)
                 pos = self._get_active_position()
-                if pos and pos['size'] >= total_amount * 0.90: # 容差 10%，视为基本吃满
+                if pos and pos['side'] == action and pos['size'] >= total_amount * 0.85: 
                     filled = True
                     final_pos = pos
                     break
                     
-            if filled:
-                logger.info(f"✅ 第 {strike_idx} 枪命中目标！筹码已吃饱！")
-                break
-                
-            # 20秒过去了还没吃满，果断撤销残单，准备下一次拔枪
-            logger.warning(f"⚠️ 第 {strike_idx} 枪未能全歼盘口，果断撤单！准备进入下一梯次追击...")
-            coinw_client.cancel_all_open_orders(symbol="ETH")
-            time.sleep(1.0) # 撤单缓冲
+            if filled: break
+            coinw_client.cancel_all_open_orders(self.symbol)
+            time.sleep(1.0)
 
         if final_pos and final_pos['size'] > 0:
-            logger.info(f"🎉 狙击战役结束！成功捕获筹码: {final_pos['size']:.2f}, 综合均价: {final_pos['entry_price']}")
-            return True, final_pos['entry_price'], margin, strike_idx
+            return True, final_pos['entry_price'], margin, final_pos['size']
             
-        return False, 0.0, 0.0, 3
-
-    def _execute_pitbull_close(self, action: str, target_ratio: float, level_name: str):
-        for attempt in range(1, 11):
-            pos = self._get_active_position()
-            if not pos: return True, attempt
-                
-            current_size = pos['size']
-            if target_ratio >= 1.0:
-                coinw_client.close_all_positions(symbol="ETH")
-            else:
-                coinw_client.close_position_partial(symbol="ETH", close_rate=str(target_ratio))
-                
-            time.sleep(2.0)
-            new_pos = self._get_active_position()
-            if not new_pos or new_pos['size'] < current_size * 0.9:
-                return True, attempt
-                
-            logger.warning(f"⚠️ {level_name} 止盈遭遇阻力！清理废单并启动第 {attempt+1} 次清仓轰炸！")
-            coinw_client.cancel_all_open_orders(symbol="ETH")
-            time.sleep(0.5)
-            
-        return False, 10
+        return False, 0.0, 0.0, 0
 
     def _get_active_position(self) -> dict:
         try:
-            res = coinw_client.get_position_info("ETH")
+            res = coinw_client.get_position_info(self.symbol)
             data = res.get("data", [])
-            if not data: return None
             for pos in data:
-                size = float(pos.get("position", pos.get("volume", pos.get("size", pos.get("holdVolume", 0)))))
+                size = float(pos.get("position", pos.get("volume", pos.get("size", 0))))
                 if size > 0:
-                    entry = float(pos.get("openPrice", pos.get("avgPrice", pos.get("price", 0))))
-                    return {"size": size, "entry_price": entry}
+                    entry = float(pos.get("openPrice", pos.get("avgPrice", 0)))
+                    pos_mode = pos.get("positionType", "") 
+                    side = "LONG" if "long" in str(pos_mode).lower() or pos.get("direction", "") == "long" else "SHORT"
+                    return {"size": size, "entry_price": entry, "side": side}
             return None
-        except Exception:
-            return None
+        except Exception: return None
 
-    def _start_radar(self, action: str, signal_price: float, entry_price: float):
+    # ==================== V8.0 哨兵防悬空对账引擎 ====================
+    def _start_sentinel(self, side: str, qty: float):
         with self._lock:
+            self.watched_side = side
+            self.watched_qty = qty
             self.monitoring = True
-        self.monitor_thread = threading.Thread(target=self._radar_loop, args=(action, signal_price, entry_price), daemon=True)
-        self.monitor_thread.start()
+        self.sentinel_thread = threading.Thread(target=self._sentinel_loop, daemon=True)
+        self.sentinel_thread.start()
 
-    def _radar_loop(self, action: str, signal_price: float, entry_price: float):
-        # 👑 核心黑科技：以 TV 信号锚定点计算止盈
-        tp1_price = signal_price + self.tp1_diff if action == "LONG" else signal_price - self.tp1_diff
-        tp2_price = signal_price + self.tp2_diff if action == "LONG" else signal_price - self.tp2_diff
-        
-        tp1_done = False
-        logger.info(f"🎯 [智能锚定雷达] TV信号锚定: {signal_price:.2f} | 实际入场: {entry_price:.2f}")
-        logger.info(f"🎯 锁定 7U/15U 防线: TP1={tp1_price:.2f}, TP2={tp2_price:.2f}")
-        
-        watchdog_counter = 0 # 🐶 新增：看门狗计数器
-        
+    def _stop_sentinel(self):
+        with self._lock:
+            self.monitoring = False
+            self.watched_side = None
+            self.watched_qty = 0.0
+
+    def _sentinel_loop(self):
+        logger.info("👀 [CoinW] 哨兵巡更启动，防幽灵悬空单机制运行中...")
         while self.monitoring:
             try:
-                # 🐶 每循环 25 次 (约 5 秒)，向交易所查一次岗，看仓位是不是被人工平掉了
-                watchdog_counter += 1
-                if watchdog_counter >= 25:
-                    watchdog_counter = 0
-                    if not self._get_active_position():
-                        logger.info("👀 [雷达巡更] 发现实盘仓位已清零 (可能触发止损或被人工干预)，雷达自动休眠待命！")
-                        self.monitoring = False
-                        break
+                pos = self._get_active_position()
+                current_qty = pos['size'] if pos else 0.0
+                current_side = pos['side'] if pos else None
 
-                current_price = coinw_client.get_current_price("ETH")
-                if current_price <= 0:
-                    time.sleep(0.2); continue
+                # 强行对齐方向
+                if current_qty > 0 and current_side and current_side != self.watched_side:
+                    logger.warning("🚨 [哨兵] 发现币赢反向对冲仓位！执行惩罚性强制清理！")
+                    self._close_all("哨兵防线：强制平掉所有反向与错位持仓")
+                    self._stop_sentinel()
+                    break
+
+                if abs(current_qty - self.watched_qty) > 0.001: # 数量发生实质性变化
+                    if current_qty == 0:
+                        logger.info("💥 [哨兵] 仓位归零！立即启动防悬空清剿，抹除盘口一切残单！")
+                        coinw_client.cancel_all_open_orders(self.symbol)
+                        dingtalk.report_coinw_tp("全平 / 手动清空", current_qty)
+                        self._stop_sentinel()
+                        break
                     
-                if not tp1_done:
-                    if (action == "LONG" and current_price >= tp1_price) or \
-                       (action == "SHORT" and current_price <= tp1_price):
-                        logger.info(f"✨ 击穿 7U 信号防线！启动半仓落袋！")
-                        success, attempts = self._execute_pitbull_close(action, 0.5, "TP1")
-                        tp1_done = True
-                        self._report_tp(action, "7U(锚定) 半仓落袋", entry_price, current_price, attempts)
-                        continue
-                        
-                if tp1_done:
-                    if (action == "LONG" and current_price >= tp2_price) or \
-                       (action == "SHORT" and current_price <= tp2_price):
-                        logger.info(f"✨ 击穿 15U 终极目标！启动全平收网！")
-                        success, attempts = self._execute_pitbull_close(action, 1.0, "TP2")
-                        self.monitoring = False
-                        self._report_tp(action, "15U(锚定) 终极全平", entry_price, current_price, attempts)
-                        break
-            except Exception:
-                pass
-            time.sleep(0.2)
+                    elif current_qty < self.watched_qty:
+                        logger.info(f"✨ [哨兵] 限价止盈吃单成功! 剩余: {current_qty}")
+                        dingtalk.report_coinw_tp("限价减仓成功落袋", current_qty)
+                        with self._lock: self.watched_qty = current_qty
 
-    def _report_clear(self, reason: str):
-        text = f"**动作**：🔄 {reason}\n**状态**：挂单与旧仓位已被彻底抹除，阵地已重置为**纯净空仓**。"
-        dingtalk.send_markdown_message("💥 [CoinW] 阵地焦土清算", text)
+                    elif current_qty > self.watched_qty:
+                        logger.warning(f"👀 [哨兵] 警告: 检测到未知加仓动作 {current_qty}")
+                        dingtalk.report_coinw_tp("发现异常外部加仓", current_qty)
+                        with self._lock: self.watched_qty = current_qty
+
+            except Exception: pass
+            time.sleep(3) # 币赢哨兵每3秒雷达扫射一次
 
     def _report_timeout(self):
-        text = f"**战况报告**：黄金60秒三段狙击全部落空。\n**原因**：盘口流动性枯竭且价格飞速偏离，为防止高位站岗，系统已撤单并重置为空仓。"
-        dingtalk.send_markdown_message("⏳ [CoinW] 狙击建仓落空保护", text)
-
-    def _report_open(self, action: str, margin: float, signal_price: float, entry_price: float, attempts: int):
-        emoji = "🟩" if action == "LONG" else "🟥"
-        tp1 = signal_price + self.tp1_diff if action == "LONG" else signal_price - self.tp1_diff
-        tp2 = signal_price + self.tp2_diff if action == "LONG" else signal_price - self.tp2_diff
-        
-        text = f"""
-| 项目 | 详情 |
-| :--- | :--- |
-| **方向** | {emoji} **{action}** |
-| **TV信号锚定** | `{signal_price:.2f}` |
-| **实盘均价** | **{entry_price:.2f}** |
-| **打入策略** | 第 **{attempts}** 枪命中目标 |
-
-🎯 **两段式严格止盈边界(信号锚定)**: 
-- **TP1 (平50%)**: `{tp1:.2f}` (+7U)
-- **TP2 (全平)**: `{tp2:.2f}` (+15U)
-"""
-        dingtalk.send_markdown_message("🚀 [CoinW] 狙击战役建仓成功", text)
-
-    def _report_tp(self, action: str, level: str, entry: float, trigger: float, attempts: int):
-        text = f"""
-**💰 利润死咬成功！已核实实盘完成切割！**
-- **战术阶段**：**{level}**
-- **开仓均价**：{entry}
-- **触发斩仓价**：{trigger}
-- **轰炸次数**：循环砸盘 **{attempts}** 次后成交
-"""
-        dingtalk.send_markdown_message(f"🎉 [CoinW] {level} 捷报", text)
+        dingtalk.report_coinw_clear("狙击建仓落空，撤单防站岗")
 
 coinw_processor = CoinWProcessor()
