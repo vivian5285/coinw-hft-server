@@ -1,42 +1,316 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Flask Webhook入口 - CoinW单系统 v16.22.1
+"""
+
 import os
+import sys
+import json
+import time
+import logging
 import threading
 from flask import Flask, request, jsonify
-import logging
-import json
-from position_supervisor_coinw import coinw_processor
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] app: %(message)s')
+# 添加当前目录到路径
+sys.path.insert(0, os.path.dirname(__file__))
+
+# 版本
+COINW_WEBHOOK_VERSION = "v16.22.1-coinw-init"
+
+# 日志配置
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] app: %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Flask应用
 app = Flask(__name__)
 
-# 修复点：去掉了 /coinw，匹配 Nginx 的内部转发路径
+# 端口
+PORT = int(os.getenv("PORT", "5004"))
+
+# Supervisor实例缓存
+_supervisors = {}
+_supervisor_lock = threading.Lock()
+
+
+def get_supervisor(symbol: str = "ETH"):
+    """获取Supervisor实例"""
+    sym = str(symbol or "ETH").upper()
+
+    with _supervisor_lock:
+        if sym not in _supervisors:
+            from position_supervisor_coinw import PositionSupervisorCoinW
+            _supervisors[sym] = PositionSupervisorCoinW(sym)
+        return _supervisors[sym]
+
+
+# ==================== Webhook路由 ====================
+
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    # 1. 提取 JSON 包裹 (终极兼容模式：无视 TV 的 Header 标签，强制暴力解析)
+    """TV Webhook入口"""
+    # 1) 解析JSON
     data = request.get_json(force=True, silent=True)
     if not data:
         try:
             raw_data = request.get_data(as_text=True)
             data = json.loads(raw_data)
         except Exception:
-            return jsonify({"status": "error", "message": "无效的 JSON 数据"}), 400
+            return jsonify({"status": "error", "message": "无效的JSON数据"}), 400
 
-    secret = data.get("secret", "")
-    expected_secret = os.getenv("WEBHOOK_SECRET", "528586")
-    
-    if secret != expected_secret:
-        logging.warning("[Webhook] Secret 校验失败！")
+    # 2) 验证secret
+    from webhook_parser import parse_webhook
+    signal = parse_webhook(data)
+
+    if not signal.valid:
+        logger.warning(f"Webhook鉴权失败: {signal.error}")
         return jsonify({"status": "error", "message": "Invalid secret"}), 403
 
-    logging.info(f"[Webhook] 密码正确，收到币赢有效信号: {data}")
-    
-    try:
-        threading.Thread(target=coinw_processor.process_signal, args=(data,), daemon=True).start()
-    except Exception as e:
-        logging.error(f"[Webhook] 触发执行线程失败: {e}")
-        return jsonify({"status": "error", "message": "内部执行错误"}), 500
-        
-    return jsonify({"message": "Signal processing started", "status": "success"}), 200
+    logger.info(f"Webhook收到信号: {signal.action} {signal.symbol}")
+
+    # 3) 获取对应的Supervisor
+    supervisor = get_supervisor(signal.symbol)
+
+    # 4) 异步处理
+    def process():
+        try:
+            result = supervisor.handle_signal(data)
+            logger.info(f"信号处理完成: {result}")
+        except Exception as e:
+            logger.error(f"信号处理异常: {e}")
+
+    threading.Thread(target=process, daemon=True).start()
+
+    return jsonify({
+        "status": "success",
+        "message": "Signal processing started",
+        "version": COINW_WEBHOOK_VERSION,
+    }), 200
+
+
+# ==================== 健康检查 ====================
+
+@app.route('/health', methods=['GET'])
+def health():
+    """健康检查"""
+    from position_supervisor_coinw import COINW_SUPERVISOR_VERSION, trading_paused
+    from pipeline_ledger import get_pipeline
+
+    symbols = ["ETH", "BTC", "XAU", "BNB"]
+    pipelines = {}
+
+    for sym in symbols:
+        p = get_pipeline(sym, "coinw")
+        pipelines[sym] = p.phase.value
+
+    return jsonify({
+        "version": COINW_WEBHOOK_VERSION,
+        "supervisor_version": COINW_SUPERVISOR_VERSION,
+        "trading_paused": trading_paused,
+        "pipelines": pipelines,
+        "uptime": time.time(),
+    })
+
+
+# ==================== 管理接口 ====================
+
+@app.route('/admin/pause', methods=['POST'])
+def admin_pause():
+    """暂停交易"""
+    from position_supervisor_coinw import pause_all_trading
+
+    payload = request.get_json() or {}
+    reason = payload.get("reason", "管理员暂停")
+
+    pause_all_trading(reason)
+    return jsonify({"ok": True, "trading_paused": True})
+
+
+@app.route('/admin/resume', methods=['POST'])
+def admin_resume():
+    """恢复交易"""
+    from position_supervisor_coinw import resume_all_trading
+
+    resume_all_trading()
+    return jsonify({"ok": True, "trading_paused": False})
+
+
+@app.route('/admin/clear/<symbol>', methods=['POST'])
+def admin_clear(symbol):
+    """清仓指定品种"""
+    supervisor = get_supervisor(symbol)
+
+    def clear():
+        supervisor._clear_position("管理员清仓")
+
+    threading.Thread(target=clear, daemon=True).start()
+
+    return jsonify({"ok": True, "symbol": symbol})
+
+
+# ==================== Console管理页 ====================
+
+@app.route('/console', methods=['GET'])
+def console_index():
+    """Console管理页"""
+    html = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>CoinW Console</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+            * { box-sizing: border-box; margin: 0; padding: 0; }
+            body {
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+                min-height: 100vh;
+                color: #fff;
+                padding: 20px;
+            }
+            .container { max-width: 1200px; margin: 0 auto; }
+            h1 { font-size: 2em; margin-bottom: 20px; color: #00d4ff; }
+            .card {
+                background: rgba(255,255,255,0.1);
+                border-radius: 12px;
+                padding: 20px;
+                margin-bottom: 20px;
+                backdrop-filter: blur(10px);
+            }
+            .card h2 { font-size: 1.2em; margin-bottom: 15px; color: #00d4ff; }
+            .status-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; }
+            .status-item {
+                background: rgba(0,0,0,0.3);
+                border-radius: 8px;
+                padding: 15px;
+            }
+            .status-item .label { font-size: 0.8em; color: #888; margin-bottom: 5px; }
+            .status-item .value { font-size: 1.2em; font-weight: bold; }
+            .btn {
+                background: #00d4ff;
+                color: #000;
+                border: none;
+                padding: 10px 20px;
+                border-radius: 8px;
+                cursor: pointer;
+                font-weight: bold;
+            }
+            .btn:hover { background: #00b8e6; }
+            .btn.danger { background: #ff4757; color: #fff; }
+            .btn.success { background: #2ed573; }
+            table { width: 100%; border-collapse: collapse; }
+            th, td { padding: 10px; text-align: left; border-bottom: 1px solid rgba(255,255,255,0.1); }
+            th { color: #00d4ff; }
+            .phase { padding: 4px 8px; border-radius: 4px; }
+            .phase.IDLE { background: #666; }
+            .phase.MONITORING { background: #2ed573; }
+            .phase.FAILED { background: #ff4757; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>CoinW Console v""" + COINW_WEBHOOK_VERSION + """</h1>
+
+            <div class="card">
+                <h2>系统状态</h2>
+                <div class="status-grid">
+                    <div class="status-item">
+                        <div class="label">版本</div>
+                        <div class="value" id="version">""" + COINW_WEBHOOK_VERSION + """</div>
+                    </div>
+                    <div class="status-item">
+                        <div class="label">交易状态</div>
+                        <div class="value" id="paused">检查中...</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <h2>流水线状态</h2>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>品种</th>
+                            <th>阶段</th>
+                            <th>方向</th>
+                            <th>数量</th>
+                            <th>开仓价</th>
+                            <th>操作</th>
+                        </tr>
+                    </thead>
+                    <tbody id="pipelines">
+                    </tbody>
+                </table>
+            </div>
+
+            <div class="card">
+                <h2>控制</h2>
+                <button class="btn" onclick="pauseAll()">暂停交易</button>
+                <button class="btn success" onclick="resumeAll()">恢复交易</button>
+            </div>
+        </div>
+
+        <script>
+            async function loadStatus() {
+                const resp = await fetch('/console/status');
+                const data = await resp.json();
+
+                document.getElementById('version').textContent = data.version;
+                document.getElementById('paused').textContent = data.trading_paused ? '已暂停' : '交易中';
+                document.getElementById('paused').style.color = data.trading_paused ? '#ff4757' : '#2ed573';
+
+                const tbody = document.getElementById('pipelines');
+                tbody.innerHTML = '';
+                for (const [sym, p] of Object.entries(data.pipelines)) {
+                    tbody.innerHTML += `
+                        <tr>
+                            <td>${sym}</td>
+                            <td><span class="phase ${p.phase}">${p.phase}</span></td>
+                            <td>${p.side || '-'}</td>
+                            <td>${p.qty || '-'}</td>
+                            <td>${p.entry || '-'}</td>
+                            <td><button class="btn danger" onclick="clearPos('${sym}')">清仓</button></td>
+                        </tr>
+                    `;
+                }
+            }
+
+            async function pauseAll() {
+                await fetch('/admin/pause', {method: 'POST'});
+                loadStatus();
+            }
+
+            async function resumeAll() {
+                await fetch('/admin/resume', {method: 'POST'});
+                loadStatus();
+            }
+
+            async function clearPos(sym) {
+                if (confirm('确定要清仓 ' + sym + ' 吗？')) {
+                    await fetch('/admin/clear/' + sym, {method: 'POST'});
+                    loadStatus();
+                }
+            }
+
+            loadStatus();
+            setInterval(loadStatus, 5000);
+        </script>
+    </body>
+    </html>
+    """
+    return html, 200, {'Content-Type': 'text/html; charset=utf-8'}
+
+
+# ==================== 启动 ====================
 
 if __name__ == '__main__':
-    app.run(host='127.0.0.1', port=5002)
+    logger.info(f"CoinW Webhook Server {COINW_WEBHOOK_VERSION} 启动")
+    logger.info(f"端口: {PORT}")
+    logger.info(f"Webhook: http://0.0.0.0:{PORT}/webhook")
+    logger.info(f"Console: http://0.0.0.0:{PORT}/console")
+    logger.info(f"Health: http://0.0.0.0:{PORT}/health")
+
+    app.run(host='0.0.0.0', port=PORT, debug=False)

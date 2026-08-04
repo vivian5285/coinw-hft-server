@@ -1,0 +1,19 @@
+[Unit]
+Description=CoinW Trading Engine
+After=network.target
+
+[Service]
+Type=simple
+User=trading
+WorkingDirectory=/home/trading/coinw-engine
+Environment="COINW_API_KEY=YOUR_API_KEY"
+Environment="COINW_API_SECRET=YOUR_API_SECRET"
+Environment="WEBHOOK_SECRET=YOUR_WEBHOOK_SECRET"
+Environment="PORT=5004"
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/home/trading/coinw-engine/venv/bin/python3 -m app
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

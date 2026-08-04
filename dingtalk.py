@@ -1,88 +1,188 @@
 #!/usr/bin/env python3
-# dingtalk.py（CoinW V8.0 7U/15U限价单专属战报版）
+# -*- coding: utf-8 -*-
+"""
+通知模块 - CoinW单系统 v16.22.1
+
+支持Telegram和钉钉通知
+"""
+
 import os
 import time
-import hmac
-import hashlib
-import base64
-import urllib.parse
 import logging
 import requests
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
+# ==================== 配置 ====================
 DINGTALK_WEBHOOK = os.getenv("DINGTALK_WEBHOOK", "")
 DINGTALK_SECRET = os.getenv("DINGTALK_SECRET", "")
+DINGTALK_DISABLE = os.getenv("DINGTALK_DISABLE", "True").lower() == "true"
 
-def _generate_sign(secret: str) -> tuple:
-    timestamp = str(round(time.time() * 1000))
-    secret_enc = secret.encode('utf-8')
-    string_to_sign = f'{timestamp}\n{secret}'
-    string_to_sign_enc = string_to_sign.encode('utf-8')
-    hmac_code = hmac.new(secret_enc, string_to_sign_enc, digestmod=hashlib.sha256).digest()
-    sign = urllib.parse.quote_plus(base64.b64encode(hmac_code))
-    return timestamp, sign
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+TELEGRAM_DISABLE = os.getenv("TELEGRAM_DISABLE", "False").lower() == "true"
 
-def _get_signed_url() -> str:
-    if not DINGTALK_WEBHOOK: return ""
-    if DINGTALK_SECRET:
-        timestamp, sign = _generate_sign(DINGTALK_SECRET)
-        return f"{DINGTALK_WEBHOOK}&timestamp={timestamp}&sign={sign}"
-    return DINGTALK_WEBHOOK
+BRAND_PREFIX = "【CoinW单系统】"
 
-def send_markdown_message(title: str, text: str):
-    if not DINGTALK_WEBHOOK: return False
+
+# ==================== Telegram ====================
+
+def _telegram_send(text: str):
+    """发送Telegram消息"""
+    if TELEGRAM_DISABLE or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return False
+
     try:
-        url = _get_signed_url()
-        full_text = f"### {title}\n> **⏱ 战报生成**：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n---\n{text}\n---\n*🤖 币赢 (CoinW) V8.0 · 极限防对冲哨兵*"
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        data = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": text,
+            "parse_mode": "Markdown",
+        }
+        resp = requests.post(url, json=data, timeout=10)
+        return resp.status_code == 200
+    except Exception as e:
+        logger.error(f"[Telegram] 发送失败: {e}")
+        return False
+
+
+# ==================== 钉钉 ====================
+
+def _dingtalk_sign(secret: str) -> tuple:
+    """钉钉签名"""
+    import hmac, hashlib, base64, urllib.parse
+    timestamp = str(round(time.time() * 1000))
+    string_to_sign = f'{timestamp}\n{secret}'
+    sign = base64.b64encode(
+        hmac.new(secret.encode(), string_to_sign.encode(), digestmod=hashlib.sha256).digest()
+    ).decode()
+    return timestamp, urllib.parse.quote_plus(sign)
+
+
+def _dingtalk_send(title: str, text: str):
+    """发送钉钉消息"""
+    if DINGTALK_DISABLE or not DINGTALK_WEBHOOK:
+        return False
+
+    try:
+        url = DINGTALK_WEBHOOK
+        if DINGTALK_SECRET:
+            ts, sign = _dingtalk_sign(DINGTALK_SECRET)
+            url = f"{url}&timestamp={ts}&sign={sign}"
+
+        full_text = f"### {title}\n> **时间**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n---\n{text}\n---\n{BRAND_PREFIX}"
         data = {
             "msgtype": "markdown",
             "markdown": {"title": title, "text": full_text}
         }
-        requests.post(url, json=data, timeout=8)
+        resp = requests.post(url, json=data, timeout=8)
+        return resp.status_code == 200
     except Exception as e:
-        logger.error(f"[DingTalk] 发送异常: {e}")
+        logger.error(f"[DingTalk] 发送失败: {e}")
+        return False
 
-# ==================== 场景化战报模板 ====================
 
-def report_coinw_open(side: str, entry_price: float, qty: float, tp_dict: dict, margin: float):
-    emoji = "🟩" if side == "LONG" else "🟥"
-    text = f"""### 🚀 币赢实盘建仓报告
-> **单向纯净模式，限价止盈网已撒下！**
+# ==================== 统一发送 ====================
 
-📍 **实盘核心数据**
-- **交易方向**: {emoji} {side}
-- **投入本金**: `{margin:.2f}` USDT (本金50% / 20x)
-- **实盘均价**: `{entry_price}`
-- **成功建仓**: `{qty}` 筹码总量
+def _send(title: str, text: str):
+    """发送通知"""
+    # Telegram优先
+    if not TELEGRAM_DISABLE and TELEGRAM_BOT_TOKEN:
+        _telegram_send(f"{BRAND_PREFIX}\n{text}")
 
-🎯 **交易所极速限价单 (7/15 目标)**
-- **TP1 (7U - 平50%)**: `{tp_dict.get('tp1')}`
-- **TP2 (15U - 全平)**: `{tp_dict.get('tp2')}`
+    # 钉钉备选
+    if not DINGTALK_DISABLE and DINGTALK_WEBHOOK:
+        _dingtalk_send(title, text)
 
-*(注: 防悬空哨兵已启动，绝不允许幽灵挂单出现！)*
+
+# ==================== 通知函数 ====================
+
+def report_coinw_open(action: str, entry_price: float, qty: float,
+                     tp_dict: dict, margin: float = 0,
+                     tier: str = "", tier_label: str = ""):
+    """开仓通知"""
+    emoji = "🟢" if action == "LONG" else "🔴"
+    tier_info = f"\n📊 趋势档位: **{tier_label}**" if tier_label else ""
+
+    text = f"""{emoji} **{action} 开仓**
+━━━━━━━━━━━━━━━━━━
+📍 品种: ETHUSDT
+📈 方向: {action}
+💰 开仓价: `{entry_price}`
+📦 数量: `{qty}`
+🎯 TP1: `{tp_dict.get('tp1', 0)}`
+🎯 TP2: `{tp_dict.get('tp2', 0)}`
+🛡️ 硬止损: `{tp_dict.get('hard_sl', 'N/A')}`{tier_info}
+━━━━━━━━━━━━━━━━━━"""
+
+    _send("CoinW开仓", text)
+
+
+def report_coinw_tp(event: str, remaining: float = 0, price: float = 0):
+    """TP成交/仓位变更通知"""
+    emoji = "💰" if remaining == 0 else "✨"
+
+    text = f"""{emoji} **{event}**
+━━━━━━━━━━━━━━━━━━
+📍 当前剩余: `{remaining}`
 """
-    send_markdown_message("币赢新开仓实盘核实", text)
 
-def report_coinw_tp(event_type: str, remaining_qty: float):
-    status_emoji = "💰" if "落袋" in event_type else "🛡️"
-    text = f"""### {status_emoji} 哨兵对账报告
-- **触发事件**: **{event_type}**
-- **当前余量**: 剩余 `{remaining_qty}` 筹码
-- **系统状态**: 
-"""
-    if remaining_qty == 0:
-        text += "仓位已彻底归零，系统已强制 **切除盘口一切残余挂单**，防止对冲爆雷，阵地重置完毕！"
-    else:
-        text += "已确认利润落袋或发现外部干预，哨兵继续紧盯剩余筹码。"
-        
-    send_markdown_message(f"哨兵事件: {event_type}", text)
+    if price > 0:
+        text += f"💵 参考价: `{price}`\n"
+
+    text += "━━━━━━━━━━━━━━━━━━"
+
+    _send(f"CoinW: {event}", text)
+
 
 def report_coinw_clear(reason: str):
-    text = f"""### 🧹 阵地焦土清算报告
-- **触发原因**: {reason}
-- **执行动作**: 盘口挂单、幽灵残余与实盘旧仓已被彻底清剿。
-- **当前状态**: **绝对纯净空仓**
-"""
-    send_markdown_message("币赢焦土清场", text)
+    """清仓通知"""
+    text = f"""🧹 **清仓完成**
+━━━━━━━━━━━━━━━━━━
+📍 原因: {reason}
+📊 状态: 空仓待命
+━━━━━━━━━━━━━━━━━━"""
+
+    _send("CoinW清仓", text)
+
+
+def report_coinw_radar_activated(entry_price: float, tp2_price: float,
+                                activation_price: float, initial_sl: float,
+                                tier_label: str = ""):
+    """雷达激活通知"""
+    tier_info = f"\n📊 趋势档位: **{tier_label}**" if tier_label else ""
+
+    text = f"""📡 **雷达激活**
+━━━━━━━━━━━━━━━━━━
+🎯 激活价锚定: `(TP1+TP2)/2`
+💰 激活价格: `{activation_price}`
+🛡️ 初始止损: `{initial_sl}`
+📈 开仓价: `{entry_price}`
+🎯 TP2目标: `{tp2_price}`{tier_info}
+━━━━━━━━━━━━━━━━━━
+*雷达启动被动追踪模式*"""
+
+    _send("CoinW雷达激活", text)
+
+
+def send_alert(message: str):
+    """发送告警"""
+    text = f"""🚨 **系统告警**
+━━━━━━━━━━━━━━━━━━
+📍 告警内容: {message}
+⏰ 时间: {datetime.now().strftime('%H:%M:%S')}
+━━━━━━━━━━━━━━━━━━"""
+
+    _send("CoinW告警", text)
+
+
+def send_error(message: str):
+    """发送错误"""
+    text = f"""❌ **错误**
+━━━━━━━━━━━━━━━━━━
+📍 错误: {message}
+⏰ 时间: {datetime.now().strftime('%H:%M:%S')}
+━━━━━━━━━━━━━━━━━━"""
+
+    _send("CoinW错误", text)

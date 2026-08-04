@@ -1,0 +1,30 @@
+{
+  "schema": "v2.0-tp2-activation-highway",
+  "description": "CoinW再入档位配置",
+  "tiers": {
+    "ETH": {
+      "reentry_window_bars": 2,
+      "max_reentry": 1,
+      "reentry_zone_pct": 0.5,
+      "loosen_after_success": true
+    },
+    "XAU": {
+      "reentry_window_bars": 3,
+      "max_reentry": 1,
+      "reentry_zone_pct": 0.3,
+      "loosen_after_success": true
+    },
+    "BTC": {
+      "reentry_window_bars": 2,
+      "max_reentry": 1,
+      "reentry_zone_pct": 0.5,
+      "loosen_after_success": true
+    },
+    "BNB": {
+      "reentry_window_bars": 2,
+      "max_reentry": 1,
+      "reentry_zone_pct": 0.5,
+      "loosen_after_success": true
+    }
+  }
+}
