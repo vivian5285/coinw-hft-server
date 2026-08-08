@@ -308,6 +308,8 @@ class PositionSupervisorCoinW:
 
     def _place_defense_orders(self, signal, entry_result: dict) -> bool:
         """设置三层防线"""
+        from atr_scenario import calc_hard_stop_price
+
         try:
             position_id = entry_result.get("position_id", "")
             entry_price = entry_result.get("entry_price", 0)
@@ -333,6 +335,8 @@ class PositionSupervisorCoinW:
                 stop_from=2,  # 市价触发
                 price_type=3,  # 标记价格
             )
+            if not sl_result or sl_result.get("code") != 0:
+                logger.error(f"硬止损挂单失败: {sl_result}")
 
             self.pipeline.data["hard_sl_px"] = hard_sl_price
 
