@@ -72,6 +72,9 @@ class WebhookParser:
     def _normalize_symbol(self, symbol: str) -> str:
         """标准化交易对"""
         s = str(symbol or "").upper().strip()
+        # 去掉TradingView永续合约后缀（如 BNBUSDT.P -> BNBUSDT）
+        if s.endswith(".P"):
+            s = s[:-2]
         # 去掉USDT后缀
         s = s.replace("USDT", "").replace("USDC", "").replace("_USDT", "")
         return s
