@@ -136,7 +136,13 @@ class PositionSupervisorCoinW:
             logger.warning("交易暂停中，拒绝开仓")
             return {"ok": False, "error": "trading_paused"}
 
-        # 1) 信号官登记
+        # 1) 信号官登记——注意：pipeline.data里的"tp1"/"tp2"是结构化状态
+        # ({"px":...,"pieces":...})，这里如果直接传tp1=signal.tp1(一个纯
+        # float)会被_apply_fields原样写进self.data["tp1"]，把dict形状覆盖
+        # 成float。后面督察官审计取self.data.get("tp1",{}).get(...)时，
+        # 如果TP1因仓位太小被跳过(没有重新写回dict)，这个float就会一路存活
+        # 到这里，'float' object has no attribute 'get'直接崩溃(2026-08-08
+        # 真实测试复现)。这里只是想把TV原始价位记进历史，改用不冲突的字段名。
         self.pipeline.advance(
             Phase.SIGNAL_RECEIVED,
             Role.SIGNAL,
@@ -145,8 +151,8 @@ class PositionSupervisorCoinW:
             price=signal.price,
             atr=signal.atr,
             stop_loss=signal.stop_loss,
-            tp1=signal.tp1,
-            tp2=signal.tp2,
+            tv_tp1=signal.tp1,
+            tv_tp2=signal.tp2,
             tier=signal.tier,
         )
 
@@ -290,11 +296,13 @@ class PositionSupervisorCoinW:
             entry_price = float(pos.get("openPrice", current_price))
             # pos["quantity"]不是真实ETH数量——真实持仓验证过(2026-08-08)：
             # 那是张数相关的内部值(quantityUnit=1场景下的原始委托量)，实际
-            # 持有的标的货币数量是baseSize(每张面值)×totalPiece(张数)。用
-            # "quantity"字段算TP1/TP2数量导致挂单量比真实持仓大了近30倍。
+            # 持有的标的货币数量就是baseSize本身(已经是持仓总量，不是"每张
+            # 面值"，实测1张=0.01 ETH时baseSize=0.01，5张=0.05 ETH时
+            # baseSize=0.05，乘以totalPiece会再放大成倍——之前那版乘了
+            # totalPiece，把5张仓位算成0.25 ETH，比真实的0.05 ETH大5倍)。
             base_size = float(pos.get("baseSize", 0) or 0)
             total_pieces = float(pos.get("totalPiece", pos.get("currentPiece", 0)) or 0)
-            actual_qty = base_size * total_pieces if (base_size and total_pieces) else float(pos.get("quantity", qty))
+            actual_qty = base_size if base_size else float(pos.get("quantity", qty))
 
             logger.info(f"开仓成功: {action} {actual_qty} @ {entry_price} ({total_pieces}张)")
 
@@ -356,6 +364,8 @@ class PositionSupervisorCoinW:
             # 加仓而不是止盈(2026-08-08真实下单验证复现，仓位被从0.01 ETH
             # 加到0.29 ETH)。原有qty计算还用错了字段，进一步放大了这个问题。
             total_pieces = float(entry_result.get("total_pieces", 0) or 0)
+            total_qty = float(entry_result.get("qty", 0) or 0)
+            per_piece_qty = (total_qty / total_pieces) if total_pieces > 0 else 0.0
             tp1_pieces = round(total_pieces * 0.10)
             tp2_pieces = round(total_pieces * 0.20)
 
@@ -372,9 +382,12 @@ class PositionSupervisorCoinW:
                     )
                     if not tp1_result or tp1_result.get("code") != 0:
                         logger.error(f"TP1挂单失败: {tp1_result}")
-                    self.pipeline.data["tp1"] = {"px": signal.tp1, "pieces": tp1_pieces}
+                    # qty字段保留给_run_audit的tp_slice一致性检查用(ETH等值)，
+                    # pieces是CoinW原生张数，两个都存，缺一个督察官那边就读不到
+                    self.pipeline.data["tp1"] = {"px": signal.tp1, "pieces": tp1_pieces, "qty": tp1_pieces * per_piece_qty}
                 else:
                     logger.warning(f"TP1跳过: 仓位仅{total_pieces}张，10%不足1张最小单位")
+                    self.pipeline.data["tp1"] = {"px": signal.tp1, "pieces": 0, "qty": 0.0}
 
             if signal.tp2 > 0:
                 if tp2_pieces > 0:
@@ -389,9 +402,10 @@ class PositionSupervisorCoinW:
                     )
                     if not tp2_result or tp2_result.get("code") != 0:
                         logger.error(f"TP2挂单失败: {tp2_result}")
-                    self.pipeline.data["tp2"] = {"px": signal.tp2, "pieces": tp2_pieces}
+                    self.pipeline.data["tp2"] = {"px": signal.tp2, "pieces": tp2_pieces, "qty": tp2_pieces * per_piece_qty}
                 else:
                     logger.warning(f"TP2跳过: 仓位仅{total_pieces}张，20%不足1张最小单位")
+                    self.pipeline.data["tp2"] = {"px": signal.tp2, "pieces": 0, "qty": 0.0}
 
             # 3) 雷达初始化（休眠状态）
             self.radar.set_atr(signal.atr)
@@ -555,6 +569,16 @@ class PositionSupervisorCoinW:
         """运行督察官审计"""
         from chief_auditor import audit_open_bundle, should_hard_pause
 
+        # pipeline.data["tp1"]/["tp2"]理应恒为dict，但曾经被其它advance()调用
+        # 误传同名标量字段直接覆盖成float(2026-08-08修过一次)。这里读取时
+        # 兜底类型检查，避免同类问题再次出现时变成崩溃而不是审计不通过。
+        tp1_state = self.pipeline.data.get("tp1")
+        tp2_state = self.pipeline.data.get("tp2")
+        if not isinstance(tp1_state, dict):
+            tp1_state = {}
+        if not isinstance(tp2_state, dict):
+            tp2_state = {}
+
         facts = {
             "symbol": self.symbol,
             "signal_side": signal.action,
@@ -562,8 +586,8 @@ class PositionSupervisorCoinW:
             "live_qty": self.pipeline.data.get("qty", 0),
             "initial_qty": self.pipeline.data.get("initial_qty", 0),
             "entry": self.pipeline.data.get("entry", 0),
-            "tp1_qty": self.pipeline.data.get("tp1", {}).get("qty", 0),
-            "tp2_qty": self.pipeline.data.get("tp2", {}).get("qty", 0),
+            "tp1_qty": tp1_state.get("qty", 0),
+            "tp2_qty": tp2_state.get("qty", 0),
             "hard_sl_px": self.pipeline.data.get("hard_sl_px", 0),
             "hard_sl_live": True,
             "tier": signal.tier,
