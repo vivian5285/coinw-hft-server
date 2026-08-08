@@ -447,6 +447,32 @@ class CoinWClient:
                 return val
         return 0.0
 
+    def get_symbol_leverage(self, symbol: str, default: float = 20.0) -> float:
+        """
+        读取该品种最近一次真实生效的杠杆（CoinW /v1/perpum/positions 返回的
+        "leverage" 字段，用户可在APP自行修改）。CoinW下单接口(/v1/perpum/order)
+        强制要求携带leverage参数，且"同一品种已有仓位/挂单时不允许用不同杠杆
+        再下单"——如果我们硬编码固定值，等于每次下单都可能悄悄把交易所杠杆
+        改回硬编码值，冲掉用户在APP上的手动设置。
+        这里优先用_all_pos_rows缓存（get_position/get_all_positions已有的
+        持仓行），缓存缺失时（品种从未记录过，例如服务刚重启、内存清零）
+        兜底发一次REST查真实持仓，避免"重启后又用旧默认值下单"重演币安那次
+        的bug；查不到任何历史（品种真正第一次开仓）才用default——CoinW没有
+        独立的"查询品种默认杠杆"接口，第一次下单只能先落一个值。
+        """
+        sym = str(symbol or "").upper()
+        try:
+            row = self._all_pos_rows.get(sym)
+            if not row:
+                row = self.get_position(sym, prefer_ws=False, force_rest=True)
+            if row:
+                lev = float(row.get("leverage") or 0)
+                if lev > 0:
+                    return lev
+        except Exception as e:
+            logger.debug(f"[{sym}] 读真实杠杆失败，回退默认值: {e}")
+        return float(default or 20.0)
+
     def get_position(self, instrument: str = "ETH", prefer_ws: bool = True, force_rest: bool = False) -> Optional[Dict]:
         """获取持仓"""
         sym = str(instrument or "ETH").upper()
@@ -639,10 +665,16 @@ class CoinWClient:
 
         def _do():
             self._throttle_rest(sym)
+            # 用户要求（2026-08-08）：与币安单系统对齐——系统永不再主动改交易所
+            # 杠杆，完全尊重用户在CoinW APP上手动设置的真实杠杆。CoinW下单接口
+            # 强制要求leverage字段，这里回填真实生效值而非硬编码，避免下单时
+            # 悄悄把交易所杠杆冲回固定值。下单量本身仍由defense_profiles固定
+            # 5倍公式计算，与此处无关。
+            lev = self.get_symbol_leverage(sym)
             params = {
                 "instrument": sym,
                 "direction": direction,
-                "leverage": "20",
+                "leverage": str(int(lev)),
                 "quantityUnit": "0",
                 "quantity": qty,
                 "positionModel": "1",
@@ -721,10 +753,14 @@ class CoinWClient:
 
         def _do():
             self._throttle_rest(sym)
+            # 同上：回填真实杠杆而非硬编码，且与开仓单保持一致——TP等限价单
+            # 多为reduce_only平掉现有仓位，若杠杆跟当前仓位真实杠杆不一致，
+            # CoinW可能直接拒单。
+            lev = self.get_symbol_leverage(sym)
             params = {
                 "instrument": sym,
                 "direction": direction,
-                "leverage": "20",
+                "leverage": str(int(lev)),
                 "quantityUnit": "0",
                 "quantity": qty,
                 "positionModel": "1",
