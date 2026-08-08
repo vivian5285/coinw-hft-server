@@ -268,9 +268,17 @@ class PositionSupervisorCoinW:
                 logger.error(f"开仓失败: {error}")
                 return {"ok": False, "error": error}
 
-            # 获取持仓信息
-            time.sleep(0.5)  # 等待成交
-            pos = self.client.get_position(self.symbol)
+            # 获取持仓信息——开仓前_clear_position()已经把本地持仓缓存写成
+            # "无持仓"(POSITION_CACHE_TTL_SEC=8s内有效)，这里如果沿用默认的
+            # prefer_ws=True/force_rest=False，大概率直接读到那份下单前的
+            # 陈旧缓存，把刚成交的仓位误判成"没有"。必须force_rest=True绕开
+            # 缓存；交易所侧成交回报也可能有轻微延迟，所以做几次重试。
+            pos = None
+            for _ in range(3):
+                time.sleep(0.5)  # 等待成交/交易所侧持仓数据落地
+                pos = self.client.get_position(self.symbol, prefer_ws=False, force_rest=True)
+                if pos and float(pos.get("positionAmt") or pos.get("quantity") or 0) != 0:
+                    break
 
             # get_position()可能返回两种形状：REST原始行(quantity字段)或
             # WS缓存行(positionAmt字段)——都要检查，否则缓存了旧的"已归零"
