@@ -288,14 +288,21 @@ class PositionSupervisorCoinW:
 
             position_id = pos.get("id", "")
             entry_price = float(pos.get("openPrice", current_price))
-            actual_qty = float(pos.get("quantity", qty))
+            # pos["quantity"]不是真实ETH数量——真实持仓验证过(2026-08-08)：
+            # 那是张数相关的内部值(quantityUnit=1场景下的原始委托量)，实际
+            # 持有的标的货币数量是baseSize(每张面值)×totalPiece(张数)。用
+            # "quantity"字段算TP1/TP2数量导致挂单量比真实持仓大了近30倍。
+            base_size = float(pos.get("baseSize", 0) or 0)
+            total_pieces = float(pos.get("totalPiece", pos.get("currentPiece", 0)) or 0)
+            actual_qty = base_size * total_pieces if (base_size and total_pieces) else float(pos.get("quantity", qty))
 
-            logger.info(f"开仓成功: {action} {actual_qty} @ {entry_price}")
+            logger.info(f"开仓成功: {action} {actual_qty} @ {entry_price} ({total_pieces}张)")
 
             return {
                 "ok": True,
                 "entry_price": entry_price,
                 "qty": actual_qty,
+                "total_pieces": total_pieces,
                 "position_id": position_id,
                 "atr": signal.atr,
             }
@@ -340,37 +347,51 @@ class PositionSupervisorCoinW:
 
             self.pipeline.data["hard_sl_px"] = hard_sl_price
 
-            # 2) TP1 + TP2
-            tp1_qty = entry_result.get("qty", 0) * 0.10
-            tp2_qty = entry_result.get("qty", 0) * 0.20
+            # 2) TP1 + TP2 —— 改用CoinW原生分批止盈接口(/v1/perpum/addTpsl,
+            # stopType=1分批)，按position_id+张数(closePiece)设置，由交易所
+            # 在触发价自动平掉对应张数。之前用"同方向限价单模拟reduce_only"
+            # 的方式是错的：CoinW下单接口没有reduce_only语义，方向填的是
+            # signal.action(跟开仓同向)，等于挂了两个"买入"限价单，价格又都
+            # 在开仓价上方——一旦挂上就被当成可成交的买单直接成交，变成两次
+            # 加仓而不是止盈(2026-08-08真实下单验证复现，仓位被从0.01 ETH
+            # 加到0.29 ETH)。原有qty计算还用错了字段，进一步放大了这个问题。
+            total_pieces = float(entry_result.get("total_pieces", 0) or 0)
+            tp1_pieces = round(total_pieces * 0.10)
+            tp2_pieces = round(total_pieces * 0.20)
 
             if signal.tp1 > 0:
-                # TP1限价单
-                self.client.place_limit_order(
-                    side=direction,
-                    quantity=tp1_qty,
-                    price=signal.tp1,
-                    instrument=self.symbol,
-                    reduce_only=True,
-                )
-                self.pipeline.data["tp1"] = {
-                    "px": signal.tp1,
-                    "qty": tp1_qty,
-                }
+                if tp1_pieces > 0:
+                    tp1_result = self.client.set_batch_sl_tp(
+                        position_id=position_id,
+                        instrument=self.symbol,
+                        stop_profit_price=signal.tp1,
+                        close_piece=tp1_pieces,
+                        stop_type=1,  # 分批止盈
+                        stop_from=2,  # 市价触发
+                        price_type=3,  # 标记价格
+                    )
+                    if not tp1_result or tp1_result.get("code") != 0:
+                        logger.error(f"TP1挂单失败: {tp1_result}")
+                    self.pipeline.data["tp1"] = {"px": signal.tp1, "pieces": tp1_pieces}
+                else:
+                    logger.warning(f"TP1跳过: 仓位仅{total_pieces}张，10%不足1张最小单位")
 
             if signal.tp2 > 0:
-                # TP2限价单
-                self.client.place_limit_order(
-                    side=direction,
-                    quantity=tp2_qty,
-                    price=signal.tp2,
-                    instrument=self.symbol,
-                    reduce_only=True,
-                )
-                self.pipeline.data["tp2"] = {
-                    "px": signal.tp2,
-                    "qty": tp2_qty,
-                }
+                if tp2_pieces > 0:
+                    tp2_result = self.client.set_batch_sl_tp(
+                        position_id=position_id,
+                        instrument=self.symbol,
+                        stop_profit_price=signal.tp2,
+                        close_piece=tp2_pieces,
+                        stop_type=1,
+                        stop_from=2,
+                        price_type=3,
+                    )
+                    if not tp2_result or tp2_result.get("code") != 0:
+                        logger.error(f"TP2挂单失败: {tp2_result}")
+                    self.pipeline.data["tp2"] = {"px": signal.tp2, "pieces": tp2_pieces}
+                else:
+                    logger.warning(f"TP2跳过: 仓位仅{total_pieces}张，20%不足1张最小单位")
 
             # 3) 雷达初始化（休眠状态）
             self.radar.set_atr(signal.atr)
