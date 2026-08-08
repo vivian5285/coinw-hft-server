@@ -407,9 +407,11 @@ class PositionSupervisorCoinW:
                     logger.warning(f"TP2跳过: 仓位仅{total_pieces}张，20%不足1张最小单位")
                     self.pipeline.data["tp2"] = {"px": signal.tp2, "pieces": 0, "qty": 0.0}
 
-            # 3) 雷达初始化（休眠状态）
+            # 3) 雷达初始化（休眠状态）——武装TP1/TP2价格供should_activate算
+            # 激活线((TP1+TP2)/2中点)，不依赖TP1/TP2是否真的成交
             self.radar.set_atr(signal.atr)
             self.radar.reset()
+            self.radar.arm(tp1_price=signal.tp1, tp2_price=signal.tp2, direction=direction)
 
             logger.info(f"防线就绪: SL={hard_sl_price}, TP1={signal.tp1}, TP2={signal.tp2}")
 
@@ -455,18 +457,19 @@ class PositionSupervisorCoinW:
                     self._on_position_zero()
                     break
 
-                # 2) 检查TP成交——之前这里读pipeline.data[...]["filled"]，但
-                # 从没有任何地方真的把这个字段置True(on_tp_filled从未被调用
-                # 过，币安那边靠"价到+挂单消失"的一堆启发式判断成交，这里没
-                # 有对应实现)，等于雷达永远不会激活。CoinW的/v1/perpum/TPSL
-                # 查询接口直接给triggerStatus(0未触发/1已触发)，不需要猜，
-                # 用这个替代。
-                tp1_filled, tp2_filled = self._check_tp_fills()
+                # 2) 检查TP成交——仅用于账本记录/日志核对，不再作为雷达激活
+                # 的前提条件(对齐币安v2.1规格：TP是否成交只是核对项，不是
+                # 激活门槛)。CoinW的/v1/perpum/TPSL查询接口直接给
+                # triggerStatus(0未触发/1已触发)，比自己猜靠谱，仍然查一下
+                # 存进pipeline方便审计/复盘。
+                self._check_tp_fills()
 
-                # 3) 雷达激活检查
-                if not self.radar.get_state().activated and tp2_filled:
-                    # TP2成交后激活雷达
-                    should, reason = self.radar.should_activate(current_price, tp2_filled)
+                # 3) 雷达激活检查——纯价格判断：现价到没到激活线
+                # ((TP1+TP2)/2中点，首次开仓)，不等TP1/TP2真的成交。CoinW
+                # 小仓位下TP1经常因不足1张最小单位被跳过，继续拿"TP成交"当
+                # 前提会导致雷达永远激活不了(2026-08-08真实测试发现此问题)。
+                if not self.radar.get_state().activated:
+                    should, reason = self.radar.should_activate(current_price)
                     if should:
                         self._activate_radar()
 

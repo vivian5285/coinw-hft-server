@@ -5,7 +5,11 @@
 
 两阶段雷达：
 1. 保本起步 -> 阶梯跟随 -> 动态追踪
-激活条件：TP2成交 + 现价达到TP2水平
+激活条件（对齐币安单系统v2.1规格，2026-08-08改）：现价达到激活线即可，
+不依赖TP1/TP2是否真的成交——首次开仓激活线=(TP1+TP2)/2中点，重入开仓
+激活线=TP2。TP是否成交仅作为账本记录/日志核对项，不作为激活的阻塞条件
+(CoinW小仓位下TP1经常因不足1张最小单位被跳过，若继续拿"TP成交"当激活
+前提，雷达会永远激活不了)。
 """
 
 from __future__ import annotations
@@ -21,7 +25,9 @@ class RadarState:
     activated: bool = False
     current_sl: float = 0.0
     entry_price: float = 0.0
+    tp1_price: float = 0.0
     tp2_price: float = 0.0
+    direction: str = "LONG"
     tier: str = "1"
     phase: str = "idle"  # idle/breakeven/trail/dynamic
     last_update: float = 0.0
@@ -46,6 +52,29 @@ class BreathStop:
         """设置ATR"""
         with self._lock:
             self._atr = float(atr or 0)
+
+    def arm(self, tp1_price: float, tp2_price: float, direction: str = "LONG"):
+        """
+        武装雷达——开仓后立即调用，记下TP1/TP2价格和方向，供should_activate
+        算激活线用。注意这里不置activated=True，只是让should_activate有
+        数据可用（之前的坑：should_activate要判断的tp2_price只在activate()
+        里才写入，但activate()恰恰是should_activate判断为True之后才调用的，
+        自己依赖自己产生的结果，永远判不出True）。
+        """
+        with self._lock:
+            self._state.tp1_price = float(tp1_price or 0)
+            self._state.tp2_price = float(tp2_price or 0)
+            self._state.direction = str(direction or "LONG").upper()
+
+    def _activation_gate_price(self) -> float:
+        """激活线：首次开仓=(TP1+TP2)/2中点，重入开仓(reentry_count>=1)=TP2"""
+        tp1 = self._state.tp1_price
+        tp2 = self._state.tp2_price
+        if self._state.reentry_count >= 1:
+            return tp2
+        if tp1 > 0 and tp2 > 0:
+            return (tp1 + tp2) / 2.0
+        return tp2  # TP1缺失时退化为TP2，不至于完全打不开
 
     def activate(self, entry_price: float, tp2_price: float,
                 tier: str = "1", direction: str = "LONG"):
@@ -95,9 +124,12 @@ class BreathStop:
                 # 空头：现价达到TP2水平
                 return current_price <= tp2
 
-    def should_activate(self, current_price: float, tp2_filled: bool = False) -> Tuple[bool, str]:
+    def should_activate(self, current_price: float) -> Tuple[bool, str]:
         """
-        判断是否应该激活
+        判断是否应该激活——纯价格判断，不要求TP1/TP2实际成交(对齐币安v2.1：
+        "TP1是否已成交仅作为日志核对项，不作为激活的阻塞条件")。CoinW小
+        仓位下TP1经常因不足1张最小单位被跳过，若还拿"TP成交"当前提，雷达
+        会永远激活不了。
 
         Returns:
             (should_activate, reason)
@@ -106,21 +138,18 @@ class BreathStop:
             if self._state.activated:
                 return False, "already_activated"
 
-            if not tp2_filled:
-                return False, "tp2_not_filled"
-
-            if not self._state.tp2_price:
-                return False, "no_tp2_price"
+            gate = self._activation_gate_price()
+            if not gate or gate <= 0:
+                return False, "no_activation_gate_price"
 
             direction = self._state.direction
-            tp2 = self._state.tp2_price
 
             if direction == "LONG":
-                if current_price >= tp2:
-                    return True, "price_reached_tp2"
+                if current_price >= gate:
+                    return True, f"price_reached_gate({gate:.2f})"
             else:
-                if current_price <= tp2:
-                    return True, "price_reached_tp2"
+                if current_price <= gate:
+                    return True, f"price_reached_gate({gate:.2f})"
 
             return False, "price_not_there"
 
@@ -255,7 +284,9 @@ class BreathStop:
                 activated=self._state.activated,
                 current_sl=self._state.current_sl,
                 entry_price=self._state.entry_price,
+                tp1_price=self._state.tp1_price,
                 tp2_price=self._state.tp2_price,
+                direction=self._state.direction,
                 tier=self._state.tier,
                 phase=self._state.phase,
                 last_update=self._state.last_update,
