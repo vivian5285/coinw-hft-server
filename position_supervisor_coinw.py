@@ -20,6 +20,8 @@ from typing import Optional, Dict, Any
 from dotenv import load_dotenv
 load_dotenv()
 
+from pipeline_ledger import PipelineLedger, get_pipeline, Phase, Role
+
 # 版本号
 COINW_SUPERVISOR_VERSION = "v16.22.1-coinw-init"
 
@@ -57,7 +59,6 @@ class PositionSupervisorCoinW:
         """初始化各模块"""
         # 延迟导入避免循环依赖
         from coinw_client import coinw_client, is_position_query_failed
-        from pipeline_ledger import get_pipeline, Phase, Role
         from pipeline_bridge import PipelineBridge
         from chief_auditor import audit_open_bundle, should_hard_pause
         from risk_manager import get_risk_manager
@@ -114,6 +115,16 @@ class PositionSupervisorCoinW:
             # LONG/SHORT信号
             if signal.action in ("LONG", "SHORT"):
                 return self._handle_open(signal)
+
+            # PING信号 - 心跳检测
+            if signal.action == "PING":
+                logger.info("收到PING心跳信号")
+                return {
+                    "ok": True,
+                    "status": "pong",
+                    "message": "system_alive",
+                    "trading_paused": trading_paused,
+                }
 
             return {"ok": False, "error": "unknown_action"}
 
@@ -261,7 +272,10 @@ class PositionSupervisorCoinW:
             time.sleep(0.5)  # 等待成交
             pos = self.client.get_position(self.symbol)
 
-            if not pos:
+            # get_position()可能返回两种形状：REST原始行(quantity字段)或
+            # WS缓存行(positionAmt字段)——都要检查，否则缓存了旧的"已归零"
+            # 记录时not pos判断不出来(非空dict恒真)
+            if not pos or float(pos.get("positionAmt") or pos.get("quantity") or 0) == 0:
                 return {"ok": False, "error": "持仓未找到"}
 
             position_id = pos.get("id", "")
@@ -389,7 +403,7 @@ class PositionSupervisorCoinW:
                 pos = self.client.get_position(self.symbol)
                 current_price = self._get_current_price()
 
-                if not pos:
+                if not pos or float(pos.get("positionAmt") or pos.get("quantity") or 0) == 0:
                     # 仓位归零
                     self._on_position_zero()
                     break
@@ -497,7 +511,7 @@ class PositionSupervisorCoinW:
         for _ in range(5):
             time.sleep(1)
             pos = self.client.get_position(self.symbol)
-            if not pos:
+            if not pos or float(pos.get("positionAmt") or pos.get("quantity") or 0) == 0:
                 return True
 
         return False
