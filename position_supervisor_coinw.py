@@ -455,16 +455,20 @@ class PositionSupervisorCoinW:
                     self._on_position_zero()
                     break
 
-                # 2) 检查TP成交
-                tp1_filled = self.pipeline.data.get("tp1", {}).get("filled", False)
-                tp2_filled = self.pipeline.data.get("tp2", {}).get("filled", False)
+                # 2) 检查TP成交——之前这里读pipeline.data[...]["filled"]，但
+                # 从没有任何地方真的把这个字段置True(on_tp_filled从未被调用
+                # 过，币安那边靠"价到+挂单消失"的一堆启发式判断成交，这里没
+                # 有对应实现)，等于雷达永远不会激活。CoinW的/v1/perpum/TPSL
+                # 查询接口直接给triggerStatus(0未触发/1已触发)，不需要猜，
+                # 用这个替代。
+                tp1_filled, tp2_filled = self._check_tp_fills()
 
                 # 3) 雷达激活检查
                 if not self.radar.get_state().activated and tp2_filled:
                     # TP2成交后激活雷达
                     should, reason = self.radar.should_activate(current_price, tp2_filled)
                     if should:
-                        self._activate_radar(entry_result)
+                        self._activate_radar()
 
                 # 4) 雷达止损更新
                 tier = self.pipeline.data.get("tier", "1")
@@ -481,28 +485,67 @@ class PositionSupervisorCoinW:
                 logger.error(f"监控异常: {e}")
                 time.sleep(5)
 
-    def _activate_radar(self, entry_result: dict):
+    def _check_tp_fills(self) -> tuple:
+        """
+        查交易所原生SL/TP记录，核对TP1/TP2是否真的成交(triggerStatus==1)。
+        按挂单时记的px匹配对应记录(浮点直接比较——CoinW原样回显我们发送的
+        stopProfitPrice，不存在自己内部再做四舍五入的问题)。跳过的档位
+        (pieces==0，没真挂过)不查、直接当未成交处理。
+        """
+        position_id = self.pipeline.data.get("position_id", "")
+        tp1_state = self.pipeline.data.get("tp1") or {}
+        tp2_state = self.pipeline.data.get("tp2") or {}
+        tp1_filled = bool(tp1_state.get("filled"))
+        tp2_filled = bool(tp2_state.get("filled"))
+
+        if not position_id or (tp1_filled and tp2_filled):
+            return tp1_filled, tp2_filled
+        if not tp1_state.get("pieces") and not tp2_state.get("pieces"):
+            return tp1_filled, tp2_filled
+
+        records = self.client.get_tp_sl_info(position_id)
+        for r in records:
+            if int(r.get("stopType") or 0) != 1:  # 只看分批止盈(TP1/TP2)，不是整仓硬止损
+                continue
+            px = float(r.get("stopProfitPrice") or 0)
+            triggered = int(r.get("triggerStatus") or 0) == 1
+            if not tp1_filled and tp1_state.get("pieces") and abs(px - float(tp1_state.get("px", 0))) < 1e-6:
+                tp1_filled = triggered
+            if not tp2_filled and tp2_state.get("pieces") and abs(px - float(tp2_state.get("px", 0))) < 1e-6:
+                tp2_filled = triggered
+
+        if tp1_filled and not tp1_state.get("filled"):
+            self.pipeline.data["tp1"]["filled"] = True
+            logger.info(f"TP1成交确认: {self.symbol} @{tp1_state.get('px')}")
+        if tp2_filled and not tp2_state.get("filled"):
+            self.pipeline.data["tp2"]["filled"] = True
+            logger.info(f"TP2成交确认: {self.symbol} @{tp2_state.get('px')}")
+
+        return tp1_filled, tp2_filled
+
+    def _activate_radar(self):
         """激活雷达"""
+        entry_price = float(self.pipeline.data.get("entry", 0) or 0)
+        position_id = self.pipeline.data.get("position_id", "")
         tp2_px = self.pipeline.data.get("tp2", {}).get("px", 0)
         tier = self.pipeline.data.get("tier", "1")
         direction = self.pipeline.data.get("side", "LONG")
 
         self.radar.activate(
-            entry_price=entry_result.get("entry_price", 0),
+            entry_price=entry_price,
             tp2_price=tp2_px,
             tier=tier,
             direction=direction,
         )
 
         # 设置初始止损为保本
-        entry = entry_result.get("entry_price", 0)
         if direction == "LONG":
-            initial_sl = entry - 0.01  # 保本起步
+            initial_sl = entry_price - 0.01  # 保本起步
         else:
-            initial_sl = entry + 0.01
+            initial_sl = entry_price + 0.01
 
         self.client.set_sl_tp(
-            position_id=entry_result.get("position_id", ""),
+            position_id=position_id,
             instrument=self.symbol,
             stop_loss_price=round(initial_sl, 2),
         )

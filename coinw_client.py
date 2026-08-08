@@ -878,6 +878,29 @@ class CoinWClient:
             logger.error(f"批量SL/TP失败 {sym}: {e}")
             return None
 
+    def get_tp_sl_info(self, position_id: str, stop_from: int = 2) -> List[Dict]:
+        """
+        查询某持仓当前挂着的SL/TP记录(/v1/perpum/TPSL GET)，用于判断分批止盈
+        是否真的成交——响应里的triggerStatus(0未触发/1已触发/2已取消)是交易所
+        原生给出的成交状态，不需要像币安那样靠"价到+限价消失"去猜测成交
+        (CoinW这个接口直接给结论)。stop_from=2对应"execute"(市价开仓形成的
+        持仓)，跟本系统的开仓方式一致。
+        注意：带上instrument参数会导致签名校验失败(2026-08-08实测，原因
+        不明，可能是这个接口的签名对参数集合有特殊要求)，所以这里不传。
+        """
+        try:
+            res = self._request("GET", "/v1/perpum/TPSL", {
+                "openId": str(position_id),
+                "stopFrom": str(stop_from),
+            })
+            if res and res.get("code") == 0:
+                data = res.get("data")
+                return list(data) if isinstance(data, list) else []
+            return []
+        except Exception as e:
+            logger.debug(f"查SL/TP信息失败 openId={position_id}: {e}")
+            return []
+
     def cancel_order(self, order_id: str, instrument: str = "ETH") -> bool:
         """撤单"""
         sym = str(instrument or "ETH").upper()
