@@ -579,6 +579,14 @@ class PositionSupervisorCoinW:
         if not isinstance(tp2_state, dict):
             tp2_state = {}
 
+        # check_tp_slice_budget默认按10%/20%全额期望TP1+TP2——但CoinW最小
+        # 交易单位是1张(0.01 ETH)，账户小的时候10%(甚至20%)会被四舍五入成
+        # 0张而合理跳过(见_place_defense_orders)。跳过的那一档就不该再被
+        # 审计要求凑齐，否则小账户每次开仓都会被这条硬性审计判失败、误触发
+        # 交易暂停(2026-08-08真实测试复现)。按实际挂没挂出来动态给ratios。
+        tp1_ratio = 0.10 if tp1_state.get("pieces", 0) else 0.0
+        tp2_ratio = 0.20 if tp2_state.get("pieces", 0) else 0.0
+
         facts = {
             "symbol": self.symbol,
             "signal_side": signal.action,
@@ -588,6 +596,7 @@ class PositionSupervisorCoinW:
             "entry": self.pipeline.data.get("entry", 0),
             "tp1_qty": tp1_state.get("qty", 0),
             "tp2_qty": tp2_state.get("qty", 0),
+            "ratios": [tp1_ratio, tp2_ratio, 1.0 - tp1_ratio - tp2_ratio],
             "hard_sl_px": self.pipeline.data.get("hard_sl_px", 0),
             "hard_sl_live": True,
             "tier": signal.tier,
