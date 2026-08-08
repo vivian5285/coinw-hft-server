@@ -675,7 +675,12 @@ class CoinWClient:
                 "instrument": sym,
                 "direction": direction,
                 "leverage": str(int(lev)),
-                "quantityUnit": "0",
+                # CoinW quantityUnit: 0=计价货币(USDT) 1=张数 2=标的货币。
+                # 全系统的qty(defense_profiles算出的仓位、TP1/TP2按比例拆分、
+                # _format_quantity按4位小数格式化)从头到尾都是ETH等标的货币
+                # 数量，不是USDT名义值，必须用2，否则交易所会把0.0104当成
+                # 0.0104 USDT去下单，远低于最小名义价值，直接被拒。
+                "quantityUnit": "2",
                 "quantity": qty,
                 "positionModel": "1",
                 "positionType": "execute",
@@ -688,7 +693,7 @@ class CoinWClient:
                     params["closeRate"] = "1.0"
 
             res = self._request("POST", "/v1/perpum/order", params)
-            logger.info(f"市价{'平仓' if reduce_only else '开仓'}: {direction} {qty} {sym}")
+            logger.info(f"市价{'平仓' if reduce_only else '开仓'}: {direction} {qty} {sym} -> {res}")
             return res
 
         try:
@@ -697,6 +702,8 @@ class CoinWClient:
                 if reduce_only:
                     self.invalidate_pos_cache(sym)
                 return result
+            if result:
+                logger.error(f"市价单被拒 {sym}: code={result.get('code')} msg={result.get('msg')}")
             return None
         except Exception as e:
             logger.error(f"市价单失败 {sym}: {e}")
@@ -761,7 +768,10 @@ class CoinWClient:
                 "instrument": sym,
                 "direction": direction,
                 "leverage": str(int(lev)),
-                "quantityUnit": "0",
+                # 同market订单：qty是ETH等标的货币数量，必须用quantityUnit=2，
+                # 不能用0(计价货币USDT)，否则TP限价单量会被交易所解读成极小的
+                # USDT名义值。
+                "quantityUnit": "2",
                 "quantity": qty,
                 "positionModel": "1",
                 "positionType": "plan",
@@ -771,7 +781,7 @@ class CoinWClient:
                 params["thirdOrderId"] = coid
 
             res = self._request("POST", "/v1/perpum/order", params)
-            logger.info(f"限价单: {direction} {qty} @{px} tag={coid}")
+            logger.info(f"限价单: {direction} {qty} @{px} tag={coid} -> {res}")
             return res
 
         try:
@@ -781,6 +791,8 @@ class CoinWClient:
                     self._recent_limit_place[key] = (time.time(), result)
                 self.invalidate_open_orders_cache(sym)
                 return result
+            if result:
+                logger.error(f"限价单被拒 {sym}: code={result.get('code')} msg={result.get('msg')}")
             return None
         except Exception as e:
             logger.error(f"限价单失败 {sym}: {e}")
