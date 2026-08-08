@@ -447,7 +447,7 @@ class CoinWClient:
                 return val
         return 0.0
 
-    def get_symbol_leverage(self, symbol: str, default: float = 20.0) -> float:
+    def get_symbol_leverage(self, symbol: str, default: float = 5.0) -> float:
         """
         读取该品种最近一次真实生效的杠杆（CoinW /v1/perpum/positions 返回的
         "leverage" 字段，用户可在APP自行修改）。CoinW下单接口(/v1/perpum/order)
@@ -458,7 +458,9 @@ class CoinWClient:
         持仓行），缓存缺失时（品种从未记录过，例如服务刚重启、内存清零）
         兜底发一次REST查真实持仓，避免"重启后又用旧默认值下单"重演币安那次
         的bug；查不到任何历史（品种真正第一次开仓）才用default——CoinW没有
-        独立的"查询品种默认杠杆"接口，第一次下单只能先落一个值。
+        独立的"查询品种默认杠杆"接口，第一次下单只能先落一个值，取仓位公式
+        本身依赖的5倍作为兜底（2026-08-08改：此前误写成20，跟用户在APP上
+        对从未交易过的品种手动设置的杠杆不一致）。
         """
         sym = str(symbol or "").upper()
         try:
@@ -471,7 +473,7 @@ class CoinWClient:
                     return lev
         except Exception as e:
             logger.debug(f"[{sym}] 读真实杠杆失败，回退默认值: {e}")
-        return float(default or 20.0)
+        return float(default or 5.0)
 
     def get_position(self, instrument: str = "ETH", prefer_ws: bool = True, force_rest: bool = False) -> Optional[Dict]:
         """获取持仓"""
