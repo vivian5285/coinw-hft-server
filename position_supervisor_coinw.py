@@ -256,6 +256,69 @@ class PositionSupervisorCoinW:
 
         return profile.calc_position_size(balance, entry_price)
 
+    def _is_retryable_open_rejection(self, code, error_msg) -> bool:
+        """只有短暂性拒单(如资金费结算窗口)才值得用限价单重试；保证金不足/
+        参数错误等重试也没用，直接判失败更清楚，避免无意义地占用限价单
+        名额(交易所挂单硬上限5笔)。"""
+        try:
+            if int(code) == 9010:
+                return True
+        except (TypeError, ValueError):
+            pass
+        msg = str(error_msg or "")
+        return "funding" in msg.lower() or "结算" in msg
+
+    def _retry_open_with_limit(self, action: str, tv_price: float, qty: float,
+                                timeout_sec: float = 60.0, poll_interval: float = 3.0) -> dict:
+        """市价开仓被拒(如资金费结算窗口)的兜底：改挂限价单，价格不劣于TV
+        信号价——多单最高只出TV价的99.7%，空单最低只收TV价的100.3%，
+        绝不比TV当时想要的价格更差。限定时间内轮询是否成交，超时未成交
+        就撤单放弃，不留孤儿挂单长期追单(2026-08-08 实盘：BNB因资金费
+        结算窗口被拒单后直接放弃，错过一次开仓信号)。"""
+        from coinw_client import is_orders_query_failed
+
+        side_u = str(action).upper()
+        if side_u == "LONG":
+            limit_price = round(float(tv_price) * 0.997, 2)
+        else:
+            limit_price = round(float(tv_price) * 1.003, 2)
+
+        logger.warning(
+            f"限价重试开仓: {side_u} {qty} @{limit_price} "
+            f"(TV价{tv_price}，让利0.3%，不追差价)"
+        )
+
+        order = self.client.place_limit_order(
+            side=action, quantity=qty, price=limit_price,
+            instrument=self.symbol, reduce_only=False,
+        )
+        if not order or order.get("code") != 0:
+            return {
+                "ok": False,
+                "error": f"限价重试提交失败: {(order or {}).get('msg', '无响应')}",
+            }
+
+        deadline = time.time() + timeout_sec
+        while time.time() < deadline:
+            time.sleep(poll_interval)
+            pos = self.client.get_position(self.symbol, prefer_ws=False, force_rest=True)
+            if pos and float(pos.get("positionAmt") or pos.get("quantity") or 0) != 0:
+                logger.info(f"限价重试成交: {side_u} @{limit_price}")
+                return {"ok": True}
+
+        logger.warning(f"限价重试超时({timeout_sec:.0f}s)未成交，撤单放弃")
+        orders = self.client.get_open_orders(self.symbol, position_type="plan")
+        if not is_orders_query_failed(orders):
+            for o in orders:
+                try:
+                    opx = round(float(o.get("openPrice", 0) or o.get("orderPrice", 0)), 2)
+                except (TypeError, ValueError):
+                    continue
+                if abs(opx - limit_price) <= 0.02 and o.get("id"):
+                    self.client.cancel_order(o.get("id"), self.symbol)
+                    break
+        return {"ok": False, "error": "限价重试超时未成交"}
+
     def _execute_open(self, action: str, price: float, qty: float, signal) -> dict:
         """执行开仓"""
         try:
@@ -271,8 +334,15 @@ class PositionSupervisorCoinW:
 
             if not result or result.get("code") != 0:
                 error = result.get("msg", "开仓失败") if result else "无响应"
+                code = result.get("code") if result else None
                 logger.error(f"开仓失败: {error}")
-                return {"ok": False, "error": error}
+                if self._is_retryable_open_rejection(code, error):
+                    retry = self._retry_open_with_limit(action, price, qty)
+                    if not retry.get("ok"):
+                        return {"ok": False, "error": retry.get("error", "限价重试失败")}
+                    # 限价重试已成交，继续走下面统一的持仓核实逻辑
+                else:
+                    return {"ok": False, "error": error}
 
             # 获取持仓信息——开仓前_clear_position()已经把本地持仓缓存写成
             # "无持仓"(POSITION_CACHE_TTL_SEC=8s内有效)，这里如果沿用默认的
