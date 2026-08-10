@@ -78,6 +78,12 @@ class PositionSupervisorCoinW:
         self.radar = get_radar(self.symbol)
         self.radar_mixin = get_radar_mixin()
         self.idempotency = get_idempotency()
+        # 注意：AccountThrottle.acquire() 目前全仓库无调用方——真正生效的限流是
+        # coinw_client.py 的 _throttle_rest()（阻塞式最小间隔）+ IP限流退避，
+        # 已在约10处REST调用点接好。self.throttle 是 v16.22.1-coinw-init 那次
+        # 整体复刻币安架构时带过来的预算滑动窗口，从初始commit起就没接线，是
+        # 冗余 scaffold 不是失效的防护——2026-08-10 评估过，暂不接入（见
+        # deepcoin_coinw对齐币安_检查清单.md 第H项）。
         self.throttle = get_throttle("coinw")
         self._dingtalk = dingtalk
 

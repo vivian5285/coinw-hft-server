@@ -99,6 +99,8 @@ def health():
     from position_supervisor_coinw import COINW_SUPERVISOR_VERSION, trading_paused
     from pipeline_ledger import get_pipeline
 
+    from pipeline_ledger import Phase
+
     symbols = ["ETH", "BTC", "XAU", "BNB"]
     pipelines = {}
 
@@ -106,11 +108,25 @@ def health():
         p = get_pipeline(sym, "coinw")
         pipelines[sym] = p.phase.value
 
+    # 部署安全阀：任一品种的pipeline阶段不在IDLE/MONITORING/FAILED这三个
+    # "静息"态时不应重启——中间那几个阶段(SIGNAL_RECEIVED~REPORTED)代表
+    # 信号正在处理中(市价单可能已成交但仓位查询/防线绑定尚未走完)，重启
+    # 会撞上这个窗口，把仓位打成孤儿仓。跟binance/deepcoin的_open_in_progress
+    # 同一个用途，coinw这边直接复用已有的pipeline状态机，不用额外加字段
+    # （对齐binance f162ede）。
+    _RESTING_PHASES = {Phase.IDLE, Phase.MONITORING, Phase.FAILED}
+    in_progress = {
+        sym: (phase_val not in {p.value for p in _RESTING_PHASES})
+        for sym, phase_val in pipelines.items()
+    }
+
     return jsonify({
         "version": COINW_WEBHOOK_VERSION,
         "supervisor_version": COINW_SUPERVISOR_VERSION,
         "trading_paused": trading_paused,
         "pipelines": pipelines,
+        "open_in_progress": in_progress,
+        "deploy_safe": not any(in_progress.values()),
         "uptime": time.time(),
     })
 
