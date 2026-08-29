@@ -160,6 +160,8 @@ def admin_clear(symbol):
     supervisor = get_supervisor(symbol)
 
     def clear():
+        supervisor._intentional_close = True   # 手动清仓：不触发再入/冷却
+        supervisor._cooldown_until = 0.0
         supervisor._stop_monitoring()
         supervisor._clear_position("管理员清仓")
         supervisor.pipeline.reset_idle("admin_clear")

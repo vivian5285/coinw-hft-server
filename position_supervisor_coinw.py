@@ -53,6 +53,19 @@ CATCHUP_BLOCK_SEC = float(os.getenv("CATCHUP_BLOCK_SEC", "1800"))  # 手动平/T
 STARTUP_RECOVERY_ENABLED = os.getenv("STARTUP_RECOVERY", "1").lower() in ("1", "true", "yes")
 NAKED_GUARD_ENABLED = os.getenv("NAKED_GUARD", "1").lower() in ("1", "true", "yes")
 
+# ==================== 止损后冷却 + 智能再入 ====================
+COOLDOWN_SEC = float(os.getenv("COOLDOWN_SEC", "1800"))          # 止损后同向 TV 信号冷却
+COOLDOWN_IGNORE_TV = os.getenv("COOLDOWN_IGNORE_TV", "1").lower() in ("1", "true", "yes")
+REENTRY_ENABLED = os.getenv("REENTRY_ENABLED", "1").lower() in ("1", "true", "yes")
+REENTRY_MAX = int(os.getenv("REENTRY_MAX", "1"))
+REENTRY_DELAY_SEC = float(os.getenv("REENTRY_DELAY_SEC", "300"))   # 止损后先等这么久才开始找再入机会
+REENTRY_WINDOW_SEC = float(os.getenv("REENTRY_WINDOW_SEC", "18000"))  # 再入机会窗口(默认5h=2根150m)
+REENTRY_POLL_SEC = float(os.getenv("REENTRY_POLL_SEC", "30"))
+REENTRY_SIZE_FACTOR = float(os.getenv("REENTRY_SIZE_FACTOR", "0.6"))
+REENTRY_ADX_GATE = float(os.getenv("REENTRY_ADX_GATE", "20"))
+REENTRY_MAX_CHASE_PCT = float(os.getenv("REENTRY_MAX_CHASE_PCT", "0.006"))
+REENTRY_HARD_SL_ATR = float(os.getenv("REENTRY_HARD_SL_ATR", "2.0"))
+
 
 class PositionSupervisorCoinW:
     """
@@ -69,6 +82,11 @@ class PositionSupervisorCoinW:
         self._monitor_thread: Optional[threading.Thread] = None
         self._catchup_blocked_until = 0.0   # 手动平/TV平后，这段时间内心跳不补开
         self._naked_tick = 0                 # 裸单守护节流计数
+        self._cooldown_until = 0.0           # 止损后同向信号冷却截止
+        self._reentry_count = 0             # 当前 episode 已再入次数
+        self._last_exit = {}                # 上次出局: side/entry/atr/tier/reason/ts
+        self._intentional_close = False    # True = TV平/手动平（不触发再入/冷却）
+        self._reentry_thread: Optional[threading.Thread] = None
 
         # 初始化模块
         self._init_modules()
@@ -158,13 +176,28 @@ class PositionSupervisorCoinW:
 
             return {"ok": False, "error": "unknown_action"}
 
-    def _handle_open(self, signal) -> dict:
+    def _handle_open(self, signal, is_reentry: bool = False) -> dict:
         """处理开仓信号"""
         global trading_paused
 
         if trading_paused:
             logger.warning("交易暂停中，拒绝开仓")
             return {"ok": False, "error": "trading_paused"}
+
+        # 止损后冷却：非再入的同向 TV 信号在冷却期内忽略（防抖，再入走独立通道）
+        if (not is_reentry and COOLDOWN_IGNORE_TV
+                and time.time() < self._cooldown_until
+                and str(signal.action).upper() == str(self._last_exit.get("side") or "").upper()):
+            left = self._cooldown_until - time.time()
+            logger.warning(f"止损后冷却中({left:.0f}s)，忽略同向信号 {signal.action}")
+            return {"ok": False, "error": "cooldown", "cooldown_left": round(left)}
+
+        # 新的真实 TV 信号 = 新 episode：清零再入计数、结束再入看守、解除冷却与心跳冻结
+        if not is_reentry:
+            self._reentry_count = 0
+            self._cooldown_until = 0.0
+            self._intentional_close = False
+        self._reentry_size_factor = REENTRY_SIZE_FACTOR if is_reentry else 1.0
 
         # 1) 信号官登记——注意：pipeline.data里的"tp1"/"tp2"是结构化状态
         # ({"px":...,"pieces":...})，这里如果直接传tp1=signal.tp1(一个纯
@@ -200,6 +233,12 @@ class PositionSupervisorCoinW:
         balance = self._get_balance()
         entry_price = signal.price
         qty = self._calc_position_size(balance, entry_price, signal.tier)
+
+        # 再入仓位缩小
+        _rf = float(getattr(self, "_reentry_size_factor", 1.0) or 1.0)
+        if _rf != 1.0:
+            qty = qty * _rf
+            logger.info(f"再入仓位系数 {_rf} -> qty={qty:.6f}")
 
         # 检查TV qty soft-cap
         if signal.qty and signal.qty > 0 and signal.qty < qty:
@@ -262,6 +301,11 @@ class PositionSupervisorCoinW:
     def _handle_close(self, signal) -> dict:
         """处理平仓信号"""
         logger.info(f"收到平仓信号: {signal.action}")
+
+        # TV 主动平仓：不触发再入 / 不算止损冷却，结束再入看守
+        self._intentional_close = True
+        self._cooldown_until = 0.0
+        self._reentry_count = 0
 
         # 停止监控
         self._stop_monitoring()
@@ -937,6 +981,11 @@ class PositionSupervisorCoinW:
         """仓位归零"""
         logger.info(f"仓位归零: {self.symbol}")
 
+        # 出局分类：非 TV平/手动平 -> 视为止损出局，记录并启动冷却 + 再入看守
+        stopped_out = not self._intentional_close
+        exit_side = str(self.pipeline.data.get("side") or "").upper()
+        exit_entry = float(self.pipeline.data.get("entry") or 0)
+
         # 停止监控
         self._monitoring = False
 
@@ -951,6 +1000,103 @@ class PositionSupervisorCoinW:
 
         # 重置流水线
         self.pipeline.reset_idle("position_zero")
+
+        if stopped_out and exit_side in ("LONG", "SHORT") and exit_entry > 0:
+            self._last_exit = {
+                "side": exit_side, "entry": exit_entry, "reason": "stop",
+                "tier": str(self.pipeline.data.get("tier") or ""), "ts": time.time(),
+            }
+            self._cooldown_until = time.time() + COOLDOWN_SEC
+            logger.warning(f"止损出局 {exit_side}@{exit_entry}；冷却 {COOLDOWN_SEC:.0f}s"
+                           f"{'，启动再入看守' if REENTRY_ENABLED else ''}")
+            if REENTRY_ENABLED and self._reentry_count < REENTRY_MAX:
+                self._start_reentry_watcher()
+        self._intentional_close = False
+
+    # ==================== 智能再入看守 ====================
+
+    def _start_reentry_watcher(self):
+        if self._reentry_thread and self._reentry_thread.is_alive():
+            return
+        self._reentry_thread = threading.Thread(
+            target=self._reentry_watch_loop, daemon=True, name=f"coinw-reentry-{self.symbol}")
+        self._reentry_thread.start()
+
+    def _reentry_watch_loop(self):
+        from smart_reentry_engine import reentry_gate
+        ex = dict(self._last_exit or {})
+        if not ex:
+            return
+        t_end = time.time() + REENTRY_WINDOW_SEC
+        time.sleep(REENTRY_DELAY_SEC)
+        while time.time() < t_end:
+            try:
+                # 已有仓 / 新 TV 信号进来了 / 冷却被清了 -> 结束看守
+                if self._pos_qty() != 0 or self._last_exit is not ex and self._last_exit != ex:
+                    return
+                if self.pipeline.phase.value not in ("IDLE", "position_zero", ""):
+                    # 有新信号在处理
+                    if self._pos_qty() != 0:
+                        return
+                if self._reentry_count >= REENTRY_MAX:
+                    return
+                raw = self.client.get_klines(self.symbol, 30, 400)
+                bars = self._synth_150(raw)
+                px = float(self._get_current_price() or 0)
+                if bars and px > 0:
+                    ok, reason = reentry_gate(
+                        bars, ex["side"], ex["entry"], px, self._reentry_count,
+                        cfg={"max_reentry": REENTRY_MAX, "adx_gate": REENTRY_ADX_GATE,
+                             "max_chase_pct": REENTRY_MAX_CHASE_PCT},
+                    )
+                    if ok:
+                        logger.warning(f"智能再入触发：{ex['side']} @现价{px} ({reason})")
+                        self._do_reentry(ex, px, bars)
+                        return
+                    logger.debug(f"再入未达标: {reason}")
+            except Exception as e:
+                logger.error(f"再入看守异常: {e}")
+            time.sleep(REENTRY_POLL_SEC)
+        logger.info("再入机会窗口结束，未再入")
+
+    def _synth_150(self, raw):
+        f = 5
+        if not raw or len(raw) < f:
+            return []
+        n = len(raw) - (len(raw) % f)
+        out = []
+        for i in range(0, n, f):
+            ch = raw[i:i + f]
+            out.append([ch[0][0], ch[0][1], max(c[2] for c in ch),
+                        min(c[3] for c in ch), ch[-1][4], sum(c[5] for c in ch)])
+        return out
+
+    def _do_reentry(self, ex: dict, px: float, bars_150: list):
+        from webhook_parser import ParsedSignal
+        atr = self._recompute_atr_150m()
+        if atr <= 0:
+            logger.warning("再入放弃：ATR 不可用")
+            return
+        side = ex["side"]
+        sl = px - REENTRY_HARD_SL_ATR * atr if side == "LONG" else px + REENTRY_HARD_SL_ATR * atr
+        tp1 = px + 1.35 * atr if side == "LONG" else px - 1.35 * atr
+        tp2 = px + 2.5 * atr if side == "LONG" else px - 2.5 * atr
+        # 再入档位沿用上次；缺失则按 ADX 粗分
+        tier = ex.get("tier") or ""
+        sig = ParsedSignal(
+            valid=True, action=side, symbol=self.symbol, price=px,
+            stop_loss=round(sl, 2), atr=round(atr, 4),
+            tp1=round(tp1, 2), tp2=round(tp2, 2), tp3=0.0,
+            qty=None, tier=tier, leverage=20, error="",
+            side=side, raw={"_reentry": True},
+        )
+        res = self._handle_open(sig, is_reentry=True)
+        if res.get("ok"):
+            self._reentry_count += 1
+            self._safe_alert(f"智能再入成功 #{self._reentry_count}：{side} @{px} "
+                             f"(仓位×{REENTRY_SIZE_FACTOR})")
+        else:
+            logger.warning(f"再入开仓失败: {res.get('error')}")
 
     # ==================== 清仓 ====================
 
