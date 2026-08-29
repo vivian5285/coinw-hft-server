@@ -384,6 +384,75 @@ class CoinWClient:
 
         return self.get_ticker(instrument)
 
+    # CoinW /v1/perpumPublic/klines 的 granularity 是枚举码，不是分钟/秒。
+    # 实测映射（2026-08-30）：分钟 -> code
+    _KLINE_GRAN = {
+        3: 7, 5: 1, 15: 2, 30: 8, 60: 3, 120: 10,
+        240: 4, 360: 11, 480: 12, 1440: 5, 10080: 6,
+    }
+
+    def get_klines(self, instrument: str = "ETH", interval_min: int = 30,
+                   limit: int = 300) -> List[list]:
+        """
+        拉合约 K 线（公开接口，无需鉴权）。
+        interval_min ∈ {3,5,15,30,60,120,240,360,480,1440,10080}。
+        返回 [[open_ms, open, high, low, close, volume], ...]，时间升序，
+        最后一根可能是未收盘的成型 K 线。失败返回 []。
+        """
+        code = self._KLINE_GRAN.get(int(interval_min or 0))
+        if code is None:
+            logger.warning(f"get_klines 不支持的周期 {interval_min}m")
+            return []
+        try:
+            self._throttle_rest(str(instrument or "ETH"), kind="rest_probe")
+            res = self._request("GET", "/v1/perpumPublic/klines", {
+                "currencyCode": str(instrument or "ETH").upper(),
+                "granularity": code,
+                "limit": int(limit or 300),
+            })
+        except Exception as e:
+            logger.warning(f"get_klines 异常 {instrument} {interval_min}m: {e}")
+            return []
+        data = res.get("data")
+        if res.get("code") != 0 or not isinstance(data, list):
+            logger.warning(
+                f"get_klines 失败 {instrument} {interval_min}m: "
+                f"code={res.get('code')} msg={res.get('msg')}"
+            )
+            return []
+        out = []
+        for row in data:
+            try:
+                out.append([
+                    int(row[0]), float(row[1]), float(row[2]),
+                    float(row[3]), float(row[4]), float(row[5]),
+                ])
+            except (TypeError, ValueError, IndexError):
+                continue
+        out.sort(key=lambda r: r[0])
+        return out
+
+    def get_position_history(self, instrument: str = "ETH", limit: int = 50) -> List[dict]:
+        """
+        已平仓历史（/v1/perpum/positions/history）。用于竞赛面板给 TV 实盘腿计分。
+        每行含 avgOpenPrice / avgClosePrice / direction / netProfit / fee /
+        tradeStartDate(ms) / openId / liquidateBy / status。失败返回 []。
+        """
+        try:
+            self._throttle_rest(str(instrument or "ETH"))
+            res = self._request("GET", "/v1/perpum/positions/history", {
+                "instrument": str(instrument or "ETH").upper(),
+                "limit": int(limit or 50),
+            })
+        except Exception as e:
+            logger.warning(f"get_position_history 异常: {e}")
+            return []
+        data = res.get("data")
+        if res.get("code") != 0 or not isinstance(data, dict):
+            return []
+        rows = data.get("rows")
+        return list(rows) if isinstance(rows, list) else []
+
     def register_price_tick_callback(self, symbol: str, callback: Callable):
         """注册价格回调"""
         sym = str(symbol or "").upper()

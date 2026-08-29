@@ -320,6 +320,68 @@ def console_index():
     return html, 200, {'Content-Type': 'text/html; charset=utf-8'}
 
 
+# ==================== 影子竞赛（TV 实盘 vs VPS 自主指标） ====================
+
+@app.route('/contest', methods=['GET'])
+def contest_json():
+    try:
+        import shadow_contest
+        return jsonify(shadow_contest.snapshot())
+    except Exception as e:
+        logger.error(f"contest_json 失败: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/contest/view', methods=['GET'])
+def contest_view():
+    try:
+        import shadow_contest
+        from contest_dashboard import DASHBOARD_HTML
+        boot = json.dumps(shadow_contest.snapshot(), ensure_ascii=False)
+    except Exception as e:
+        logger.error(f"contest_view 失败: {e}")
+        boot = json.dumps({"error": str(e)})
+        from contest_dashboard import DASHBOARD_HTML
+    html = DASHBOARD_HTML.replace("__BOOT__", boot)
+    return html, 200, {'Content-Type': 'text/html; charset=utf-8'}
+
+
+_contest_started = False
+_contest_lock = threading.Lock()
+
+
+def _start_contest_loop():
+    """后台线程：每 60s 跑一次影子竞赛单步。纯模拟，不下单。"""
+    global _contest_started
+    with _contest_lock:
+        if _contest_started:
+            return
+        if os.getenv("CONTEST_ENABLED", "1") not in ("1", "true", "yes"):
+            logger.info("影子竞赛已禁用 (CONTEST_ENABLED)")
+            return
+        _contest_started = True
+
+    def _loop():
+        import shadow_contest
+        time.sleep(8)  # 等 worker 起稳
+        while True:
+            try:
+                snap = shadow_contest.run_once()
+                m = snap.get("shadow", {}).get("metrics", {})
+                logger.info(f"[竞赛] 影子 {m.get('n',0)}笔 净{m.get('net',0)}U | "
+                            f"TV {snap.get('tv',{}).get('metrics',{}).get('n',0)}笔")
+            except Exception as e:
+                logger.error(f"[竞赛] run_once 异常: {e}")
+            time.sleep(60)
+
+    threading.Thread(target=_loop, daemon=True, name="shadow-contest").start()
+    logger.info("影子竞赛后台线程已启动 (60s/次)")
+
+
+# gunicorn 导入即启动
+_start_contest_loop()
+
+
 # ==================== 启动 ====================
 
 if __name__ == '__main__':
