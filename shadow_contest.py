@@ -351,12 +351,18 @@ class ShadowContest:
         rows = client.get_position_history(CONFIG["symbol"], 50)
         tv = self.state["tv"]
         seen = set(tv.get("seen_ids") or [])
+        start_ts = float(self.state.get("started_ts") or 0)
         added = 0
         for r in rows:
             if str(r.get("status") or "").lower() != "close":
                 continue
             oid = str(r.get("openId") or r.get("orderId") or "")
             if not oid or oid in seen:
+                continue
+            # 只算竞赛开始之后开的仓；开始前的历史单不计入
+            o_ts = int(r.get("tradeStartDate") or 0) / 1000.0
+            if start_ts > 0 and o_ts > 0 and o_ts < start_ts:
+                seen.add(oid)
                 continue
             try:
                 net = float(r.get("netProfit") or 0)
