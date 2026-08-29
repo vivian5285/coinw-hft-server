@@ -187,6 +187,24 @@ def admin_abort_catchup():
     return jsonify({"ok": True, "symbol": symbol, "blocked_until": until})
 
 
+@app.route('/admin/confirm_catchup', methods=['POST'])
+def admin_confirm_catchup():
+    """人工确认追单：下一次合格心跳立即补开。"""
+    symbol = (request.get_json(silent=True) or {}).get("symbol", "ETH")
+    from position_supervisor_coinw import confirm_catchup
+    confirm_catchup(symbol)
+    return jsonify({"ok": True, "symbol": symbol, "confirmed": True})
+
+
+@app.route('/admin/cancel_chase_watch', methods=['POST'])
+def admin_cancel_chase_watch():
+    """人工中止追单确认观察窗。"""
+    symbol = (request.get_json(silent=True) or {}).get("symbol", "ETH")
+    from position_supervisor_coinw import cancel_chase_watch
+    until = cancel_chase_watch(symbol)
+    return jsonify({"ok": True, "symbol": symbol, "blocked_until": until})
+
+
 # ==================== Console管理页 ====================
 
 @app.route('/console', methods=['GET'])
@@ -398,8 +416,8 @@ def _start_contest_loop():
     logger.info("影子竞赛后台线程已启动 (60s/次)")
 
 
-def _start_recovery():
-    """引擎启动后，若交易所仍有在场持仓，重建监控（后台线程，不阻塞 worker 启动）。"""
+def _start_housekeeping():
+    """启动恢复 + 周期巡检（孤儿单清扫 / 无人管持仓兜底）。后台线程。"""
     def _run():
         time.sleep(5)
         try:
@@ -407,12 +425,19 @@ def _start_recovery():
             recover_all_on_start()
         except Exception as e:
             logger.error(f"启动恢复异常: {e}")
-    threading.Thread(target=_run, daemon=True, name="startup-recovery").start()
+        from position_supervisor_coinw import housekeep, HOUSEKEEP_SEC
+        while True:
+            time.sleep(HOUSEKEEP_SEC)
+            try:
+                housekeep("ETH")
+            except Exception as e:
+                logger.error(f"housekeep 异常: {e}")
+    threading.Thread(target=_run, daemon=True, name="coinw-housekeeping").start()
 
 
 # gunicorn 导入即启动
 _start_contest_loop()
-_start_recovery()
+_start_housekeeping()
 
 
 # ==================== 启动 ====================

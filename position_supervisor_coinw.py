@@ -75,6 +75,14 @@ REVLOCK_BODY_ATR = float(os.getenv("REVLOCK_BODY_ATR", "1.1"))
 REVLOCK_VOL_MULT = float(os.getenv("REVLOCK_VOL_MULT", "1.4"))
 REVLOCK_MIN_PROFIT_ATR = float(os.getenv("REVLOCK_MIN_PROFIT_ATR", "0.8"))  # 至少这么多浮盈才收保本
 
+# ==================== 追单确认观察窗 / 孤儿单清扫 ====================
+CHASE_WATCH_ENABLED = os.getenv("CHASE_WATCH", "1").lower() in ("1", "true", "yes")
+CHASE_CONFIRM_COUNT = int(os.getenv("CHASE_CONFIRM_COUNT", "3"))     # 连续 N 次合格心跳
+CHASE_CONFIRM_MIN_SEC = float(os.getenv("CHASE_CONFIRM_MIN_SEC", "120"))  # 且至少观察这么久
+CHASE_STALE_SEC = float(os.getenv("CHASE_STALE_SEC", "600"))         # 心跳断这么久 -> 观察窗作废
+CHASE_3TF_REQUIRED = int(os.getenv("CHASE_3TF_REQUIRED", "3"))       # 3 个周期里至少几个同向
+HOUSEKEEP_SEC = float(os.getenv("HOUSEKEEP_SEC", "300"))
+
 
 class PositionSupervisorCoinW:
     """
@@ -98,6 +106,8 @@ class PositionSupervisorCoinW:
         self._reentry_thread: Optional[threading.Thread] = None
         self._reentry_size_factor = 1.0
         self._revlock_bar_ts = 0           # 已查过的最近 4h K线 open_ts（反转锁利节流）
+        self._chase_watch = {}            # 追单确认观察窗: {side,first_ts,count,last_ts}
+        self._chase_confirmed = False     # 人工 /admin/confirm_catchup 强制放行
 
         # 初始化模块
         self._init_modules()
@@ -449,9 +459,10 @@ class PositionSupervisorCoinW:
                 self.pipeline.reset_idle("hb_flip")
                 have = 0
 
-            # TV 有仓、VPS 空：补开
+            # TV 有仓、VPS 空：补开（经追单确认观察窗）
             if have == 0:
                 if time.time() < self._catchup_blocked_until:
+                    self._chase_watch = {}
                     return {"ok": True, "status": "heartbeat", "state": "catchup_blocked",
                             "until": round(self._catchup_blocked_until, 0)}
                 px = float(self._get_current_price() or 0)
@@ -460,15 +471,79 @@ class PositionSupervisorCoinW:
                     self._safe_alert("心跳催单放弃：缺 ATR，无法管理")
                     return {"ok": True, "status": "heartbeat", "state": "no_atr"}
                 if hb_entry > 0 and px > 0 and abs(px - hb_entry) / hb_entry > CATCHUP_MAX_DRIFT_PCT:
+                    self._chase_watch = {}
                     self._safe_alert(f"心跳催单放弃：现价{px} 偏离 entry{hb_entry} 超 "
                                      f"{CATCHUP_MAX_DRIFT_PCT:.2%}")
                     return {"ok": True, "status": "heartbeat", "state": "drift_too_large"}
-                logger.warning(f"心跳催单：补开 {hb_side} @现价{px}（心跳 entry {hb_entry}）")
+
+                ready, why = self._chase_watch_step(hb_side)
+                if not ready:
+                    return {"ok": True, "status": "heartbeat", "state": "chase_watch",
+                            "detail": why, "count": self._chase_watch.get("count", 0)}
+
+                logger.warning(f"追单确认通过（{why}）：补开 {hb_side} @现价{px}")
+                self._chase_watch = {}
+                self._chase_confirmed = False
                 res = self._handle_open(hb_sig)
                 res["catchup"] = True
                 return res
 
             return {"ok": True, "status": "heartbeat"}
+
+    # ==================== 追单确认观察窗 ====================
+
+    def _trend_confirm_3tf(self, side: str) -> tuple:
+        """30m / 150m / 4h 三周期方向一致性。返回 (同向数, 详情)。"""
+        from smart_reentry_engine import _adx, _donchian
+        agree = 0
+        parts = []
+        for tf, code, n in (("30m", 30, 400), ("150m", 150, 400), ("4h", 240, 200)):
+            try:
+                if tf == "150m":
+                    bars = self._synth_150(self.client.get_klines(self.symbol, 30, n))
+                else:
+                    bars = self.client.get_klines(self.symbol, code, n)
+            except Exception:
+                bars = []
+            if not bars or len(bars) < 25:
+                parts.append(f"{tf}:?")
+                continue
+            hh, ll, mid = _donchian(bars, 20)
+            close = bars[-1][4]
+            ok = (side == "LONG" and close > mid and close > ll) or \
+                 (side == "SHORT" and close < mid and close < hh)
+            agree += 1 if ok else 0
+            parts.append(f"{tf}:{'✓' if ok else '✗'}")
+        return agree, " ".join(parts)
+
+    def _chase_watch_step(self, hb_side: str) -> tuple:
+        """推进观察窗。返回 (是否放行, 详情)。"""
+        now = time.time()
+        if self._chase_confirmed:
+            return True, "人工确认"
+        if not CHASE_WATCH_ENABLED:
+            agree, det = self._trend_confirm_3tf(hb_side)
+            return (agree >= CHASE_3TF_REQUIRED), f"3TF {agree}/3 {det}"
+
+        cw = self._chase_watch
+        if cw and (cw.get("side") != hb_side or now - cw.get("last_ts", 0) > CHASE_STALE_SEC):
+            cw = {}
+        agree, det = self._trend_confirm_3tf(hb_side)
+        if agree < CHASE_3TF_REQUIRED:
+            self._chase_watch = {}
+            return False, f"3TF不足 {agree}/{CHASE_3TF_REQUIRED} {det}"
+
+        if not cw:
+            self._chase_watch = {"side": hb_side, "first_ts": now, "count": 1, "last_ts": now}
+            self._safe_alert(f"追单确认观察窗开启 {hb_side}（3TF {agree}/3）— "
+                             f"需连续{CHASE_CONFIRM_COUNT}次/{CHASE_CONFIRM_MIN_SEC:.0f}s 或 /admin/confirm_catchup")
+            return False, f"watch_started 3TF{agree}/3"
+        cw["count"] = cw.get("count", 0) + 1
+        cw["last_ts"] = now
+        self._chase_watch = cw
+        if cw["count"] >= CHASE_CONFIRM_COUNT and now - cw["first_ts"] >= CHASE_CONFIRM_MIN_SEC:
+            return True, f"连续{cw['count']}次/{now-cw['first_ts']:.0f}s 3TF{agree}/3"
+        return False, f"观察中 {cw['count']}/{CHASE_CONFIRM_COUNT}"
 
     def _safe_alert(self, msg: str):
         logger.warning(msg)
@@ -1437,3 +1512,43 @@ def recover_all_on_start():
             get_supervisor(sym).recover_on_start()
         except Exception as e:
             logger.error(f"[{sym}] 启动恢复异常: {e}")
+
+
+def confirm_catchup(symbol: str = "ETH"):
+    """人工确认追单：下一次合格心跳立即补开。"""
+    from app import get_supervisor
+    sup = get_supervisor(symbol)
+    sup._chase_confirmed = True
+    logger.warning(f"[{symbol}] 追单已人工确认")
+    return True
+
+
+def cancel_chase_watch(symbol: str = "ETH"):
+    """人工中止追单确认观察窗，并冻结补开一段时间。"""
+    from app import get_supervisor
+    sup = get_supervisor(symbol)
+    sup._chase_watch = {}
+    sup._chase_confirmed = False
+    sup._catchup_blocked_until = time.time() + CATCHUP_BLOCK_SEC
+    logger.warning(f"[{symbol}] 追单观察窗已中止，冻结补开 {CATCHUP_BLOCK_SEC:.0f}s")
+    return sup._catchup_blocked_until
+
+
+def housekeep(symbol: str = "ETH"):
+    """周期巡检：空仓清孤儿单；有仓但无人管 -> 兜底恢复。"""
+    from app import get_supervisor
+    from coinw_client import is_orders_query_failed
+    sup = get_supervisor(symbol)
+    try:
+        have = sup._pos_qty()
+        if have == 0:
+            if not sup._monitoring:
+                orders = sup.client.get_open_orders(symbol, position_type="plan")
+                if not is_orders_query_failed(orders) and orders:
+                    n = sup.client.cancel_all_orders(symbol)
+                    logger.warning(f"[{symbol}] housekeep：清孤儿单 {n} 笔")
+        elif not sup._monitoring:
+            logger.warning(f"[{symbol}] housekeep：发现无人管持仓，触发恢复")
+            sup.recover_on_start()
+    except Exception as e:
+        logger.error(f"[{symbol}] housekeep 异常: {e}")
