@@ -11,8 +11,28 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Dict, Tuple
+
+logger = logging.getLogger(__name__)
+
+# 趋势强弱仓位倾斜 —— 逐字段对齐币安 webhook_parser.TIER_NOTIONAL_MULT
+# （2026-08-19 值：整体在 0.2/0.35/0.5 基础上再降 30%）。
+# tier: 0=弱 1=中 2=强。在"本金×20%×5 = 本金×1.0"的基础名义上再乘该系数，
+# 即 弱/中/强 → 本金的 14% / 24.5% / 35% 名义。
+# 未知 tier（TV 没发 tier 或发了非法值）→ 1.0（不缩放，= 换代前的旧行为），
+# 与币安主开仓路径一致。
+TIER_NOTIONAL_MULT = {0: 0.14, 1: 0.245, 2: 0.35}
+
+
+def get_tier_notional_mult(tier) -> float:
+    """tier ∈ {0,1,2} / "0"/"1"/"2" → 对应系数；其余 → 1.0。"""
+    try:
+        t = int(str(tier).strip())
+    except (TypeError, ValueError):
+        return 1.0
+    return float(TIER_NOTIONAL_MULT.get(t, 1.0))
 
 
 class DefenseProfile:
@@ -47,11 +67,27 @@ class DefenseProfile:
         # 防叠单
         self.max_open_orders: int = 5
 
-    def calc_position_size(self, balance: float, entry_price: float) -> float:
-        """计算仓位"""
+    def calc_position_size(self, balance: float, entry_price: float, tier=None) -> float:
+        """
+        计算仓位。基础名义 = 本金 × risk_pct(0.20) × leverage_multiplier(5.0) = 本金×1.0。
+        再按趋势强弱档位 tier(0/1/2) 乘 TIER_NOTIONAL_MULT 缩放（对齐币安）。
+        tier 缺省/非法 → 系数 1.0（不缩放）。
+        """
         risk_capital = balance * self.risk_pct
         notional_cap = risk_capital * self.leverage_multiplier
-        qty = notional_cap / entry_price
+        if entry_price <= 0:
+            return 0.0
+        base_qty = notional_cap / entry_price
+        mult = get_tier_notional_mult(tier)
+        qty = base_qty * mult
+        if mult != 1.0:
+            logger.info(
+                f"[{self.symbol}] 趋势档位仓位倾斜 tier={tier}({mult}x) "
+                f"名义 {notional_cap:.1f}U → {notional_cap * mult:.1f}U  "
+                f"qty {base_qty:.6f} → {qty:.6f}"
+            )
+        elif tier not in (None, ""):
+            logger.warning(f"[{self.symbol}] tier={tier!r} 无法识别，仓位不缩放(1.0x)")
         return qty
 
     def calc_hard_stop(self, entry_price: float, stop_loss: float) -> float:

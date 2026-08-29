@@ -172,10 +172,10 @@ class PositionSupervisorCoinW:
 
         self.pipeline.advance(Phase.CLEARED, Role.AUDITOR_POS, note="清场完成")
 
-        # 3) 计算仓位
+        # 3) 计算仓位（按 TV 趋势强弱档位 signal.tier 缩放名义，对齐币安）
         balance = self._get_balance()
         entry_price = signal.price
-        qty = self._calc_position_size(balance, entry_price)
+        qty = self._calc_position_size(balance, entry_price, signal.tier)
 
         # 检查TV qty soft-cap
         if signal.qty and signal.qty > 0 and signal.qty < qty:
@@ -255,12 +255,12 @@ class PositionSupervisorCoinW:
 
     # ==================== 开仓执行 ====================
 
-    def _calc_position_size(self, balance: float, entry_price: float) -> float:
-        """计算仓位"""
+    def _calc_position_size(self, balance: float, entry_price: float, tier=None) -> float:
+        """计算仓位（tier=0/1/2 时按趋势强弱缩放名义，对齐币安）"""
         from defense_profiles import get_defense_profile
         profile = get_defense_profile(self.symbol)
 
-        return profile.calc_position_size(balance, entry_price)
+        return profile.calc_position_size(balance, entry_price, tier)
 
     def _is_retryable_open_rejection(self, code, error_msg) -> bool:
         """只有短暂性拒单(如资金费结算窗口)才值得用限价单重试；保证金不足/
