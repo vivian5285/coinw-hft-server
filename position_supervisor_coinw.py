@@ -549,10 +549,16 @@ class PositionSupervisorCoinW:
                     if should:
                         self._activate_radar()
 
-                # 4) 雷达止损更新
-                tier = self.pipeline.data.get("tier", "1")
-                params = breath_profiles.get_breath_profile(self.symbol).get_tier_params(tier)
-                new_sl = self.radar.update(current_price, params)
+                # 4) 雷达止损更新（币安 v2.1 价格分区模型）
+                profile = breath_profiles.get_breath_profile(self.symbol)
+                tp1_px = float((self.pipeline.data.get("tp1") or {}).get("px", 0) or 0)
+                tp2_px = float((self.pipeline.data.get("tp2") or {}).get("px", 0) or 0)
+                _tp3 = self.pipeline.data.get("tp3")
+                tp3_px = float(_tp3.get("px", 0) or 0) if isinstance(_tp3, dict) else float(_tp3 or 0)
+                new_sl = self.radar.update(
+                    current_price, profile,
+                    tp1_px=tp1_px, tp2_px=tp2_px, tp3_px=tp3_px,
+                )
 
                 if new_sl:
                     self._update_radar_sl(new_sl)
@@ -604,24 +610,26 @@ class PositionSupervisorCoinW:
 
     def _activate_radar(self):
         """激活雷达"""
+        import breath_profiles
         entry_price = float(self.pipeline.data.get("entry", 0) or 0)
         position_id = self.pipeline.data.get("position_id", "")
         tp2_px = self.pipeline.data.get("tp2", {}).get("px", 0)
         tier = self.pipeline.data.get("tier", "1")
         direction = self.pipeline.data.get("side", "LONG")
 
+        profile = breath_profiles.get_breath_profile(self.symbol)
         self.radar.activate(
             entry_price=entry_price,
             tp2_price=tp2_px,
             tier=tier,
             direction=direction,
+            profile=profile,
         )
 
-        # 设置初始止损为保本
-        if direction == "LONG":
-            initial_sl = entry_price - 0.01  # 保本起步
-        else:
-            initial_sl = entry_price + 0.01
+        # 初始止损 = 雷达算出的保本起步位（entry ± tick ± entry×fee_cover_pct）
+        initial_sl = self.radar.get_state().current_sl
+        if not initial_sl or initial_sl <= 0:
+            initial_sl = entry_price - 0.01 if direction == "LONG" else entry_price + 0.01
 
         self.client.set_sl_tp(
             position_id=position_id,
