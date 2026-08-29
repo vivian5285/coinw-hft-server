@@ -35,6 +35,16 @@ logger = logging.getLogger(__name__)
 # 交易暂停标志
 trading_paused = False
 
+# ==================== 开仓滑点阶梯（被动限价 -> 可成交限价 -> 市价兜底）====================
+# 目标：TV 信号到达后先挂对我们最有利的限价（不劣于 TV 价），给一小段时间做 maker；
+# 没成交就让利到滑点上限的可成交限价；仍不成交才市价兜底。现价逆向跑过头则放弃这次信号。
+ENTRY_LADDER_ENABLED = os.getenv("ENTRY_LADDER", "1").lower() in ("1", "true", "yes")
+ENTRY_PASSIVE_SEC = float(os.getenv("ENTRY_PASSIVE_SEC", "25"))      # 阶段1：TV 价被动限价，做 maker
+ENTRY_MARKETABLE_SEC = float(os.getenv("ENTRY_MARKETABLE_SEC", "45"))  # 阶段2：让利到滑点上限的可成交限价
+ENTRY_SLIP_CAP_PCT = float(os.getenv("ENTRY_SLIP_CAP_PCT", "0.0012"))  # 阶段2 最多相对 TV 价让 0.12%
+ENTRY_ABORT_PCT = float(os.getenv("ENTRY_ABORT_PCT", "0.004"))        # 现价比 TV 价逆向跑超 0.4% -> 放弃信号
+ENTRY_POLL_SEC = float(os.getenv("ENTRY_POLL_SEC", "3"))
+
 
 class PositionSupervisorCoinW:
     """
@@ -325,30 +335,135 @@ class PositionSupervisorCoinW:
                     break
         return {"ok": False, "error": "限价重试超时未成交"}
 
+    # ---------- 开仓滑点阶梯 ----------
+
+    _MIN_ORDER_ETH = 0.011  # < 1 张(0.01 ETH)的残量无法再挂单，视为已完成
+
+    def _pos_qty(self) -> float:
+        """当前实盘持仓的标的货币数量（强制 REST，绕缓存）。"""
+        pos = self.client.get_position(self.symbol, prefer_ws=False, force_rest=True)
+        if not pos:
+            return 0.0
+        return float(pos.get("baseSize") or pos.get("positionAmt") or pos.get("quantity") or 0)
+
+    def _cancel_open_limits(self):
+        from coinw_client import is_orders_query_failed
+        orders = self.client.get_open_orders(self.symbol, position_type="plan")
+        if is_orders_query_failed(orders) or not orders:
+            return
+        for o in orders:
+            if o.get("id"):
+                self.client.cancel_order(o.get("id"), self.symbol)
+
+    def _adverse_gap_pct(self, action: str, tv_price: float) -> float:
+        """现价相对 TV 价的【逆向】偏离比例（>0 表示对我们不利：多单买贵/空单卖便宜）。"""
+        last = float(self._get_current_price() or 0)
+        if last <= 0 or tv_price <= 0:
+            return 0.0
+        if str(action).upper() == "LONG":
+            return (last - tv_price) / tv_price
+        return (tv_price - last) / tv_price
+
+    def _wait_fill(self, action: str, tv_price: float, deadline: float, want_qty: float):
+        """轮询到成交 / deadline / 逆向放弃。返回 (状态, 已成交量)。"""
+        while time.time() < deadline:
+            time.sleep(ENTRY_POLL_SEC)
+            have = self._pos_qty()
+            if have >= want_qty - self._MIN_ORDER_ETH:
+                return "filled", have
+            if self._adverse_gap_pct(action, tv_price) > ENTRY_ABORT_PCT:
+                return "abort", have
+        return "timeout", self._pos_qty()
+
+    def _open_with_ladder(self, action: str, tv_price: float, qty: float) -> dict:
+        """
+        TV 信号进场：被动限价(TV价, maker) -> 可成交限价(让利≤滑点上限) -> 市价兜底。
+        现价逆向跑过 ENTRY_ABORT_PCT 则撤单放弃这次信号。
+        返回 {ok, via, error, aborted}。
+        """
+        side_u = str(action).upper()
+        if not ENTRY_LADDER_ENABLED:
+            r = self.client.place_market_order(side=action, quantity=qty, instrument=self.symbol)
+            if r and r.get("code") == 0:
+                return {"ok": True, "via": "market_direct"}
+            code = (r or {}).get("code")
+            msg = (r or {}).get("msg", "无响应")
+            if self._is_retryable_open_rejection(code, msg):
+                rr = self._retry_open_with_limit(action, tv_price, qty)
+                return {"ok": bool(rr.get("ok")), "via": "limit_retry", "error": rr.get("error", "")}
+            return {"ok": False, "via": "market_direct", "error": msg}
+
+        t0 = time.time()
+        tvp = float(tv_price)
+
+        # 阶段1：TV 价被动限价（做 maker，对我们最有利，绝不劣于 TV 价）
+        px1 = round(tvp, 2)
+        logger.info(f"[开仓阶梯] ①被动限价 {side_u} {qty} @{px1} (TV价 · {ENTRY_PASSIVE_SEC:.0f}s)")
+        o1 = self.client.place_limit_order(side=action, quantity=qty, price=px1,
+                                           instrument=self.symbol, reduce_only=False)
+        remaining = float(qty)
+        if o1 and (o1.get("code") == 0 or o1.get("id")):
+            st, have = self._wait_fill(action, tvp, t0 + ENTRY_PASSIVE_SEC, qty)
+            remaining = max(0.0, float(qty) - have)
+            if st == "filled":
+                logger.info("[开仓阶梯] ①成交(被动限价, 0 滑点)")
+                return {"ok": True, "via": "passive_limit"}
+            if st == "abort":
+                self._cancel_open_limits()
+                return {"ok": False, "via": "passive_limit", "aborted": True,
+                        "error": f"信号逆向跑过 {ENTRY_ABORT_PCT:.2%}，放弃进场"}
+        self._cancel_open_limits()
+
+        # 阶段2：让利到滑点上限的可成交限价
+        if remaining >= self._MIN_ORDER_ETH:
+            px2 = round(tvp * (1.0 + ENTRY_SLIP_CAP_PCT), 2) if side_u == "LONG" \
+                else round(tvp * (1.0 - ENTRY_SLIP_CAP_PCT), 2)
+            logger.info(f"[开仓阶梯] ②可成交限价 {side_u} {remaining:.6f} @{px2} "
+                        f"(让利≤{ENTRY_SLIP_CAP_PCT:.2%} · 到{ENTRY_MARKETABLE_SEC:.0f}s)")
+            o2 = self.client.place_limit_order(side=action, quantity=remaining, price=px2,
+                                               instrument=self.symbol, reduce_only=False)
+            if o2 and (o2.get("code") == 0 or o2.get("id")):
+                st, have = self._wait_fill(action, tvp, t0 + ENTRY_MARKETABLE_SEC, qty)
+                remaining = max(0.0, float(qty) - have)
+                if st == "filled":
+                    logger.info("[开仓阶梯] ②成交(可成交限价, 滑点已封顶)")
+                    return {"ok": True, "via": "marketable_limit"}
+                if st == "abort":
+                    self._cancel_open_limits()
+                    return {"ok": False, "via": "marketable_limit", "aborted": True,
+                            "error": f"信号逆向跑过 {ENTRY_ABORT_PCT:.2%}，放弃进场"}
+            self._cancel_open_limits()
+
+        # 阶段3：市价兜底（仅剩余量）
+        if remaining < self._MIN_ORDER_ETH:
+            return {"ok": True, "via": "limit_all"}
+        if self._adverse_gap_pct(action, tvp) > ENTRY_ABORT_PCT:
+            return {"ok": False, "via": "market_fallback", "aborted": True,
+                    "error": f"兜底前信号已逆向跑过 {ENTRY_ABORT_PCT:.2%}，放弃进场"}
+        logger.warning(f"[开仓阶梯] ③市价兜底 {side_u} {remaining:.6f}")
+        r = self.client.place_market_order(side=action, quantity=remaining, instrument=self.symbol)
+        if r and r.get("code") == 0:
+            return {"ok": True, "via": "market_fallback"}
+        code = (r or {}).get("code")
+        msg = (r or {}).get("msg", "无响应")
+        if self._is_retryable_open_rejection(code, msg):
+            rr = self._retry_open_with_limit(action, tvp, remaining, timeout_sec=20.0)
+            return {"ok": bool(rr.get("ok")), "via": "market_fallback_retry", "error": rr.get("error", "")}
+        return {"ok": False, "via": "market_fallback", "error": msg}
+
     def _execute_open(self, action: str, price: float, qty: float, signal) -> dict:
         """执行开仓"""
         try:
             # 获取当前价格作为参考
             current_price = self._get_current_price()
 
-            # 市价开仓
-            result = self.client.place_market_order(
-                side=action,
-                quantity=qty,
-                instrument=self.symbol,
-            )
-
-            if not result or result.get("code") != 0:
-                error = result.get("msg", "开仓失败") if result else "无响应"
-                code = result.get("code") if result else None
-                logger.error(f"开仓失败: {error}")
-                if self._is_retryable_open_rejection(code, error):
-                    retry = self._retry_open_with_limit(action, price, qty)
-                    if not retry.get("ok"):
-                        return {"ok": False, "error": retry.get("error", "限价重试失败")}
-                    # 限价重试已成交，继续走下面统一的持仓核实逻辑
-                else:
-                    return {"ok": False, "error": error}
+            # 进场滑点阶梯：被动限价 -> 可成交限价 -> 市价兜底
+            led = self._open_with_ladder(action, price, qty)
+            if not led.get("ok"):
+                logger.error(f"开仓未成交: {led.get('error')} (via={led.get('via')})")
+                return {"ok": False, "error": led.get("error", "开仓未成交"),
+                        "aborted": bool(led.get("aborted"))}
+            logger.info(f"进场方式: {led.get('via')}")
 
             # 获取持仓信息——开仓前_clear_position()已经把本地持仓缓存写成
             # "无持仓"(POSITION_CACHE_TTL_SEC=8s内有效)，这里如果沿用默认的
