@@ -83,6 +83,13 @@ CHASE_STALE_SEC = float(os.getenv("CHASE_STALE_SEC", "600"))         # 心跳断
 CHASE_3TF_REQUIRED = int(os.getenv("CHASE_3TF_REQUIRED", "3"))       # 3 个周期里至少几个同向
 HOUSEKEEP_SEC = float(os.getenv("HOUSEKEEP_SEC", "300"))
 
+# ==================== regime(ADX档位)自适应雷达 + watchdog ====================
+REGIME_ADAPT_ENABLED = os.getenv("REGIME_ADAPT", "1").lower() in ("1", "true", "yes")
+# tier 0弱/1中/2强 -> 步进系数 / 呼吸系数（强趋势给跑者更多空间，弱趋势收快点）
+REGIME_STEP_MULT = {"0": 0.85, "1": 1.0, "2": 1.20}
+REGIME_BREATH_MULT = {"0": 0.90, "1": 1.0, "2": 1.15}
+WATCHDOG_STALE_SEC = float(os.getenv("WATCHDOG_STALE_SEC", "120"))   # 监控循环这么久没跳 -> 重启
+
 
 class PositionSupervisorCoinW:
     """
@@ -108,6 +115,7 @@ class PositionSupervisorCoinW:
         self._revlock_bar_ts = 0           # 已查过的最近 4h K线 open_ts（反转锁利节流）
         self._chase_watch = {}            # 追单确认观察窗: {side,first_ts,count,last_ts}
         self._chase_confirmed = False     # 人工 /admin/confirm_catchup 强制放行
+        self._loop_beat = 0.0            # 监控循环心跳（watchdog 用）
 
         # 初始化模块
         self._init_modules()
@@ -928,6 +936,7 @@ class PositionSupervisorCoinW:
 
         while self._monitoring:
             try:
+                self._loop_beat = time.time()  # watchdog 心跳
                 # 1) 检查持仓
                 pos = self.client.get_position(self.symbol)
                 current_price = self._get_current_price()
@@ -969,8 +978,8 @@ class PositionSupervisorCoinW:
                     if should:
                         self._activate_radar()
 
-                # 4) 雷达止损更新（币安 v2.1 价格分区模型）
-                profile = breath_profiles.get_breath_profile(self.symbol)
+                # 4) 雷达止损更新（币安 v2.1 价格分区模型 + regime 自适应）
+                profile = self._regime_profile(breath_profiles.get_breath_profile(self.symbol))
                 tp1_px = float((self.pipeline.data.get("tp1") or {}).get("px", 0) or 0)
                 tp2_px = float((self.pipeline.data.get("tp2") or {}).get("px", 0) or 0)
                 _tp3 = self.pipeline.data.get("tp3")
@@ -1173,6 +1182,24 @@ class PositionSupervisorCoinW:
             out.append([ch[0][0], ch[0][1], max(c[2] for c in ch),
                         min(c[3] for c in ch), ch[-1][4], sum(c[5] for c in ch)])
         return out
+
+    # ==================== regime 自适应雷达 ====================
+
+    def _regime_profile(self, base: dict) -> dict:
+        """按开仓锁定的 tier(0/1/2) 微调雷达步进/呼吸系数。"""
+        if not REGIME_ADAPT_ENABLED or not isinstance(base, dict):
+            return base
+        tier = str(self.pipeline.data.get("tier") or "1")
+        sm = REGIME_STEP_MULT.get(tier, 1.0)
+        bm = REGIME_BREATH_MULT.get(tier, 1.0)
+        if sm == 1.0 and bm == 1.0:
+            return base
+        p = dict(base)
+        p["step_trigger_atr"] = round(float(base.get("step_trigger_atr", 0.96)) * sm, 3)
+        p["step_advance_atr"] = round(float(base.get("step_advance_atr", 0.62)) * sm, 3)
+        p["breath_tp12"] = round(float(base.get("breath_tp12", 2.56)) * bm, 3)
+        p["breath_tp23"] = round(float(base.get("breath_tp23", 3.45)) * bm, 3)
+        return p
 
     # ==================== 高潮否决 / 反转锁利 ====================
 
@@ -1550,5 +1577,12 @@ def housekeep(symbol: str = "ETH"):
         elif not sup._monitoring:
             logger.warning(f"[{symbol}] housekeep：发现无人管持仓，触发恢复")
             sup.recover_on_start()
+        elif sup._loop_beat and (time.time() - sup._loop_beat) > WATCHDOG_STALE_SEC:
+            stale = time.time() - sup._loop_beat
+            logger.error(f"[{symbol}] watchdog：监控循环 {stale:.0f}s 未跳，重启监控线程")
+            sup._safe_alert(f"watchdog：监控循环停跳 {stale:.0f}s，已重启")
+            sup._monitoring = False
+            time.sleep(1)
+            sup._start_monitoring()
     except Exception as e:
         logger.error(f"[{symbol}] housekeep 异常: {e}")
