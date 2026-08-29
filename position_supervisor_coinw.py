@@ -66,6 +66,15 @@ REENTRY_ADX_GATE = float(os.getenv("REENTRY_ADX_GATE", "20"))
 REENTRY_MAX_CHASE_PCT = float(os.getenv("REENTRY_MAX_CHASE_PCT", "0.006"))
 REENTRY_HARD_SL_ATR = float(os.getenv("REENTRY_HARD_SL_ATR", "2.0"))
 
+# ==================== 高潮否决 / 反转锁利 ====================
+CLIMAX_VETO_ENABLED = os.getenv("CLIMAX_VETO", "1").lower() in ("1", "true", "yes")
+CLIMAX_ATR_MULT = float(os.getenv("CLIMAX_ATR_MULT", "3.0"))
+OVEREXT_ATR_MULT = float(os.getenv("OVEREXT_ATR_MULT", "4.0"))
+REVLOCK_ENABLED = os.getenv("REVLOCK", "1").lower() in ("1", "true", "yes")
+REVLOCK_BODY_ATR = float(os.getenv("REVLOCK_BODY_ATR", "1.1"))
+REVLOCK_VOL_MULT = float(os.getenv("REVLOCK_VOL_MULT", "1.4"))
+REVLOCK_MIN_PROFIT_ATR = float(os.getenv("REVLOCK_MIN_PROFIT_ATR", "0.8"))  # 至少这么多浮盈才收保本
+
 
 class PositionSupervisorCoinW:
     """
@@ -87,6 +96,8 @@ class PositionSupervisorCoinW:
         self._last_exit = {}                # 上次出局: side/entry/atr/tier/reason/ts
         self._intentional_close = False    # True = TV平/手动平（不触发再入/冷却）
         self._reentry_thread: Optional[threading.Thread] = None
+        self._reentry_size_factor = 1.0
+        self._revlock_bar_ts = 0           # 已查过的最近 4h K线 open_ts（反转锁利节流）
 
         # 初始化模块
         self._init_modules()
@@ -243,6 +254,16 @@ class PositionSupervisorCoinW:
         # 检查TV qty soft-cap
         if signal.qty and signal.qty > 0 and signal.qty < qty:
             qty = signal.qty
+
+        # 3.5) 高潮插针否决 / 过度延伸告警
+        if CLIMAX_VETO_ENABLED:
+            veto, warn, det = self._climax_check(signal.action, entry_price)
+            if warn:
+                logger.warning(f"进场过度延伸告警: {det}")
+            if veto:
+                self._safe_alert(f"高潮插针否决进场 {signal.action}: {det}")
+                self.pipeline.mark_failed(Role.EXECUTION, f"climax_veto:{det}")
+                return {"ok": False, "error": f"climax_veto:{det}"}
 
         # 4) 开仓
         self.pipeline.advance(Phase.ENTRY_SUBMITTED, Role.EXECUTION, note="提交开仓")
@@ -887,6 +908,13 @@ class PositionSupervisorCoinW:
                 if new_sl:
                     self._update_radar_sl(new_sl)
 
+                # 5) 反转锁利：4h 逆向放量反转 + 浮盈中 -> 收保本
+                if REVLOCK_ENABLED:
+                    try:
+                        self._apply_reversal_lock(current_price)
+                    except Exception as _e:
+                        logger.debug(f"反转锁利异常: {_e}")
+
                 # 等待
                 time.sleep(4)  # 雷达间隔
 
@@ -1070,6 +1098,67 @@ class PositionSupervisorCoinW:
             out.append([ch[0][0], ch[0][1], max(c[2] for c in ch),
                         min(c[3] for c in ch), ch[-1][4], sum(c[5] for c in ch)])
         return out
+
+    # ==================== 高潮否决 / 反转锁利 ====================
+
+    def _climax_check(self, side: str, price: float):
+        """进场前：(veto, warn, detail)。"""
+        try:
+            bars = self._synth_150(self.client.get_klines(self.symbol, 30, 400))
+            if not bars:
+                return False, False, "no_bars"
+            from market_overlays import climax_check
+            return climax_check(bars, side, float(price or 0),
+                                cfg={"climax_atr_mult": CLIMAX_ATR_MULT,
+                                     "overext_atr_mult": OVEREXT_ATR_MULT})
+        except Exception as e:
+            logger.debug(f"climax_check异常: {e}")
+            return False, False, "err"
+
+    def _apply_reversal_lock(self, current_price: float):
+        """持仓中：4h 逆向放量反转K线 + 有浮盈 -> 止损收到保本（只进不退）。"""
+        if not REVLOCK_ENABLED:
+            return
+        st = self.radar.get_state()
+        side = str(self.pipeline.data.get("side") or "").upper()
+        entry = float(self.pipeline.data.get("entry") or 0)
+        atr = float(st.initial_atr or getattr(self.radar, "_atr", 0) or 0)
+        px = float(current_price or 0)
+        if side not in ("LONG", "SHORT") or entry <= 0 or atr <= 0 or px <= 0:
+            return
+        mfe = (px - entry) if side == "LONG" else (entry - px)
+        if mfe < REVLOCK_MIN_PROFIT_ATR * atr:
+            return
+        try:
+            raw4h = self.client.get_klines(self.symbol, 240, 120)
+        except Exception:
+            return
+        if not raw4h or len(raw4h) < 20:
+            return
+        last_closed_ts = raw4h[-2][0] if len(raw4h) >= 2 else raw4h[-1][0]
+        if last_closed_ts <= self._revlock_bar_ts:
+            return
+        self._revlock_bar_ts = last_closed_ts
+        from market_overlays import reversal_candle
+        hit, det = reversal_candle(raw4h, side, cfg={"body_atr_mult": REVLOCK_BODY_ATR,
+                                                     "vol_mult": REVLOCK_VOL_MULT})
+        if not hit:
+            return
+        from breath_stop import initial_stop_price
+        from breath_profiles import get_breath_profile
+        be = initial_stop_price(side, entry, profile=get_breath_profile(self.symbol))
+        cur = float(st.current_sl or 0)
+        new_sl = None
+        if side == "LONG":
+            if be > cur:
+                new_sl = round(be, 2)
+        else:
+            if cur <= 0 or be < cur:
+                new_sl = round(be, 2)
+        if new_sl:
+            self.radar.seed_stop(new_sl)
+            self._update_radar_sl(new_sl)
+            self._safe_alert(f"反转锁利：4h逆向放量反转({det})，止损收到保本 {new_sl}")
 
     def _do_reentry(self, ex: dict, px: float, bars_150: list):
         from webhook_parser import ParsedSignal
