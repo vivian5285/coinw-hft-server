@@ -4,8 +4,9 @@
 呼吸参数表 - CoinW单系统
 
 2026-08-29 换代：从"ADX 三档 + BreathProfile 类"整体切到币安单系统 v2.1 的
-"每品种校准 + 价格分区呼吸"模型。当前仅 ETH 接入（用户确认 CoinW 只做 ETH，
-90 分钟周期，数值逐字段对齐币安现行 BREATH_ETH，两系统保持一致）。
+"每品种校准 + 价格分区呼吸"模型。当前仅 ETH 接入。结构对齐币安，系数按
+CoinW 自己的 150 分钟周期独立校准（币安 ETH 走 90 分钟，CoinW ETH 走
+150 分钟——见 BREATH_ETH 上方校准注释）。
 
 雷达推进逻辑见 breath_stop.py（已同步换成币安的 calculate_breath_stop：
 价格分区 pre_tp1 / tp1_tp2 / tp2_tp3 / tp3_confirm / tp3_plus）。
@@ -22,26 +23,31 @@ from typing import Any, Dict, List, Optional
 RATIO_FLOOR = 0.6
 RATIO_CEILING = 2.2
 
-# ETH 基线 —— 逐字段对齐币安 eth-webhook-server 的 BREATH_ETH
-# （90 分钟周期，2026-08-13 / 08-17 校准值）。CoinW 侧不再单独校准。
+# ETH 基线 —— 结构对齐币安 v2.1，但系数按 CoinW 自己的 150 分钟周期校准
+# （币安 ETH 是 90 分钟；CoinW 用户确认 CoinW ETH 走 150 分钟）。
+# 2026-08-29 校准：方法同币安 scratch_calibrate（30m×5 合成 150m，ATR(14)，
+# fractal pivot ±3 确认，回调距离/本地ATR 分位）。1020 根合成 150m K线
+# （~106 天）、148 个回调样本，ATR%=1.12%，回调/ATR：P50=2.56 / P75=3.45 /
+# P90=5.16。step_trigger≈0.375×breath_tp12（沿用币安 ETH/BNB/ZEC/XPD 家族
+# 惯例，与同为 150m 的 BNB/ZEC/XPD 对齐），step_advance≈0.65×step_trigger。
 BREATH_ETH: Dict[str, Any] = {
     "name": "ETH",
     "initial_sl_atr": 0.0,        # 规格 v2.1：激活用保本位，不用 ATR 臂
     "fee_cover_pct": 0.0008,
     "stop_exec_buffer": 0.3,
     "early_be_atr": 0.0,
-    "step_trigger_atr": 1.05,
-    "step_advance_atr": 0.68,
+    "step_trigger_atr": 0.96,    # 150m 校准：0.375×breath_tp12
+    "step_advance_atr": 0.62,    # 150m 校准：0.65×step_trigger
     "phase_switch_atr": 3.0,
     "tp1_atr": 1.35,
     "tp1_floor_atr": 0.0,
     "tp2_atr": 2.5,
     "tp2_floor_atr": 0.0,
-    "breath_tp12": 2.70,
-    "breath_tp23": 4.00,
+    "breath_tp12": 2.56,        # 150m 校准：覆盖实测中位数回调 (P50=2.56)
+    "breath_tp23": 3.45,        # 150m 校准：覆盖实测 75 分位回调 (P75=3.45)
     "phase2_trail_mult": 1.0,
-    "min_mult": 4.0,
-    "max_mult": 5.8,
+    "min_mult": 4.0,           # 150m 校准：0.72×max_mult
+    "max_mult": 5.5,           # 150m 校准：覆盖实测 90 分位回调 (P90=5.16) + 0.3
     "ratio_floor": RATIO_FLOOR,
     "ratio_ceiling": RATIO_CEILING,
     "tick_size": 0.01,
