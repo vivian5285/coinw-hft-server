@@ -19,7 +19,10 @@ from dataclasses import dataclass
 logger = logging.getLogger(__name__)
 
 # 有效动作
-VALID_ACTIONS = {"LONG", "SHORT", "CLOSE", "CLOSE_QUICK_EXIT", "CLOSE_RSI_EXIT", "PING"}
+# HEARTBEAT：TV 周期性上报当前应有的持仓意图（side/entry/tp/sl/atr/tier），
+# VPS 用来做「心跳催单」——漏了开仓信号就补开、止损漂了就补挂。
+VALID_ACTIONS = {"LONG", "SHORT", "CLOSE", "CLOSE_QUICK_EXIT", "CLOSE_RSI_EXIT",
+                 "PING", "HEARTBEAT"}
 
 # 支持的交易对
 VALID_SYMBOLS = {"ETH", "BTC", "XAU", "BNB"}
@@ -40,6 +43,8 @@ class ParsedSignal:
     tier: str
     leverage: int
     error: str
+    side: str = ""                       # LONG/SHORT/FLAT —— HEARTBEAT 用
+    raw: Optional[Dict[str, Any]] = None  # 原始 payload —— HEARTBEAT 直接读
 
 
 class WebhookParser:
@@ -112,6 +117,32 @@ class WebhookParser:
                 stop_loss=0, atr=0, tp1=0, tp2=0, tp3=0,
                 qty=None, tier="", leverage=20,
                 error="",
+            )
+
+        # HEARTBEAT：宽松解析，缺字段不拒；side/entry/tp/sl 供心跳催单核对
+        if action == "HEARTBEAT":
+            side = str(raw.get("side") or raw.get("direction") or "").upper()
+            if side in ("LONG", "BUY"):
+                side = "LONG"
+            elif side in ("SHORT", "SELL"):
+                side = "SHORT"
+            elif side in ("FLAT", "NONE", "", "IDLE"):
+                side = "FLAT"
+            def _f(k):
+                try:
+                    return float(raw.get(k) or 0)
+                except (TypeError, ValueError):
+                    return 0.0
+            tier_hb = str(raw.get("tier") or raw.get("adx_tier") or "").lower()
+            tier_hb = {"0": "0", "弱": "0", "weak": "0", "1": "1", "中": "1",
+                       "medium": "1", "2": "2", "强": "2", "strong": "2"}.get(tier_hb, "")
+            return ParsedSignal(
+                valid=True, action=action,
+                symbol=self._normalize_symbol(raw.get("symbol", "ETH")),
+                price=_f("price"), stop_loss=_f("stop_loss"), atr=_f("atr"),
+                tp1=_f("tp1"), tp2=_f("tp2"), tp3=_f("tp3"),
+                qty=None, tier=tier_hb, leverage=20, error="",
+                side=side, raw=dict(raw),
             )
 
         # 3) 交易对
@@ -213,6 +244,8 @@ class WebhookParser:
             tier=tier,
             leverage=leverage,
             error="",
+            side=action if action in ("LONG", "SHORT") else "",
+            raw=dict(raw),
         )
 
     def is_duplicate(self, action: str, symbol: str, price: float) -> bool:

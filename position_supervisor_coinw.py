@@ -45,6 +45,14 @@ ENTRY_SLIP_CAP_PCT = float(os.getenv("ENTRY_SLIP_CAP_PCT", "0.0012"))  # 阶段2
 ENTRY_ABORT_PCT = float(os.getenv("ENTRY_ABORT_PCT", "0.004"))        # 现价比 TV 价逆向跑超 0.4% -> 放弃信号
 ENTRY_POLL_SEC = float(os.getenv("ENTRY_POLL_SEC", "3"))
 
+# ==================== 心跳催单 / 启动恢复 / 裸单守护 ====================
+HEARTBEAT_CATCHUP_ENABLED = os.getenv("HEARTBEAT_CATCHUP", "1").lower() in ("1", "true", "yes")
+CATCHUP_MAX_DRIFT_PCT = float(os.getenv("CATCHUP_MAX_DRIFT_PCT", "0.006"))  # 现价偏离心跳entry超此 -> 不补开
+HEARTBEAT_FLAT_CLOSE = os.getenv("HEARTBEAT_FLAT_CLOSE", "0").lower() in ("1", "true", "yes")  # TV空/VPS有仓是否自动补平
+CATCHUP_BLOCK_SEC = float(os.getenv("CATCHUP_BLOCK_SEC", "1800"))  # 手动平/TV平后多久内不被心跳补开
+STARTUP_RECOVERY_ENABLED = os.getenv("STARTUP_RECOVERY", "1").lower() in ("1", "true", "yes")
+NAKED_GUARD_ENABLED = os.getenv("NAKED_GUARD", "1").lower() in ("1", "true", "yes")
+
 
 class PositionSupervisorCoinW:
     """
@@ -59,6 +67,8 @@ class PositionSupervisorCoinW:
         # 状态
         self._monitoring = False
         self._monitor_thread: Optional[threading.Thread] = None
+        self._catchup_blocked_until = 0.0   # 手动平/TV平后，这段时间内心跳不补开
+        self._naked_tick = 0                 # 裸单守护节流计数
 
         # 初始化模块
         self._init_modules()
@@ -141,6 +151,10 @@ class PositionSupervisorCoinW:
                     "message": "system_alive",
                     "trading_paused": trading_paused,
                 }
+
+            # HEARTBEAT - 心跳催单（漏开补开 / 止损漂了补挂 / 反向翻转补救）
+            if signal.action == "HEARTBEAT":
+                return self._handle_heartbeat(signal)
 
             return {"ok": False, "error": "unknown_action"}
 
@@ -258,10 +272,145 @@ class PositionSupervisorCoinW:
         # 重置流水线
         self.pipeline.reset_idle("tv_close")
 
+        # 刚平的仓，一段时间内不让滞后的心跳把它又补开
+        self._catchup_blocked_until = time.time() + CATCHUP_BLOCK_SEC
+
         return {
             "ok": success,
             "action": signal.action,
         }
+
+    # ==================== 心跳催单 ====================
+
+    def _synthesize_open_signal(self, hb_signal, side: str, entry: float, px: float):
+        """把心跳 payload 拼成一个开仓信号，走 _handle_open。"""
+        from webhook_parser import ParsedSignal
+        raw = hb_signal.raw or {}
+
+        def _f(k, d=0.0):
+            try:
+                return float(raw.get(k) or d)
+            except (TypeError, ValueError):
+                return d
+
+        return ParsedSignal(
+            valid=True, action=side, symbol=self.symbol,
+            price=(entry or px), stop_loss=(hb_signal.stop_loss or _f("stop_loss")),
+            atr=(hb_signal.atr or _f("atr")),
+            tp1=(hb_signal.tp1 or _f("tp1")), tp2=(hb_signal.tp2 or _f("tp2")),
+            tp3=(hb_signal.tp3 or _f("tp3")),
+            qty=None, tier=(hb_signal.tier or ""), leverage=20, error="",
+            side=side, raw=raw,
+        )
+
+    def _hard_sl_present(self) -> bool:
+        """交易所是否已挂着一张有效硬止损（stopType!=1、未触发、stopLossPrice>0）。"""
+        pid = self.pipeline.data.get("position_id")
+        if not pid:
+            return False
+        try:
+            for r in self.client.get_tp_sl_info(pid):
+                if int(r.get("stopType") or 0) != 1 and float(r.get("stopLossPrice") or 0) > 0 \
+                        and int(r.get("triggerStatus") or 0) == 0:
+                    return True
+        except Exception:
+            return True  # 查不到就别乱补，避免重复挂
+        return False
+
+    def _live_side(self, pos: dict) -> str:
+        s = str((pos or {}).get("direction") or "").upper()
+        if s in ("LONG", "BUY"):
+            return "LONG"
+        if s in ("SHORT", "SELL"):
+            return "SHORT"
+        return ""
+
+    def _handle_heartbeat(self, signal) -> dict:
+        """心跳催单：以 TV 上报的应有持仓意图为准，补齐 VPS 的漏动作。"""
+        if not HEARTBEAT_CATCHUP_ENABLED:
+            return {"ok": True, "status": "heartbeat", "catchup": "disabled"}
+
+        hb_side = (signal.side or "FLAT").upper()
+        raw = signal.raw or {}
+        try:
+            hb_entry = float(raw.get("entry") or raw.get("entry_price") or signal.price or 0)
+        except (TypeError, ValueError):
+            hb_entry = 0.0
+
+        with self._lock:
+            have = self._pos_qty()
+            pos = None
+            live = ""
+            if have != 0:
+                pos = self.client.get_position(self.symbol, prefer_ws=False, force_rest=True)
+                live = self._live_side(pos)
+
+            # 两边都空
+            if hb_side == "FLAT" and have == 0:
+                return {"ok": True, "status": "heartbeat", "state": "both_flat"}
+
+            # TV 空、VPS 有仓：TV 平了我们漏了
+            if hb_side == "FLAT" and have != 0:
+                self._safe_alert("心跳：TV已空但VPS仍持仓")
+                if HEARTBEAT_FLAT_CLOSE:
+                    self._stop_monitoring()
+                    ok = self._clear_position("心跳催单-补平(TV已空)")
+                    self.pipeline.reset_idle("hb_flat_close")
+                    self._catchup_blocked_until = time.time() + CATCHUP_BLOCK_SEC
+                    return {"ok": ok, "status": "heartbeat", "action": "flat_close"}
+                return {"ok": True, "status": "heartbeat", "state": "tv_flat_vps_open",
+                        "note": "仅告警，未自动平（HEARTBEAT_FLAT_CLOSE=0）"}
+
+            # 同向已持仓：核对裸单
+            if have != 0 and live == hb_side:
+                if NAKED_GUARD_ENABLED and not self.radar.get_state().activated \
+                        and not self._hard_sl_present():
+                    sl = float(self.pipeline.data.get("hard_sl_px") or 0) or float(signal.stop_loss or 0)
+                    pid = self.pipeline.data.get("position_id")
+                    if sl > 0 and pid:
+                        self.client.set_sl_tp(position_id=pid, instrument=self.symbol,
+                                              stop_loss_price=round(sl, 2))
+                        logger.warning(f"心跳裸单守护：补挂硬止损 @{sl}")
+                        return {"ok": True, "status": "heartbeat", "action": "reattach_sl", "sl": sl}
+                if not self._monitoring:
+                    self._start_monitoring()
+                return {"ok": True, "status": "heartbeat", "state": "in_sync"}
+
+            # 反向持仓：TV 翻转我们漏了 -> 先平
+            if have != 0 and live and live != hb_side:
+                logger.warning(f"心跳催单：反向翻转 {live} -> {hb_side}，先平旧仓")
+                self._stop_monitoring()
+                self._clear_position(f"心跳催单-反向翻转 {live}->{hb_side}")
+                self.pipeline.reset_idle("hb_flip")
+                have = 0
+
+            # TV 有仓、VPS 空：补开
+            if have == 0:
+                if time.time() < self._catchup_blocked_until:
+                    return {"ok": True, "status": "heartbeat", "state": "catchup_blocked",
+                            "until": round(self._catchup_blocked_until, 0)}
+                px = float(self._get_current_price() or 0)
+                hb_sig = self._synthesize_open_signal(signal, hb_side, hb_entry, px)
+                if float(hb_sig.atr or 0) <= 0:
+                    self._safe_alert("心跳催单放弃：缺 ATR，无法管理")
+                    return {"ok": True, "status": "heartbeat", "state": "no_atr"}
+                if hb_entry > 0 and px > 0 and abs(px - hb_entry) / hb_entry > CATCHUP_MAX_DRIFT_PCT:
+                    self._safe_alert(f"心跳催单放弃：现价{px} 偏离 entry{hb_entry} 超 "
+                                     f"{CATCHUP_MAX_DRIFT_PCT:.2%}")
+                    return {"ok": True, "status": "heartbeat", "state": "drift_too_large"}
+                logger.warning(f"心跳催单：补开 {hb_side} @现价{px}（心跳 entry {hb_entry}）")
+                res = self._handle_open(hb_sig)
+                res["catchup"] = True
+                return res
+
+            return {"ok": True, "status": "heartbeat"}
+
+    def _safe_alert(self, msg: str):
+        logger.warning(msg)
+        try:
+            self._dingtalk.report_coinw_tp(msg, 0)
+        except Exception:
+            pass
 
     # ==================== 开仓执行 ====================
 
@@ -655,6 +804,22 @@ class PositionSupervisorCoinW:
                 # 存进pipeline方便审计/复盘。
                 self._check_tp_fills()
 
+                # 2.5) 裸单守护：持仓在场但交易所没有有效硬止损、雷达也没接管
+                #      -> 补挂硬止损（每 ~24s 查一次，限流）
+                self._naked_tick += 1
+                if NAKED_GUARD_ENABLED and self._naked_tick % 6 == 0 \
+                        and not self.radar.get_state().activated:
+                    try:
+                        if not self._hard_sl_present():
+                            sl = float(self.pipeline.data.get("hard_sl_px") or 0)
+                            pid = self.pipeline.data.get("position_id")
+                            if sl > 0 and pid:
+                                self.client.set_sl_tp(position_id=pid, instrument=self.symbol,
+                                                      stop_loss_price=round(sl, 2))
+                                logger.warning(f"裸单守护：补挂硬止损 @{sl}")
+                    except Exception as _e:
+                        logger.debug(f"裸单守护检查异常: {_e}")
+
                 # 3) 雷达激活检查——纯价格判断：现价到没到激活线
                 # ((TP1+TP2)/2中点，首次开仓)，不等TP1/TP2真的成交。CoinW
                 # 小仓位下TP1经常因不足1张最小单位被跳过，继续拿"TP成交"当
@@ -884,6 +1049,105 @@ class PositionSupervisorCoinW:
 
         self._dingtalk.send_alert(f"交易暂停: {reason}")
 
+    # ==================== 启动恢复 ====================
+
+    def _recompute_atr_150m(self) -> float:
+        """重启后 TV 锁定的 ATR 已丢，用币赢 150m K线重算 ATR(14) 兜底。"""
+        try:
+            raw = self.client.get_klines(self.symbol, 30, 400)
+            if len(raw) < 30:
+                return 0.0
+            f = 5
+            n = len(raw) - (len(raw) % f)
+            bars = []
+            for i in range(0, n, f):
+                ch = raw[i:i + f]
+                bars.append([ch[0][0], ch[0][1], max(c[2] for c in ch),
+                             min(c[3] for c in ch), ch[-1][4]])
+            if len(bars) < 16:
+                return 0.0
+            trs = []
+            for i in range(1, len(bars)):
+                h, l, pc = bars[i][2], bars[i][3], bars[i - 1][4]
+                trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+            p = 14
+            atr = sum(trs[:p]) / p
+            for tr in trs[p:]:
+                atr = (atr * (p - 1) + tr) / p
+            return round(atr, 4)
+        except Exception as e:
+            logger.warning(f"重算ATR失败: {e}")
+            return 0.0
+
+    def recover_on_start(self):
+        """引擎重启时，如交易所仍有在场持仓，重建 pipeline + 雷达并恢复监控。
+        止损锚定交易所现值（只进不退），绝不因恢复而放松。"""
+        if not STARTUP_RECOVERY_ENABLED:
+            return
+        try:
+            pos = self.client.get_position(self.symbol, prefer_ws=False, force_rest=True)
+        except Exception as e:
+            logger.warning(f"启动恢复：查持仓失败 {e}")
+            return
+        amt = 0.0
+        if pos:
+            amt = float(pos.get("baseSize") or pos.get("positionAmt") or pos.get("quantity") or 0)
+        if not pos or amt == 0:
+            logger.info("启动恢复：无在场持仓")
+            return
+
+        side = self._live_side(pos) or "LONG"
+        entry = float(pos.get("openPrice") or 0)
+        pid = str(pos.get("id") or "")
+        logger.warning(f"启动恢复：发现在场持仓 {side} {amt} @{entry} id={pid}，重建监控")
+
+        atr = self._recompute_atr_150m()
+        hard_sl = tp1_px = tp2_px = 0.0
+        tp1_f = tp2_f = False
+        try:
+            for r in (self.client.get_tp_sl_info(pid) or []):
+                spx = float(r.get("stopProfitPrice") or 0)
+                slx = float(r.get("stopLossPrice") or 0)
+                trg = int(r.get("triggerStatus") or 0) == 1
+                if int(r.get("stopType") or 0) == 1 and spx > 0:
+                    if not tp1_px or abs(spx - entry) < abs(tp1_px - entry):
+                        tp2_px, tp2_f = tp1_px, tp1_f
+                        tp1_px, tp1_f = spx, trg
+                    else:
+                        tp2_px, tp2_f = spx, trg
+                elif slx > 0 and not trg:
+                    hard_sl = slx
+        except Exception as e:
+            logger.warning(f"启动恢复：查TPSL失败 {e}")
+
+        self.pipeline.sync_position(side=side, qty=amt, entry=entry,
+                                    position_id=pid, allow_initial=True)
+        self.pipeline.data["hard_sl_px"] = hard_sl
+        self.pipeline.data["tp1"] = {"px": tp1_px, "pieces": 1 if tp1_px else 0,
+                                     "filled": tp1_f, "qty": 0.0}
+        self.pipeline.data["tp2"] = {"px": tp2_px, "pieces": 1 if tp2_px else 0,
+                                     "filled": tp2_f, "qty": 0.0}
+        self.pipeline.data.setdefault("tier", "")
+
+        self.radar.reset()
+        if atr > 0:
+            self.radar.set_atr(atr)
+        self.radar.arm(tp1_price=tp1_px, tp2_price=(tp2_px or entry), direction=side)
+        px = float(self._get_current_price() or entry)
+        gate = ((tp1_px + tp2_px) / 2.0) if (tp1_px and tp2_px) else (tp2_px or entry)
+        if atr > 0 and gate > 0 and (
+            (side == "LONG" and px >= gate) or (side == "SHORT" and px <= gate)
+        ):
+            self.radar.mark_activated(entry_price=entry, tp2_price=(tp2_px or entry), direction=side)
+        # 无论是否激活，都把雷达止损锚到交易所现有硬止损（只进不退守卫在 update 里）
+        if hard_sl > 0:
+            self.radar.seed_stop(hard_sl)
+
+        self._start_monitoring()
+        self._catchup_blocked_until = 0.0
+        self._safe_alert(f"启动恢复：{side} {amt}@{entry} 已重建监控 "
+                         f"(ATR≈{atr:.2f} SL={hard_sl or '?'} 雷达={'已激活' if self.radar.get_state().activated else '待命'})")
+
     # ==================== 健康检查 ====================
 
     def get_health(self) -> dict:
@@ -918,3 +1182,23 @@ def resume_all_trading():
 def is_trading_paused() -> bool:
     """检查是否暂停"""
     return trading_paused
+
+
+def block_catchup(symbol: str = "ETH", seconds: float = None):
+    """人工中止心跳催单：这段时间内心跳不再把该品种补开。"""
+    from app import get_supervisor  # 延迟导入避免循环
+    sup = get_supervisor(symbol)
+    sec = float(seconds if seconds is not None else CATCHUP_BLOCK_SEC)
+    sup._catchup_blocked_until = time.time() + sec
+    logger.warning(f"[{symbol}] 心跳催单已人工中止 {sec:.0f}s")
+    return sup._catchup_blocked_until
+
+
+def recover_all_on_start():
+    """引擎启动时对所有活跃品种做一次在场持仓恢复。"""
+    from app import get_supervisor
+    for sym in ("ETH",):
+        try:
+            get_supervisor(sym).recover_on_start()
+        except Exception as e:
+            logger.error(f"[{sym}] 启动恢复异常: {e}")

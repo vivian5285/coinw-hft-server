@@ -476,6 +476,29 @@ class BreathStop:
         with self._lock:
             self._state.reentry_count = max(0, count)
 
+    def seed_stop(self, sl: float):
+        """启动恢复用：把 current_sl / initial_stop 直接锚到交易所现有止损，
+        之后 update() 的只进不退守卫保证不会把线放松。"""
+        with self._lock:
+            s = float(sl or 0)
+            if s > 0:
+                self._state.current_sl = s
+                self._state.initial_stop = s
+
+    def mark_activated(self, entry_price: float, tp2_price: float,
+                       direction: str = "LONG"):
+        """启动恢复用：现价已过激活线时，直接把雷达置为已激活（不重算 current_sl，
+        随后请紧接着 seed_stop 锚定交易所现值）。"""
+        with self._lock:
+            self._state.activated = True
+            self._state.entry_price = float(entry_price)
+            self._state.tp2_price = float(tp2_price or entry_price)
+            self._state.direction = str(direction).upper()
+            self._state.phase = "trail"
+            self._state.initial_atr = float(self._atr or 0)
+            self._state.best_price = float(entry_price)
+            self._state.last_update = time.time()
+
 
 # 雷达状态管理
 _RADARS: Dict[str, BreathStop] = {}

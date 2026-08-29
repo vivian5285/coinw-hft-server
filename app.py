@@ -156,15 +156,33 @@ def admin_resume():
 
 @app.route('/admin/clear/<symbol>', methods=['POST'])
 def admin_clear(symbol):
-    """清仓指定品种"""
+    """清仓指定品种（并临时冻结心跳催单，避免刚清就被补开）"""
     supervisor = get_supervisor(symbol)
 
     def clear():
+        supervisor._stop_monitoring()
         supervisor._clear_position("管理员清仓")
+        supervisor.pipeline.reset_idle("admin_clear")
+        try:
+            from position_supervisor_coinw import block_catchup
+            block_catchup(symbol)
+        except Exception:
+            pass
 
     threading.Thread(target=clear, daemon=True).start()
 
     return jsonify({"ok": True, "symbol": symbol})
+
+
+@app.route('/admin/abort_catchup', methods=['POST'])
+def admin_abort_catchup():
+    """人工中止心跳催单：一段时间内心跳不再把该品种补开。"""
+    payload = request.get_json(silent=True) or {}
+    symbol = payload.get("symbol", "ETH")
+    seconds = payload.get("seconds")
+    from position_supervisor_coinw import block_catchup
+    until = block_catchup(symbol, float(seconds) if seconds else None)
+    return jsonify({"ok": True, "symbol": symbol, "blocked_until": until})
 
 
 # ==================== Console管理页 ====================
@@ -378,8 +396,21 @@ def _start_contest_loop():
     logger.info("影子竞赛后台线程已启动 (60s/次)")
 
 
+def _start_recovery():
+    """引擎启动后，若交易所仍有在场持仓，重建监控（后台线程，不阻塞 worker 启动）。"""
+    def _run():
+        time.sleep(5)
+        try:
+            from position_supervisor_coinw import recover_all_on_start
+            recover_all_on_start()
+        except Exception as e:
+            logger.error(f"启动恢复异常: {e}")
+    threading.Thread(target=_run, daemon=True, name="startup-recovery").start()
+
+
 # gunicorn 导入即启动
 _start_contest_loop()
+_start_recovery()
 
 
 # ==================== 启动 ====================
