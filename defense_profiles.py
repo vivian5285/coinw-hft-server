@@ -17,13 +17,14 @@ from typing import Dict, Tuple
 
 logger = logging.getLogger(__name__)
 
-# 趋势强弱仓位倾斜 —— 逐字段对齐币安 webhook_parser.TIER_NOTIONAL_MULT
-# （2026-08-19 值：整体在 0.2/0.35/0.5 基础上再降 30%）。
-# tier: 0=弱 1=中 2=强。在"本金×20%×5 = 本金×1.0"的基础名义上再乘该系数，
-# 即 弱/中/强 → 本金的 14% / 24.5% / 35% 名义。
-# 未知 tier（TV 没发 tier 或发了非法值）→ 1.0（不缩放，= 换代前的旧行为），
-# 与币安主开仓路径一致。
-TIER_NOTIONAL_MULT = {0: 0.14, 1: 0.245, 2: 0.35}
+# 趋势强弱仓位倾斜。
+# 2026-08-29：CoinW 只做 ETH 单品种，不像币安要分摊给 10+ 个品种，所以这里
+# 用户要求把下单量整体上调。强档 = 本金×20%×5 = 本金×1.0 名义（占名义价值
+# 一倍），这是上限；弱/中档沿用币安一直稳定的 0.4 : 0.7 : 1.0 比例依次上调。
+# tier: 0=弱 1=中 2=强。基础名义 = 本金×20%×5 = 本金×1.0，再乘该系数：
+#   弱 → 本金的 40% 名义 / 中 → 70% / 强 → 100%
+# 未知 tier（TV 没发或发了非法值）→ 1.0（= 强档，不缩放）。
+TIER_NOTIONAL_MULT = {0: 0.40, 1: 0.70, 2: 1.00}
 
 
 def get_tier_notional_mult(tier) -> float:
@@ -80,14 +81,14 @@ class DefenseProfile:
         base_qty = notional_cap / entry_price
         mult = get_tier_notional_mult(tier)
         qty = base_qty * mult
-        if mult != 1.0:
+        tier_s = str(tier).strip() if tier is not None else ""
+        if tier_s in ("0", "1", "2"):
             logger.info(
-                f"[{self.symbol}] 趋势档位仓位倾斜 tier={tier}({mult}x) "
-                f"名义 {notional_cap:.1f}U → {notional_cap * mult:.1f}U  "
-                f"qty {base_qty:.6f} → {qty:.6f}"
+                f"[{self.symbol}] 趋势档位仓位 tier={tier_s}({mult}x) "
+                f"名义 {notional_cap * mult:.1f}U  qty={qty:.6f}"
             )
-        elif tier not in (None, ""):
-            logger.warning(f"[{self.symbol}] tier={tier!r} 无法识别，仓位不缩放(1.0x)")
+        elif tier_s:
+            logger.warning(f"[{self.symbol}] tier={tier!r} 无法识别，仓位按强档(1.0x)")
         return qty
 
     def calc_hard_stop(self, entry_price: float, stop_loss: float) -> float:
