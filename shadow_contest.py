@@ -10,7 +10,7 @@ VPS 腿【纯模拟，永不下单】：自己拉币赢 K 线跑趋势指标，�
 TV 腿计分：轮询 /v1/perpum/positions/history 的已平仓行（netProfit 是净额）。
 
 策略（可调旋钮见 CONFIG）：
-  周期 150m（30m×5 合成）；唐奇安 N 根通道突破定方向；ADX(14) 门控 + 分档
+  周期 60m（≈59m TV 周期）；唐奇安 N 根通道突破定方向；ADX(14) 门控 + 分档
   （<门槛不做；弱/中/强 -> tier 0/1/2 -> 复用 TIER_NOTIONAL_MULT 定模拟仓位）。
 """
 from __future__ import annotations
@@ -26,8 +26,8 @@ STATE_PATH = os.path.join(BASE_DIR, "contest_state.json")
 
 CONFIG: Dict[str, Any] = {
     "symbol": "ETH",
-    "tf_min": 150,            # 目标周期
-    "src_min": 30,            # 拉取的原始 K 线周期（30m×5=150m）
+    "tf_min": 60,             # 目标周期（≈ETH TV 59m，用 60m 原生近似）
+    "src_min": 60,            # 60m 原生，无需合成
     "donchian_n": 20,         # 通道突破回看根数
     "adx_period": 14,
     "atr_period": 14,
@@ -42,7 +42,7 @@ CONFIG: Dict[str, Any] = {
     "tick": 0.01,
     "tp1_ratio": 0.10,
     "tp2_ratio": 0.20,
-    "src_limit": 900,         # 拉多少根 30m（~180 根 150m，够 20/14 指标）
+    "src_limit": 1000,        # 60m×1000 ≈ 41 天，够 20/14 指标
     "equity_curve_cap": 3000,
 }
 
@@ -196,7 +196,7 @@ class ShadowContest:
     def _slip(self) -> float:
         return CONFIG["slippage_ticks"] * CONFIG["tick"]
 
-    # ---- 策略评估（用最后一根已收盘 150m）----
+    # ---- 策略评估（用最后一根已收盘 60m）----
     def _entry_signal(self, bars: List[list]) -> Optional[Dict[str, Any]]:
         c = CONFIG
         need = max(c["donchian_n"], c["adx_period"] * 2, c["atr_period"]) + 3

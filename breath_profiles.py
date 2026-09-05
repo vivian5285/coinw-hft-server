@@ -23,31 +23,32 @@ from typing import Any, Dict, List, Optional
 RATIO_FLOOR = 0.6
 RATIO_CEILING = 2.2
 
-# ETH 基线 —— 结构对齐币安 v2.1，但系数按 CoinW 自己的 150 分钟周期校准
-# （币安 ETH 是 90 分钟；CoinW 用户确认 CoinW ETH 走 150 分钟）。
-# 2026-08-29 校准：方法同币安 scratch_calibrate（30m×5 合成 150m，ATR(14)，
-# fractal pivot ±3 确认，回调距离/本地ATR 分位）。1020 根合成 150m K线
-# （~106 天）、148 个回调样本，ATR%=1.12%，回调/ATR：P50=2.56 / P75=3.45 /
-# P90=5.16。step_trigger≈0.375×breath_tp12（沿用币安 ETH/BNB/ZEC/XPD 家族
-# 惯例，与同为 150m 的 BNB/ZEC/XPD 对齐），step_advance≈0.65×step_trigger。
+# ETH 基线 —— 结构对齐币安 v2.1，系数按 CoinW ETH 的 TV 周期校准。
+# 2026-09-06 重校准：用户确认 CoinW ETH 的 TV 周期改为 59 分钟（此前 150 分钟）。
+# 59 是质数，用 Binance 1m ×59 合成（同价），方法同币安 scratch_calibrate
+# （ATR(14)，fractal pivot ±3 确认，回调距离/本地ATR 分位）。1003 根合成
+# 59m K线（~41 天）、171 个回调样本，ATR%=0.39%，回调/ATR：P50=2.31 /
+# P75=3.36 / P90=5.32。step_trigger≈0.375×breath_tp12，step_advance≈0.65×。
+# 运行时 CoinW 侧重算（恢复/再入/climax/3TF/影子）用 60m 原生 K 线作 59m 近似
+# （CoinW granularity 无 59，且 1m limit 只到 25h 拼不出足够 59m 历史）。
 BREATH_ETH: Dict[str, Any] = {
     "name": "ETH",
     "initial_sl_atr": 0.0,        # 规格 v2.1：激活用保本位，不用 ATR 臂
     "fee_cover_pct": 0.0008,
     "stop_exec_buffer": 0.3,
     "early_be_atr": 0.0,
-    "step_trigger_atr": 0.96,    # 150m 校准：0.375×breath_tp12
-    "step_advance_atr": 0.62,    # 150m 校准：0.65×step_trigger
+    "step_trigger_atr": 0.87,    # 59m 校准：0.375×breath_tp12
+    "step_advance_atr": 0.57,    # 59m 校准：0.65×step_trigger
     "phase_switch_atr": 3.0,
     "tp1_atr": 1.35,
     "tp1_floor_atr": 0.0,
     "tp2_atr": 2.5,
     "tp2_floor_atr": 0.0,
-    "breath_tp12": 2.56,        # 150m 校准：覆盖实测中位数回调 (P50=2.56)
-    "breath_tp23": 3.45,        # 150m 校准：覆盖实测 75 分位回调 (P75=3.45)
+    "breath_tp12": 2.31,        # 59m 校准：覆盖实测中位数回调 (P50=2.31)
+    "breath_tp23": 3.36,        # 59m 校准：覆盖实测 75 分位回调 (P75=3.36)
     "phase2_trail_mult": 1.0,
-    "min_mult": 4.0,           # 150m 校准：0.72×max_mult
-    "max_mult": 5.5,           # 150m 校准：覆盖实测 90 分位回调 (P90=5.16) + 0.3
+    "min_mult": 4.0,           # 59m 校准：0.72×max_mult
+    "max_mult": 5.6,           # 59m 校准：覆盖实测 90 分位回调 (P90=5.32) + 0.3
     "ratio_floor": RATIO_FLOOR,
     "ratio_ceiling": RATIO_CEILING,
     "tick_size": 0.01,

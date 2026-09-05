@@ -501,16 +501,13 @@ class PositionSupervisorCoinW:
     # ==================== 追单确认观察窗 ====================
 
     def _trend_confirm_3tf(self, side: str) -> tuple:
-        """30m / 150m / 4h 三周期方向一致性。返回 (同向数, 详情)。"""
+        """30m / 60m / 4h 三周期方向一致性。返回 (同向数, 详情)。"""
         from smart_reentry_engine import _adx, _donchian
         agree = 0
         parts = []
-        for tf, code, n in (("30m", 30, 400), ("150m", 150, 400), ("4h", 240, 200)):
+        for tf, code, n in (("30m", 30, 400), ("60m", 60, 400), ("4h", 240, 200)):
             try:
-                if tf == "150m":
-                    bars = self._synth_150(self.client.get_klines(self.symbol, 30, n))
-                else:
-                    bars = self.client.get_klines(self.symbol, code, n)
+                bars = self.client.get_klines(self.symbol, code, n)
             except Exception:
                 bars = []
             if not bars or len(bars) < 25:
@@ -978,15 +975,20 @@ class PositionSupervisorCoinW:
                     if should:
                         self._activate_radar()
 
-                # 4) 雷达止损更新（币安 v2.1 价格分区模型 + regime 自适应）
+                # 4) 雷达止损更新（币安 v2.1 价格分区 + regime 自适应 + 三条硬地板 + tp2_patience）
                 profile = self._regime_profile(breath_profiles.get_breath_profile(self.symbol))
                 tp1_px = float((self.pipeline.data.get("tp1") or {}).get("px", 0) or 0)
                 tp2_px = float((self.pipeline.data.get("tp2") or {}).get("px", 0) or 0)
                 _tp3 = self.pipeline.data.get("tp3")
                 tp3_px = float(_tp3.get("px", 0) or 0) if isinstance(_tp3, dict) else float(_tp3 or 0)
+                # TV 止损空间 = |entry − 硬止损|，喂给「雷达最多比 TV 紧 35%」硬地板
+                _entry = float(self.pipeline.data.get("entry") or 0)
+                _hsl = float(self.pipeline.data.get("hard_sl_px") or 0)
+                tv_stop_dist = abs(_entry - _hsl) if (_entry > 0 and _hsl > 0) else 0.0
                 new_sl = self.radar.update(
                     current_price, profile,
                     tp1_px=tp1_px, tp2_px=tp2_px, tp3_px=tp3_px,
+                    tv_stop_dist=tv_stop_dist,
                 )
 
                 if new_sl:
@@ -1152,8 +1154,7 @@ class PositionSupervisorCoinW:
                         return
                 if self._reentry_count >= REENTRY_MAX:
                     return
-                raw = self.client.get_klines(self.symbol, 30, 400)
-                bars = self._synth_150(raw)
+                bars = self.client.get_klines(self.symbol, 60, 400)
                 px = float(self._get_current_price() or 0)
                 if bars and px > 0:
                     ok, reason = reentry_gate(
@@ -1206,7 +1207,7 @@ class PositionSupervisorCoinW:
     def _climax_check(self, side: str, price: float):
         """进场前：(veto, warn, detail)。"""
         try:
-            bars = self._synth_150(self.client.get_klines(self.symbol, 30, 400))
+            bars = self.client.get_klines(self.symbol, 60, 400)
             if not bars:
                 return False, False, "no_bars"
             from market_overlays import climax_check
@@ -1389,18 +1390,9 @@ class PositionSupervisorCoinW:
     # ==================== 启动恢复 ====================
 
     def _recompute_atr_150m(self) -> float:
-        """重启后 TV 锁定的 ATR 已丢，用币赢 150m K线重算 ATR(14) 兜底。"""
+        """重启后 TV 锁定的 ATR 已丢，用币赢 60m 原生 K线重算 ATR(14) 兜底（≈59m TV 周期）。"""
         try:
-            raw = self.client.get_klines(self.symbol, 30, 400)
-            if len(raw) < 30:
-                return 0.0
-            f = 5
-            n = len(raw) - (len(raw) % f)
-            bars = []
-            for i in range(0, n, f):
-                ch = raw[i:i + f]
-                bars.append([ch[0][0], ch[0][1], max(c[2] for c in ch),
-                             min(c[3] for c in ch), ch[-1][4]])
+            bars = self.client.get_klines(self.symbol, 60, 400)
             if len(bars) < 16:
                 return 0.0
             trs = []

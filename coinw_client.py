@@ -385,9 +385,9 @@ class CoinWClient:
         return self.get_ticker(instrument)
 
     # CoinW /v1/perpumPublic/klines 的 granularity 是枚举码，不是分钟/秒。
-    # 实测映射（2026-08-30）：分钟 -> code
+    # 实测映射（2026-08-30，2026-09-06 补 1m=0）：分钟 -> code
     _KLINE_GRAN = {
-        3: 7, 5: 1, 15: 2, 30: 8, 60: 3, 120: 10,
+        1: 0, 3: 7, 5: 1, 15: 2, 30: 8, 60: 3, 120: 10,
         240: 4, 360: 11, 480: 12, 1440: 5, 10080: 6,
     }
 
