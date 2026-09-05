@@ -463,7 +463,7 @@ class ShadowContest:
             "started_ts": st["started_ts"],
             "last_price": st["last_price"],
             "last_bar_ts": st["last_bar_ts"],
-            "config": st["config"],
+            "config": dict(CONFIG),  # 返回实时 CONFIG，不是建档时快照
             "shadow": {
                 "open": sh["open"],
                 "equity": sh["equity"],
