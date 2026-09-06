@@ -17,23 +17,31 @@ from typing import Dict, Tuple
 
 logger = logging.getLogger(__name__)
 
-# 趋势强弱仓位倾斜。
-# 2026-08-29：CoinW 只做 ETH 单品种，不像币安要分摊给 10+ 个品种，所以这里
-# 用户要求把下单量整体上调。强档 = 本金×20%×5 = 本金×1.0 名义（占名义价值
-# 一倍），这是上限；弱/中档沿用币安一直稳定的 0.4 : 0.7 : 1.0 比例依次上调。
-# tier: 0=弱 1=中 2=强。基础名义 = 本金×20%×5 = 本金×1.0，再乘该系数：
-#   弱 → 本金的 40% 名义 / 中 → 70% / 强 → 100%
-# 未知 tier（TV 没发或发了非法值）→ 1.0（= 强档，不缩放）。
-TIER_NOTIONAL_MULT = {0: 0.40, 1: 0.70, 2: 1.00}
+# 趋势强弱仓位倾斜（2026-09-06 用户重定）。
+# 本金余额 × 趋势强度百分比 × 5倍杠杆 = 下单名义。
+#   弱 tier0 : 本金×10%×5 = 本金×0.50 名义
+#   中 tier1 : 本金×15%×5 = 本金×0.75 名义
+#   强 tier2 : 本金×20%×5 = 本金×1.00 名义（满仓一倍 = 现货一倍，上限）
+# 未知/缺失 tier → 按最强档（0.20），与既有默认行为一致。
+TIER_RISK_PCT = {0: 0.10, 1: 0.15, 2: 0.20}
+DEFAULT_RISK_PCT = 0.20
 
 
-def get_tier_notional_mult(tier) -> float:
-    """tier ∈ {0,1,2} / "0"/"1"/"2" → 对应系数；其余 → 1.0。"""
+def get_tier_risk_pct(tier) -> float:
+    """tier ∈ {0,1,2} / "0"/"1"/"2" → 对应本金百分比；其余 → DEFAULT_RISK_PCT。"""
     try:
         t = int(str(tier).strip())
     except (TypeError, ValueError):
-        return 1.0
-    return float(TIER_NOTIONAL_MULT.get(t, 1.0))
+        return DEFAULT_RISK_PCT
+    return float(TIER_RISK_PCT.get(t, DEFAULT_RISK_PCT))
+
+
+# 兼容旧引用：换算成"相对强档(本金×1.0名义)的系数"
+TIER_NOTIONAL_MULT = {t: (p * 5.0) for t, p in TIER_RISK_PCT.items()}  # {0:0.50,1:0.75,2:1.00}
+
+
+def get_tier_notional_mult(tier) -> float:
+    return get_tier_risk_pct(tier) * 5.0
 
 
 class DefenseProfile:
@@ -53,8 +61,8 @@ class DefenseProfile:
         # TP档位限制
         self.place_tp_levels: int = 2  # 只挂TP1+TP2
 
-        # 仓位公式
-        self.risk_pct: float = 0.20       # 本金20%
+        # 仓位公式：本金 × 趋势百分比(见 TIER_RISK_PCT) × 5倍杠杆
+        self.risk_pct: float = 0.20       # 仅作 tier 缺失时的兜底
         self.leverage_multiplier: float = 5.0  # 5倍
 
         # 雷达激活参数
@@ -70,25 +78,23 @@ class DefenseProfile:
 
     def calc_position_size(self, balance: float, entry_price: float, tier=None) -> float:
         """
-        计算仓位。基础名义 = 本金 × risk_pct(0.20) × leverage_multiplier(5.0) = 本金×1.0。
-        再按趋势强弱档位 tier(0/1/2) 乘 TIER_NOTIONAL_MULT 缩放（对齐币安）。
-        tier 缺省/非法 → 系数 1.0（不缩放）。
+        下单名义 = 本金余额 × 趋势强度百分比(tier) × 5倍杠杆。
+          弱 tier0 10% / 中 tier1 15% / 强 tier2 20%（强档 = 本金×1.0 名义）。
+          tier 缺省/非法 → DEFAULT_RISK_PCT(0.20，按强档兜底)。
         """
-        risk_capital = balance * self.risk_pct
-        notional_cap = risk_capital * self.leverage_multiplier
         if entry_price <= 0:
             return 0.0
-        base_qty = notional_cap / entry_price
-        mult = get_tier_notional_mult(tier)
-        qty = base_qty * mult
+        rp = get_tier_risk_pct(tier)
+        notional = balance * rp * self.leverage_multiplier
+        qty = notional / entry_price
         tier_s = str(tier).strip() if tier is not None else ""
         if tier_s in ("0", "1", "2"):
             logger.info(
-                f"[{self.symbol}] 趋势档位仓位 tier={tier_s}({mult}x) "
-                f"名义 {notional_cap * mult:.1f}U  qty={qty:.6f}"
+                f"[{self.symbol}] 趋势档位仓位 tier={tier_s} 本金×{rp:.0%}×5 "
+                f"名义 {notional:.1f}U (占本金 {rp*5:.2f}x)  qty={qty:.6f}"
             )
         elif tier_s:
-            logger.warning(f"[{self.symbol}] tier={tier!r} 无法识别，仓位按强档(1.0x)")
+            logger.warning(f"[{self.symbol}] tier={tier!r} 无法识别，按强档 20%×5")
         return qty
 
     def calc_hard_stop(self, entry_price: float, stop_loss: float) -> float:
