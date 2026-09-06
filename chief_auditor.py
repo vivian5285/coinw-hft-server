@@ -62,8 +62,9 @@ def check_tp_slice_budget(
     place_levels: int = 2,
     ratios: Optional[List[float]] = None,
     tol_ratio: float = 0.03,
+    contract_unit: float = 0.0,
 ) -> AuditItem:
-    """TP1+TP2之和应≈initial×30%"""
+    """TP1+TP2之和应≈initial×30%（CoinW 按整张挂，容差要能吸收 1 张取整）"""
     ratios = list(ratios or [0.10, 0.20, 0.70])
     place_n = max(1, min(2, int(place_levels or 2)))
     initial = _f(initial_qty)
@@ -74,8 +75,12 @@ def check_tp_slice_budget(
     expected = initial * sum(_f(r) for r in ratios[:place_n])
     got = _f(tp1_qty) + _f(tp2_qty)
     drift = abs(got - expected)
-    tol = max(0.001, initial * float(tol_ratio), expected * float(tol_ratio))
-    ok = drift <= tol and got <= initial * 0.35 + 1e-9
+    # CoinW 每档 TP 按整张(contract_unit)挂，10%/20% 取整后单档最多偏 <1 张；
+    # 容差里加一份合约单位，避免"合法取整"被判审计失败进而暂停交易。
+    cu = _f(contract_unit)
+    tol = max(0.001, initial * float(tol_ratio), expected * float(tol_ratio),
+              (cu * 1.05) if cu > 0 else 0.0)
+    ok = drift <= tol and got <= initial * 0.35 + cu + 1e-9
 
     return AuditItem(
         "tp_slice",
@@ -142,6 +147,7 @@ def audit_open_bundle(facts: Dict[str, Any]) -> AuditResult:
         _f(facts.get("tp2_qty")),
         place_levels=int(facts.get("place_levels") or 2),
         ratios=facts.get("ratios"),
+        contract_unit=_f(facts.get("contract_unit")),
     ))
 
     # 6) 硬止损

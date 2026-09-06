@@ -121,13 +121,18 @@ class WebhookParser:
 
         # HEARTBEAT：宽松解析，缺字段不拒；side/entry/tp/sl 供心跳催单核对
         if action == "HEARTBEAT":
+            _has_side_key = ("side" in raw) or ("direction" in raw)
             side = str(raw.get("side") or raw.get("direction") or "").upper()
             if side in ("LONG", "BUY"):
                 side = "LONG"
             elif side in ("SHORT", "SELL"):
                 side = "SHORT"
-            elif side in ("FLAT", "NONE", "", "IDLE"):
+            elif side in ("FLAT", "NONE", "IDLE"):
                 side = "FLAT"
+            elif side == "" and _has_side_key:
+                side = "FLAT"          # 显式发了空 side = 明确"TV 空仓"
+            else:
+                side = "UNKNOWN"       # 心跳没带 side -> 不当作 TV 空仓，只做存活/裸单核对
             def _f(k):
                 try:
                     return float(raw.get(k) or 0)

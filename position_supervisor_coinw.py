@@ -432,6 +432,19 @@ class PositionSupervisorCoinW:
                 pos = self.client.get_position(self.symbol, prefer_ws=False, force_rest=True)
                 live = self._live_side(pos)
 
+            # 心跳没带 side（TV 心跳没配持仓意图）：只做存活/裸单核对，不当 TV 空仓处理
+            if hb_side == "UNKNOWN":
+                if have != 0 and NAKED_GUARD_ENABLED and not self.radar.get_state().activated \
+                        and not self._hard_sl_present():
+                    sl = float(self.pipeline.data.get("hard_sl_px") or 0)
+                    pid = self.pipeline.data.get("position_id")
+                    if sl > 0 and pid:
+                        self.client.set_sl_tp(position_id=pid, instrument=self.symbol,
+                                              stop_loss_price=round(sl, 2))
+                        logger.warning(f"心跳(无side)裸单守护：补挂硬止损 @{sl}")
+                        return {"ok": True, "status": "heartbeat", "action": "reattach_sl", "sl": sl}
+                return {"ok": True, "status": "heartbeat", "state": "no_side"}
+
             # 两边都空
             if hb_side == "FLAT" and have == 0:
                 return {"ok": True, "status": "heartbeat", "state": "both_flat"}
@@ -1367,6 +1380,7 @@ class PositionSupervisorCoinW:
             "hard_sl_px": self.pipeline.data.get("hard_sl_px", 0),
             "hard_sl_live": True,
             "tier": signal.tier,
+            "contract_unit": 0.01,  # CoinW ETH 1张=0.01 ETH，供 TP 切片审计吸收整张取整
         }
 
         result = audit_open_bundle(facts)
