@@ -1470,13 +1470,27 @@ class PositionSupervisorCoinW:
         self.radar.reset()
         if atr > 0:
             self.radar.set_atr(atr)
-        self.radar.arm(tp1_price=tp1_px, tp2_price=(tp2_px or entry), direction=side)
+        # 交易所没有 TP 记录（小仓位 TP1/TP2 被跳过）时，用 ATR 倍数估出 TP1/TP2，
+        # 让恢复后的激活时机跟全新开仓一致（等到 (TP1+TP2)/2 中点），而不是一
+        # 恢复就按 entry 立刻激活。
+        _bp = None
+        try:
+            from breath_profiles import get_breath_profile
+            _bp = get_breath_profile(self.symbol)
+        except Exception:
+            _bp = {}
+        _t1a = float((_bp or {}).get("tp1_atr") or 1.35)
+        _t2a = float((_bp or {}).get("tp2_atr") or 2.5)
+        _sgn = 1 if side == "LONG" else -1
+        tp1_est = tp1_px or (entry + _sgn * _t1a * atr if atr > 0 else 0.0)
+        tp2_est = tp2_px or (entry + _sgn * _t2a * atr if atr > 0 else 0.0)
+        self.radar.arm(tp1_price=tp1_est, tp2_price=(tp2_est or entry), direction=side)
         px = float(self._get_current_price() or entry)
-        gate = ((tp1_px + tp2_px) / 2.0) if (tp1_px and tp2_px) else (tp2_px or entry)
+        gate = ((tp1_est + tp2_est) / 2.0) if (tp1_est and tp2_est) else (tp2_est or entry)
         if atr > 0 and gate > 0 and (
             (side == "LONG" and px >= gate) or (side == "SHORT" and px <= gate)
         ):
-            self.radar.mark_activated(entry_price=entry, tp2_price=(tp2_px or entry), direction=side)
+            self.radar.mark_activated(entry_price=entry, tp2_price=(tp2_est or entry), direction=side)
         # 无论是否激活，都把雷达止损锚到交易所现有硬止损（只进不退守卫在 update 里）
         if hard_sl > 0:
             self.radar.seed_stop(hard_sl)
