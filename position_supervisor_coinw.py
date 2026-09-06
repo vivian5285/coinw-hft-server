@@ -939,7 +939,6 @@ class PositionSupervisorCoinW:
     def _monitor_loop(self):
         """监控循环"""
         import breath_profiles
-        from smart_reentry_engine import should_reenter
 
         while self._monitoring:
             try:
