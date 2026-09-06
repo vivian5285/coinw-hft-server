@@ -1505,8 +1505,10 @@ class PositionSupervisorCoinW:
         if hard_sl > 0:
             self.radar.seed_stop(hard_sl)
 
+        # IDLE -> MONITORING 是跳阶段，正常 advance 会被 can_advance 拒；恢复路径 force 跳过
         try:
-            self.pipeline.advance(Phase.MONITORING, Role.RADAR, note="启动恢复-重建监控")
+            self.pipeline.advance(Phase.MONITORING, Role.RADAR,
+                                  note="启动恢复-重建监控", force=True)
         except Exception:
             pass
         self._start_monitoring()
