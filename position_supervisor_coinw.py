@@ -1010,6 +1010,16 @@ class PositionSupervisorCoinW:
                     except Exception as _e:
                         logger.debug(f"反转锁利异常: {_e}")
 
+                # 每 ~60s 打一条监控存活/状态日志（冒烟/复盘可见）
+                if self._naked_tick % 15 == 0:
+                    _rs = self.radar.get_state()
+                    _e = float(self.pipeline.data.get("entry") or 0)
+                    _pnl = ((current_price - _e) if str(self.pipeline.data.get("side") or "").upper() == "LONG"
+                            else (_e - current_price)) if _e else 0.0
+                    logger.info(f"[监控] ETH px={current_price} 浮盈={_pnl:+.2f} "
+                                f"雷达={'激活' if _rs.activated else '待命'} SL={_rs.current_sl or self.pipeline.data.get('hard_sl_px')} "
+                                f"step={_rs.step_count} phase={_rs.phase}")
+
                 # 等待
                 time.sleep(4)  # 雷达间隔
 
@@ -1495,6 +1505,10 @@ class PositionSupervisorCoinW:
         if hard_sl > 0:
             self.radar.seed_stop(hard_sl)
 
+        try:
+            self.pipeline.advance(Phase.MONITORING, Role.RADAR, note="启动恢复-重建监控")
+        except Exception:
+            pass
         self._start_monitoring()
         self._catchup_blocked_until = 0.0
         self._safe_alert(f"启动恢复：{side} {amt}@{entry} 已重建监控 "
