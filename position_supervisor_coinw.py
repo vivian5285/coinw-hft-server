@@ -44,6 +44,10 @@ ENTRY_MARKETABLE_SEC = float(os.getenv("ENTRY_MARKETABLE_SEC", "45"))  # 阶段2
 ENTRY_SLIP_CAP_PCT = float(os.getenv("ENTRY_SLIP_CAP_PCT", "0.0012"))  # 阶段2 最多相对 TV 价让 0.12%
 ENTRY_ABORT_PCT = float(os.getenv("ENTRY_ABORT_PCT", "0.004"))        # 现价比 TV 价逆向跑超 0.4% -> 放弃信号
 ENTRY_POLL_SEC = float(os.getenv("ENTRY_POLL_SEC", "3"))
+# 强趋势(tier=2)立即进入：跳过①被动限价（单边突破里等回踩=纯负收益，对齐币安
+# _try_better_than_tv_limit_entry 的 tier>=2 跳过），直接可成交限价(短窗)+市价。
+ENTRY_STRONG_IMMEDIATE = os.getenv("ENTRY_STRONG_IMMEDIATE", "1").lower() in ("1", "true", "yes")
+ENTRY_STRONG_MARKETABLE_SEC = float(os.getenv("ENTRY_STRONG_MARKETABLE_SEC", "8"))
 
 # ==================== 心跳催单 / 启动恢复 / 裸单守护 ====================
 HEARTBEAT_CATCHUP_ENABLED = os.getenv("HEARTBEAT_CATCHUP", "1").lower() in ("1", "true", "yes")
@@ -669,13 +673,15 @@ class PositionSupervisorCoinW:
                 return "abort", have
         return "timeout", self._pos_qty()
 
-    def _open_with_ladder(self, action: str, tv_price: float, qty: float) -> dict:
+    def _open_with_ladder(self, action: str, tv_price: float, qty: float,
+                          tier: str = None) -> dict:
         """
         TV 信号进场：被动限价(TV价, maker) -> 可成交限价(让利≤滑点上限) -> 市价兜底。
-        现价逆向跑过 ENTRY_ABORT_PCT 则撤单放弃这次信号。
-        返回 {ok, via, error, aborted}。
+        强趋势 tier=2：跳过①被动限价，直接②可成交限价(短窗)+③市价 —— 立即进入。
+        现价逆向跑过 ENTRY_ABORT_PCT 则撤单放弃这次信号。返回 {ok, via, error, aborted}。
         """
         side_u = str(action).upper()
+        strong = ENTRY_STRONG_IMMEDIATE and str(tier or "").strip() == "2"
         if not ENTRY_LADDER_ENABLED:
             r = self.client.place_market_order(side=action, quantity=qty, instrument=self.symbol)
             if r and r.get("code") == 0:
@@ -689,35 +695,39 @@ class PositionSupervisorCoinW:
 
         t0 = time.time()
         tvp = float(tv_price)
-
-        # 阶段1：TV 价被动限价（做 maker，对我们最有利，绝不劣于 TV 价）
-        px1 = round(tvp, 2)
-        logger.info(f"[开仓阶梯] ①被动限价 {side_u} {qty} @{px1} (TV价 · {ENTRY_PASSIVE_SEC:.0f}s)")
-        o1 = self.client.place_limit_order(side=action, quantity=qty, price=px1,
-                                           instrument=self.symbol, reduce_only=False)
         remaining = float(qty)
-        if o1 and (o1.get("code") == 0 or o1.get("id")):
-            st, have = self._wait_fill(action, tvp, t0 + ENTRY_PASSIVE_SEC, qty)
-            remaining = max(0.0, float(qty) - have)
-            if st == "filled":
-                logger.info("[开仓阶梯] ①成交(被动限价, 0 滑点)")
-                return {"ok": True, "via": "passive_limit"}
-            if st == "abort":
-                self._cancel_open_limits()
-                return {"ok": False, "via": "passive_limit", "aborted": True,
-                        "error": f"信号逆向跑过 {ENTRY_ABORT_PCT:.2%}，放弃进场"}
-        self._cancel_open_limits()
 
-        # 阶段2：让利到滑点上限的可成交限价
+        # 阶段1：TV 价被动限价（做 maker，绝不劣于 TV 价）—— 强趋势档跳过
+        if strong:
+            logger.info(f"[开仓阶梯] 强趋势档 tier=2 → 跳过①被动限价，立即可成交限价+市价")
+        else:
+            px1 = round(tvp, 2)
+            logger.info(f"[开仓阶梯] ①被动限价 {side_u} {qty} @{px1} (TV价 · {ENTRY_PASSIVE_SEC:.0f}s)")
+            o1 = self.client.place_limit_order(side=action, quantity=qty, price=px1,
+                                               instrument=self.symbol, reduce_only=False)
+            if o1 and (o1.get("code") == 0 or o1.get("id")):
+                st, have = self._wait_fill(action, tvp, t0 + ENTRY_PASSIVE_SEC, qty)
+                remaining = max(0.0, float(qty) - have)
+                if st == "filled":
+                    logger.info("[开仓阶梯] ①成交(被动限价, 0 滑点)")
+                    return {"ok": True, "via": "passive_limit"}
+                if st == "abort":
+                    self._cancel_open_limits()
+                    return {"ok": False, "via": "passive_limit", "aborted": True,
+                            "error": f"信号逆向跑过 {ENTRY_ABORT_PCT:.2%}，放弃进场"}
+            self._cancel_open_limits()
+
+        # 阶段2：让利到滑点上限的可成交限价（强趋势档用短窗）
+        mk_deadline = (t0 + ENTRY_STRONG_MARKETABLE_SEC) if strong else (t0 + ENTRY_MARKETABLE_SEC)
         if remaining >= self._MIN_ORDER_ETH:
             px2 = round(tvp * (1.0 + ENTRY_SLIP_CAP_PCT), 2) if side_u == "LONG" \
                 else round(tvp * (1.0 - ENTRY_SLIP_CAP_PCT), 2)
             logger.info(f"[开仓阶梯] ②可成交限价 {side_u} {remaining:.6f} @{px2} "
-                        f"(让利≤{ENTRY_SLIP_CAP_PCT:.2%} · 到{ENTRY_MARKETABLE_SEC:.0f}s)")
+                        f"(让利≤{ENTRY_SLIP_CAP_PCT:.2%} · 到{mk_deadline - t0:.0f}s)")
             o2 = self.client.place_limit_order(side=action, quantity=remaining, price=px2,
                                                instrument=self.symbol, reduce_only=False)
             if o2 and (o2.get("code") == 0 or o2.get("id")):
-                st, have = self._wait_fill(action, tvp, t0 + ENTRY_MARKETABLE_SEC, qty)
+                st, have = self._wait_fill(action, tvp, mk_deadline, qty)
                 remaining = max(0.0, float(qty) - have)
                 if st == "filled":
                     logger.info("[开仓阶梯] ②成交(可成交限价, 滑点已封顶)")
@@ -752,7 +762,7 @@ class PositionSupervisorCoinW:
             current_price = self._get_current_price()
 
             # 进场滑点阶梯：被动限价 -> 可成交限价 -> 市价兜底
-            led = self._open_with_ladder(action, price, qty)
+            led = self._open_with_ladder(action, price, qty, tier=getattr(signal, "tier", None))
             if not led.get("ok"):
                 logger.error(f"开仓未成交: {led.get('error')} (via={led.get('via')})")
                 return {"ok": False, "error": led.get("error", "开仓未成交"),
