@@ -126,8 +126,21 @@ class WebhookParser:
 
         # HEARTBEAT：宽松解析，缺字段不拒；side/entry/tp/sl 供心跳催单核对
         if action == "HEARTBEAT":
-            _has_side_key = ("side" in raw) or ("direction" in raw)
-            side = str(raw.get("side") or raw.get("direction") or "").upper()
+            # 2026-09-12修复：此前只认 side/price/stop_loss/tp1/tp2/tp3，
+            # 跟币安 eth-webhook-server 的 webhook_parser.py 不一致——币安
+            # 那边心跳字段是 tv_side/tv_entry/tv_stop/tv_tp1/tv_tp2/tv_tp3，
+            # 且 tp_i / tv_tp_i 互为别名。宝贝新策略"Webhook 对齐版 + tier
+            # 动态分档"（新测试策略源码.txt）心跳payload用的正是tv_前缀这套
+            # （跟币安一致，不是CoinW这边原来认的裸字段名）——冒烟测试实测
+            # 过：不加这个别名，心跳side解析结果是"UNKNOWN"，entry/stop/tp
+            # 全部读成0，TV心跳追回/对账功能对这个新策略完全失效。现在两套
+            # 字段名都认，跟币安对齐。
+            _has_side_key = (
+                ("side" in raw) or ("direction" in raw) or ("tv_side" in raw)
+            )
+            side = str(
+                raw.get("side") or raw.get("direction") or raw.get("tv_side") or ""
+            ).upper()
             if side in ("LONG", "BUY"):
                 side = "LONG"
             elif side in ("SHORT", "SELL"):
@@ -138,9 +151,12 @@ class WebhookParser:
                 side = "FLAT"          # 显式发了空 side = 明确"TV 空仓"
             else:
                 side = "UNKNOWN"       # 心跳没带 side -> 不当作 TV 空仓，只做存活/裸单核对
-            def _f(k):
+            def _f(k, alt=None):
                 try:
-                    return float(raw.get(k) or 0)
+                    v = raw.get(k)
+                    if v is None and alt:
+                        v = raw.get(alt)
+                    return float(v or 0)
                 except (TypeError, ValueError):
                     return 0.0
             # 同款 tier=0 falsy 修复见下方"9) Tier"注释
@@ -153,8 +169,9 @@ class WebhookParser:
             return ParsedSignal(
                 valid=True, action=action,
                 symbol=self._normalize_symbol(raw.get("symbol", "ETH")),
-                price=_f("price"), stop_loss=_f("stop_loss"), atr=_f("atr"),
-                tp1=_f("tp1"), tp2=_f("tp2"), tp3=_f("tp3"),
+                price=_f("price", "tv_entry"), stop_loss=_f("stop_loss", "tv_stop"),
+                atr=_f("atr"),
+                tp1=_f("tp1", "tv_tp1"), tp2=_f("tp2", "tv_tp2"), tp3=_f("tp3", "tv_tp3"),
                 qty=None, tier=tier_hb, leverage=20, error="",
                 side=side, raw=dict(raw),
             )
