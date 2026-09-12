@@ -143,7 +143,11 @@ class WebhookParser:
                     return float(raw.get(k) or 0)
                 except (TypeError, ValueError):
                     return 0.0
-            tier_hb = str(raw.get("tier") or raw.get("adx_tier") or "").lower()
+            # 同款 tier=0 falsy 修复见下方"9) Tier"注释
+            _tier_hb_raw = raw.get("tier")
+            if _tier_hb_raw is None:
+                _tier_hb_raw = raw.get("adx_tier")
+            tier_hb = str(_tier_hb_raw if _tier_hb_raw is not None else "").lower()
             tier_hb = {"0": "0", "弱": "0", "weak": "0", "1": "1", "中": "1",
                        "medium": "1", "2": "2", "强": "2", "strong": "2"}.get(tier_hb, "")
             return ParsedSignal(
@@ -224,7 +228,17 @@ class WebhookParser:
                 pass
 
         # 9) Tier（趋势档位）
-        tier = str(raw.get("tier") or raw.get("adx_tier") or "").lower()
+        # 2026-09-12修复：`or` 链在 tier 是 JSON 整数 0 时会被当 falsy 跳过
+        # （新策略"Webhook 对齐版 + tier 动态分档"发的是裸数字 "tier":0，
+        # 不是老信号常见的字符串"0"），此前会一路落到 else 分支变成空串
+        # ""，get_tier_risk_pct(defense_profiles.py) 对空串按强档
+        # (DEFAULT_RISK_PCT=0.40) 兜底——等于把弱信号仓位悄悄放大到本该
+        # 强信号才有的2倍名义，静默超配。改用 is not None 判定，不再用
+        # 真值判定。
+        _tier_raw = raw.get("tier")
+        if _tier_raw is None:
+            _tier_raw = raw.get("adx_tier")
+        tier = str(_tier_raw if _tier_raw is not None else "").lower()
         if tier in ("0", "弱", "weak"):
             tier = "0"
         elif tier in ("1", "中", "medium"):
