@@ -71,6 +71,27 @@ REENTRY_ADX_GATE = float(os.getenv("REENTRY_ADX_GATE", "20"))
 REENTRY_MAX_CHASE_PCT = float(os.getenv("REENTRY_MAX_CHASE_PCT", "0.006"))
 REENTRY_HARD_SL_ATR = float(os.getenv("REENTRY_HARD_SL_ATR", "2.0"))
 
+# ==================== TV方向+双均线趋势自主重入(2026-09-13新增) ====================
+# 宝贝拍板：VPS空仓、TV心跳最后一个非空方向仍然满足"现价站在这个方向的
+# 双均线(15/30)之上/之下"(跟TV策略源码自己的开平仓定义完全一致)，就
+# 认为趋势还在，允许VPS自己衡量重入——用综合硬止损+ATR估算TP123自己
+# 管理这笔仓位，直到TV发出全新真实开仓信号为止(TV判方向为主，VPS是
+# 执行层+半辅助)。这跟上面已有的"止损后小区间智能再入"(_start_reentry_
+# watcher，只在VPS自己刚被止损出局、价格没跑远时生效)是两套独立机制，
+# 互不冲突：这套只在"两边都空"且TV最后方向有据可查时触发。
+TREND_REENTRY_ENABLED = os.getenv("TREND_REENTRY_ENABLED", "1").lower() in ("1", "true", "yes")
+TREND_REENTRY_FAST_LEN = int(os.getenv("TREND_REENTRY_FAST_LEN", "15"))
+TREND_REENTRY_SLOW_LEN = int(os.getenv("TREND_REENTRY_SLOW_LEN", "30"))
+TREND_REENTRY_MA_TYPE = os.getenv("TREND_REENTRY_MA_TYPE", "SMA")
+TREND_REENTRY_KLINE_INTERVAL_MIN = int(os.getenv("TREND_REENTRY_KLINE_INTERVAL_MIN", "30"))
+TREND_REENTRY_KLINE_LIMIT = int(os.getenv("TREND_REENTRY_KLINE_LIMIT", "80"))
+# 每次尝试(不管成功/趋势不确认)之间至少间隔这么久，避免现价刚好贴在均线
+# 附近来回穿越时每次心跳都触发一轮开/查
+TREND_REENTRY_COOLDOWN_SEC = float(os.getenv("TREND_REENTRY_COOLDOWN_SEC", "300"))
+TREND_REENTRY_TP1_ATR = float(os.getenv("TREND_REENTRY_TP1_ATR", "1.35"))
+TREND_REENTRY_TP2_ATR = float(os.getenv("TREND_REENTRY_TP2_ATR", "2.5"))
+TREND_REENTRY_SIZE_FACTOR = float(os.getenv("TREND_REENTRY_SIZE_FACTOR", "0.6"))
+
 # ==================== 高潮否决 / 反转锁利 ====================
 CLIMAX_VETO_ENABLED = os.getenv("CLIMAX_VETO", "1").lower() in ("1", "true", "yes")
 CLIMAX_ATR_MULT = float(os.getenv("CLIMAX_ATR_MULT", "3.0"))
@@ -145,6 +166,9 @@ class PositionSupervisorCoinW:
         self._chase_watch = {}            # 追单确认观察窗: {side,first_ts,count,last_ts}
         self._chase_confirmed = False     # 人工 /admin/confirm_catchup 强制放行
         self._loop_beat = 0.0            # 监控循环心跳（watchdog 用）
+        self._last_nonflat_hb_side = ""    # TV心跳最后一个非FLAT方向（重启清零，等下次心跳重新填）
+        self._last_nonflat_hb_entry = 0.0
+        self._trend_reentry_next_try_ts = 0.0  # 冷却：同方向下次允许再评估的时间
 
         # 初始化模块
         self._init_modules()
@@ -456,6 +480,16 @@ class PositionSupervisorCoinW:
         except (TypeError, ValueError):
             hb_entry = 0.0
 
+        # 2026-09-13新增：记住TV心跳最后一个非FLAT方向——心跳一旦变成
+        # FLAT，hb_side这个局部变量就再也看不出"之前是哪个方向"了，供
+        # 下面"两边都空"分支里的自主重入机制用(TV最后方向未变+趋势仍在
+        # 才允许重入，不是每次心跳都乱猜)。只在真的是LONG/SHORT时更新，
+        # FLAT/UNKNOWN都不覆盖，保留"上一次真实方向"的记忆。
+        if hb_side in ("LONG", "SHORT"):
+            self._last_nonflat_hb_side = hb_side
+            if hb_entry > 0:
+                self._last_nonflat_hb_entry = hb_entry
+
         with self._lock:
             have = self._pos_qty()
             pos = None
@@ -477,8 +511,12 @@ class PositionSupervisorCoinW:
                         return {"ok": True, "status": "heartbeat", "action": "reattach_sl", "sl": sl}
                 return {"ok": True, "status": "heartbeat", "state": "no_side"}
 
-            # 两边都空
+            # 两边都空——TV最后方向如果还站得住(双均线趋势确认)，交给
+            # 自主重入机制评估要不要自己开仓(见_maybe_trend_reentry)
             if hb_side == "FLAT" and have == 0:
+                trend_result = self._maybe_trend_reentry()
+                if trend_result is not None:
+                    return trend_result
                 return {"ok": True, "status": "heartbeat", "state": "both_flat"}
 
             # TV 空、VPS 有仓：TV 平了我们漏了
@@ -1364,6 +1402,120 @@ class PositionSupervisorCoinW:
                              f"(仓位×{REENTRY_SIZE_FACTOR})")
         else:
             logger.warning(f"再入开仓失败: {res.get('error')}")
+
+    # ==================== TV方向+双均线趋势自主重入 ====================
+
+    def _maybe_trend_reentry(self) -> Optional[dict]:
+        """
+        2026-09-13新增(宝贝拍板)：只在VPS空仓、TV心跳当前也是FLAT时被
+        调用(见_handle_heartbeat"两边都空"分支)。TV最后一个非FLAT方向
+        (self._last_nonflat_hb_side)如果仍然满足双均线趋势确认(定义
+        跟TV策略源码自己的开平仓逻辑完全一致——多头close>MA15 and
+        close>MA30，空头反过来)，就自主开仓——用综合硬止损+ATR估算
+        TP123自己管理这笔仓位，直到TV发出全新真实开仓信号为止(那条
+        路径走_handle_open的is_reentry=False分支，自动接管权威)。
+
+        跟本类既有的"止损后小区间智能再入"(_start_reentry_watcher，只
+        在VPS自己刚被止损、价格没跑远时生效)是两套独立机制：那套要求
+        "现价已收复原entry"，这套完全不要求，只看"TV最后方向+当前趋势"
+        ——TV是主方向判断，VPS是执行层+半辅助，允许VPS在更大范围内
+        自己做主，仓位缩小(TREND_REENTRY_SIZE_FACTOR)对冲这份自主性
+        带来的额外风险。
+
+        返回None表示"这次没有可评估的东西"，调用方按原有"both_flat"
+        逻辑处理；返回dict表示已经处理过，直接作为心跳响应返回。
+        """
+        if not TREND_REENTRY_ENABLED:
+            return None
+        side = str(self._last_nonflat_hb_side or "").upper()
+        if side not in ("LONG", "SHORT"):
+            return None  # 从没见过TV给过方向，没什么好评估的
+
+        now = time.time()
+        if now < self._catchup_blocked_until:
+            # 人工/手动平仓后的冻结窗口——跟既有心跳催单共用同一个开关，
+            # 宝贝刚手动干预过，这段时间内不该被这套机制自作主张重开
+            return {"ok": True, "status": "heartbeat", "state": "trend_reentry_blocked"}
+        if now < self._trend_reentry_next_try_ts:
+            return {"ok": True, "status": "heartbeat", "state": "trend_reentry_cooldown", "side": side}
+
+        self._trend_reentry_next_try_ts = now + TREND_REENTRY_COOLDOWN_SEC
+
+        try:
+            bars = self.client.get_klines(
+                self.symbol, TREND_REENTRY_KLINE_INTERVAL_MIN, TREND_REENTRY_KLINE_LIMIT,
+            )
+        except Exception as e:
+            logger.debug(f"自主重入拉K线失败: {e}")
+            return {"ok": True, "status": "heartbeat", "state": "trend_reentry_kline_failed"}
+
+        from dual_ma_trend import dual_ma_trend_ok
+        ok, meta = dual_ma_trend_ok(
+            side, bars, fast_len=TREND_REENTRY_FAST_LEN, slow_len=TREND_REENTRY_SLOW_LEN,
+            ma_type=TREND_REENTRY_MA_TYPE,
+        )
+        if not ok:
+            logger.debug(f"自主重入：趋势未确认 {side} {meta}")
+            return {"ok": True, "status": "heartbeat", "state": "trend_not_confirmed",
+                    "side": side, "meta": meta}
+
+        px = float(self._get_current_price() or 0)
+        if px <= 0:
+            return {"ok": True, "status": "heartbeat", "state": "trend_reentry_no_price"}
+
+        from atr_scenario import calc_smart_hard_stop_price
+        hard_sl, sl_meta, sl_ok, sl_err = calc_smart_hard_stop_price(
+            side=side, entry_price=px, klines=bars, tier=None,
+        )
+        atr = float(sl_meta.get("atr") or 0) if sl_ok else self._recompute_atr_150m()
+        if atr <= 0:
+            logger.warning("自主重入放弃：ATR不可用")
+            return {"ok": True, "status": "heartbeat", "state": "trend_reentry_no_atr"}
+        if not sl_ok:
+            # 综合硬止损算不出来(K线不够/摆动点异常)时退回ATR倍数应急止损，
+            # 跟_do_reentry既有的ATR应急止损同一套安全网，不整体放弃这次
+            # 重入——VPS自主开仓这条路径尤其不能因为一次算不出智能止损
+            # 就裸奔或者干脆放弃，安全网要比TV正常开仓路径更保守。
+            hard_sl = (
+                px - REENTRY_HARD_SL_ATR * atr if side == "LONG"
+                else px + REENTRY_HARD_SL_ATR * atr
+            )
+            logger.warning(f"自主重入：综合硬止损失败({sl_err})，回退ATR应急止损 @{hard_sl:.2f}")
+
+        tp1 = px + TREND_REENTRY_TP1_ATR * atr if side == "LONG" else px - TREND_REENTRY_TP1_ATR * atr
+        tp2 = px + TREND_REENTRY_TP2_ATR * atr if side == "LONG" else px - TREND_REENTRY_TP2_ATR * atr
+
+        from webhook_parser import ParsedSignal
+        sig = ParsedSignal(
+            valid=True, action=side, symbol=self.symbol, price=px,
+            stop_loss=round(float(hard_sl), 2), atr=round(atr, 4),
+            tp1=round(tp1, 2), tp2=round(tp2, 2), tp3=0.0,
+            qty=None, tier="", leverage=20, error="",
+            side=side, raw={"_trend_reentry": True},
+        )
+        old_factor = self._reentry_size_factor
+        self._reentry_size_factor = TREND_REENTRY_SIZE_FACTOR
+        try:
+            res = self._handle_open(sig, is_reentry=True)
+        finally:
+            self._reentry_size_factor = old_factor
+
+        if res.get("ok"):
+            self._safe_alert(
+                f"TV方向+双均线自主重入：{side} @{px} "
+                f"(综合硬止损@{hard_sl:.2f}{'' if sl_ok else '·ATR兜底'}，"
+                f"TV上次方向entry≈{self._last_nonflat_hb_entry or '-'})"
+            )
+            logger.warning(
+                f"自主重入成功：{side} @{px} sl={hard_sl:.2f} tp1={tp1:.2f} tp2={tp2:.2f}"
+            )
+        else:
+            logger.warning(f"自主重入开仓失败: {res.get('error')}")
+
+        res_out = dict(res)
+        res_out.setdefault("status", "heartbeat")
+        res_out["trend_reentry"] = True
+        return res_out
 
     # ==================== 清仓 ====================
 
