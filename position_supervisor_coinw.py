@@ -1072,7 +1072,7 @@ class PositionSupervisorCoinW:
                     _e = float(self.pipeline.data.get("entry") or 0)
                     _pnl = ((current_price - _e) if str(self.pipeline.data.get("side") or "").upper() == "LONG"
                             else (_e - current_price)) if _e else 0.0
-                    logger.info(f"[监控] ETH px={current_price} 浮盈={_pnl:+.2f} "
+                    logger.info(f"[监控] {self.symbol} px={current_price} 浮盈={_pnl:+.2f} "
                                 f"雷达={'激活' if _rs.activated else '待命'} SL={_rs.current_sl or self.pipeline.data.get('hard_sl_px')} "
                                 f"step={_rs.step_count} phase={_rs.phase}")
 
