@@ -1554,7 +1554,30 @@ class PositionSupervisorCoinW:
         self.radar.arm(tp1_price=tp1_est, tp2_price=(tp2_est or entry), direction=side)
         px = float(self._get_current_price() or entry)
         gate = ((tp1_est + tp2_est) / 2.0) if (tp1_est and tp2_est) else (tp2_est or entry)
-        if atr > 0 and gate > 0 and (
+        # 2026-09-13修复(BNB实盘复现)：原来只靠"现价有没有过激活线(用tp1_est/
+        # tp2_est现算的gate)"这一条判断"重启前雷达是不是已经激活过"——雷达真的
+        # 已经激活过、把交易所止损从开仓时的hard_sl移到了盈利区间(比如
+        # 738.06→733.87)，但重启这一刻价格恰好又回落到gate以下一点点(或者
+        # tp1_est/tp2_est用ATR估算跟当初真实激活时用的TP1/TP2对不上)，这条
+        # 判断就会误判"还没激活"，把已经进入trail/dynamic阶段的雷达打回
+        # activated=False——而update()一开头就是"if not st.activated: return
+        # None"，之后雷达再也不会推进，止损永远锁死在733.87不会再收紧，
+        # 白白丢失"趋势强度系数不断锁住利润"这个雷达最核心的能力。
+        # 交易所现有止损本身就是最权威的"有没有激活过"证据：全新开仓的硬
+        # 止损必然在亏损方向(多头entry上方/空头entry下方)，只要止损已经
+        # 越过entry进到盈利方向，就百分百证明雷达之前真的动过手——不需要
+        # 再靠现价对gate的瞬时快照去猜，直接信这个更可靠的信号。
+        already_moved_into_profit = hard_sl > 0 and (
+            (side == "LONG" and hard_sl > entry)
+            or (side == "SHORT" and hard_sl < entry)
+        )
+        if already_moved_into_profit:
+            self.radar.mark_activated(entry_price=entry, tp2_price=(tp2_est or entry), direction=side)
+            logger.warning(
+                f"启动恢复：交易所止损{hard_sl}已在盈利方向(entry={entry})，"
+                f"判定雷达重启前已激活，恢复为已激活状态(而非重新等待现价过gate)"
+            )
+        elif atr > 0 and gate > 0 and (
             (side == "LONG" and px >= gate) or (side == "SHORT" and px <= gate)
         ):
             self.radar.mark_activated(entry_price=entry, tp2_price=(tp2_est or entry), direction=side)
