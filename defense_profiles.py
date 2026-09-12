@@ -17,17 +17,26 @@ from typing import Dict, Tuple
 
 logger = logging.getLogger(__name__)
 
-# 趋势强弱仓位倾斜（2026-09-06 用户第二次上调）。
-# 本金余额 × 趋势强度百分比 × 5倍杠杆 = 下单名义。
+# 趋势强弱仓位倾斜——2026-09-06 曾第二次上调过，**2026-09-12 宝贝拍板改为
+# 固定公式，不再按 tier 缩放仓位**："账户的权重设置为本金余额的20%然后
+# 3倍杠杆下单"。TIER_RISK_PCT/get_tier_risk_pct 这套按档位缩放的旧公式
+# 保留在这里（shadow_contest.py 等仍可能引用常量本身），但 calc_position_
+# size() 已经不再调用它——见下方 FIXED_POSITION_PCT/FIXED_LEVERAGE_MULT。
 #   弱 tier0 : 本金×20%×5 = 本金×1.0 名义（现货一倍）
 #   中 tier1 : 本金×30%×5 = 本金×1.5 名义
 #   强 tier2 : 本金×40%×5 = 本金×2.0 名义（全仓两倍，上限）
 # 未知/缺失 tier → 按最强档（0.40）。
-# 目的之一：把仓位做大，让 TP1(10%)/TP2(20%) 分批止盈按整张(0.01 ETH)取整后
-# 能真正挂上——100U 本金下 中/强档 6/8 张，TP1/TP2 都 ≥1 张；弱档 4 张仍差
-# 一张挂不上 TP1（本金 ≥125U 才够）。
 TIER_RISK_PCT = {0: 0.20, 1: 0.30, 2: 0.40}
 DEFAULT_RISK_PCT = 0.40
+
+# 2026-09-12 新公式（宝贝拍板，替代上面的tier缩放）：
+#   下单名义 = 本金余额 × FIXED_POSITION_PCT × FIXED_LEVERAGE_MULT
+#            = 本金余额 × 20% × 3 = 本金余额 × 0.6 名义（约0.6倍杠杆敞口）
+# 不再按 signal.tier 缩放仓位——tier 只用于硬止损的 K_tier 保护带宽度
+# （见 atr_scenario.py::calc_smart_hard_stop_price），职责拆开：
+#   仓位大小 = 固定公式；止损远近 = 按tier智能判断。
+FIXED_POSITION_PCT = 0.20
+FIXED_LEVERAGE_MULT = 3.0
 
 
 def get_tier_risk_pct(tier) -> float:
@@ -81,23 +90,21 @@ class DefenseProfile:
 
     def calc_position_size(self, balance: float, entry_price: float, tier=None) -> float:
         """
-        下单名义 = 本金余额 × 趋势强度百分比(tier) × 5倍杠杆。
-          弱 tier0 10% / 中 tier1 15% / 强 tier2 20%（强档 = 本金×1.0 名义）。
-          tier 缺省/非法 → DEFAULT_RISK_PCT(0.20，按强档兜底)。
+        2026-09-12起：下单名义 = 本金余额 × 20% × 3倍杠杆，不再按 tier 缩放
+        （宝贝拍板固定公式）。tier 参数仍保留在签名里（调用方/shadow_contest
+        等历史调用点不用改），只用于日志展示，不参与仓位计算——tier 的实际
+        作用转移到硬止损的 K_tier 保护带宽度（见 atr_scenario.py）。
         """
         if entry_price <= 0:
             return 0.0
-        rp = get_tier_risk_pct(tier)
-        notional = balance * rp * self.leverage_multiplier
+        notional = balance * FIXED_POSITION_PCT * FIXED_LEVERAGE_MULT
         qty = notional / entry_price
         tier_s = str(tier).strip() if tier is not None else ""
-        if tier_s in ("0", "1", "2"):
-            logger.info(
-                f"[{self.symbol}] 趋势档位仓位 tier={tier_s} 本金×{rp:.0%}×5 "
-                f"名义 {notional:.1f}U (占本金 {rp*5:.2f}x)  qty={qty:.6f}"
-            )
-        elif tier_s:
-            logger.warning(f"[{self.symbol}] tier={tier!r} 无法识别，按强档 20%×5")
+        logger.info(
+            f"[{self.symbol}] 固定仓位公式 本金×{FIXED_POSITION_PCT:.0%}×"
+            f"{FIXED_LEVERAGE_MULT:.0f} 名义 {notional:.1f}U "
+            f"(tier={tier_s or '—'}，不影响仓位大小)  qty={qty:.6f}"
+        )
         return qty
 
     def calc_hard_stop(self, entry_price: float, stop_loss: float) -> float:

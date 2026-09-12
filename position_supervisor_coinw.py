@@ -832,24 +832,35 @@ class PositionSupervisorCoinW:
 
     def _place_defense_orders(self, signal, entry_result: dict) -> bool:
         """设置三层防线"""
-        from atr_scenario import calc_hard_stop_price
+        from atr_scenario import calc_smart_hard_stop_price, STRUCT_LOOKBACK_BARS, ATR_PERIOD
 
         try:
             position_id = entry_result.get("position_id", "")
             entry_price = entry_result.get("entry_price", 0)
             direction = signal.action
 
-            # 1) 硬止损
-            hard_sl_price, dist, ok, err = calc_hard_stop_price(
-                tv_price=signal.price,
-                tv_stop_loss=signal.stop_loss,
+            # 1) 硬止损——2026-09-12改为"综合硬止损"（宝贝拍板：不理会TV自己
+            # 算的stop_loss，太木讷；VPS自己拉K线判断趋势更智慧）。TV只给
+            # 方向，止损完全由VPS独立算：结构摆动点(fractal pivot) + 分档
+            # ATR保护带，取更保守者。klines用VPS自己拉的30m原生K线（不依赖
+            # TV那边用的图表周期，VPS自主判断，周期choice见atr_scenario.py
+            # 模块docstring）。
+            _need_bars = STRUCT_LOOKBACK_BARS + ATR_PERIOD + 10
+            klines = self.client.get_klines(self.symbol, interval_min=30, limit=_need_bars)
+            hard_sl_price, hard_sl_meta, ok, err = calc_smart_hard_stop_price(
+                side=direction,
                 entry_price=entry_price,
-                direction=direction,
+                klines=klines,
+                tier=signal.tier,
             )
 
             if not ok:
-                logger.error(f"硬止损计算失败: {err}")
+                logger.error(
+                    f"[{self.symbol}] 综合硬止损计算失败: {err} "
+                    f"(klines={len(klines or [])}根)"
+                )
                 return False
+            logger.info(f"[{self.symbol}] 综合硬止损 @{hard_sl_price} | {hard_sl_meta}")
 
             # 设置止损（通过TPSL接口）
             sl_result = self.client.set_sl_tp(
