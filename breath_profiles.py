@@ -17,24 +17,33 @@
 
 2026-09-12 新增 BNB/OPENAI/SNDK/XPD（宝贝要求币赢对齐币安、这4个品种接入
 交易）。方法同 ETH：真实摆动点识别（fractal pivot，±3根确认）+ ATR(14)，
-回调距离/本地ATR 分位。**数据来源与已知局限**：CoinW 公开 klines 接口
-(/v1/perpumPublic/klines) 单次最多回 1500 根、不支持分页翻更早历史（实测
-endTime/before 参数均无效），30m 是能整除150分钟的最细粒度，1500根30m≈
-31天，是目前能拿到的历史上限——比币安那边同品种校准用的60~83天样本明显
-薄（37~50个回调样本 vs 币安的53~173个），统计显著性弱一些，等实盘跑出更长
-历史后应该重新校准一遍加厚样本。**周期假设**：这4个品种在 CoinW 这边的
-TV 报警周期沿用币安同品种的150分钟（BNB/OPENAI/SNDK/XPD 在币安都是150分
-钟，OPENAI/XPD 这点有宝贝给的TV警报截图佐证），宝贝没有明确逐个确认过
-CoinW 侧是否也是150分钟——如果实际不是，需要按正确周期重新拉数重新校准
-（ETH 就因为周期搞错重新校准过，不是不可能发生）。
+回调距离/本地ATR 分位。
+
+**周期（2026-09-12当天二次修正）**：第一版按"沿用币安同品种150分钟"假设
+校准过一次，当天晚些时候宝贝直接给了 CoinW 这边 TV 警报面板截图确认
+真实周期——**BNB=45分钟，XPD=45分钟，SNDK=75分钟，OPENAI=2小时(120分钟)
+——四个品种周期各不相同，也都不是币安那边的150分钟**，第一版数值作废，
+本次按真实周期重新拉K线全部重新校准。CoinW granularity 原生支持
+{1,3,5,15,30,60,120,240,360,480,1440,10080}分钟——OPENAI的120分钟正好
+是原生粒度，直接拉，不用合成；BNB/XPD的45分钟、SNDK的75分钟都不是原生
+粒度，用能整除的最细原生粒度15分钟K线合成（45=15×3，75=15×5）。
+
+**数据量**：CoinW 公开 klines 接口单次最多回1500根、不支持分页翻更早
+历史（实测 endTime/before 参数均无效）——OPENAI用120m原生粒度，1500根
+覆盖约109天（197个回调样本，比第一版31天/50样本厚实很多）；BNB/XPD/SNDK
+用15m合成，1500根15m只能覆盖约15.6天（51~73个回调样本，比币安同品种
+60~83天的样本更薄——这是CoinW数据接口的硬限制，用更细粒度合成换不来更长
+历史，等实盘跑出更长真实历史后应该重新校准一遍加厚样本）。
+
 tp1_atr/tp2_atr/phase_switch_atr/fee_cover_pct/stop_exec_buffer/
 tick_size/entry_score/exit_score 沿用全系统统一默认值（这几项从来都不是
 按品种校准的，币安那边所有品种也是同一套值）。step_trigger_atr≈0.375×
 breath_tp12、step_advance_atr≈0.65×step_trigger_atr 是币安那边SNDK等
 品种验证过的跨品种经验比例；min_mult/max_mult 比例沿用币安同品种自己的
 既有比例（BNB0.72／OPENAI0.8／SNDK0.72／XPD0.79——这是币安该品种自己的
-尾部特征，比统一比例更贴合）。未接 has_staged_exit_gate：不确认CoinW这边
-TV pine脚本是否也有这个机制，跟CoinW-ETH现有档案一样先不设。
+尾部特征，比统一比例更贴合，即便周期不同也是该品种自己的"行情性格"，
+比套统一比例更合理）。未接 has_staged_exit_gate：不确认CoinW这边TV
+pine脚本是否也有这个机制，跟CoinW-ETH现有档案一样先不设。
 """
 from __future__ import annotations
 
@@ -77,57 +86,28 @@ BREATH_ETH: Dict[str, Any] = {
     "exit_score": 2,
 }
 
-# BNB 基线 —— 2026-09-12新增，150分钟周期假设（见上方模块docstring局限说明）。
-# CoinW真实30m K线合成150m，299根覆盖约31天，49个摆动点、37个回调样本。
-# ATR%=1.09%。回调分布：P50=2.68×ATR，P75=3.26×ATR，P90=5.19×ATR。
+# BNB 基线 —— 2026-09-12二次校准：真实TV周期45分钟（宝贝截图确认，第一版
+# 150分钟假设作废）。CoinW真实15m K线合成45m，499根覆盖约15.6天，87个
+# 摆动点、56个回调样本。ATR%=0.44%。回调分布：P50=2.43×ATR，P75=3.20×ATR，
+# P90=4.41×ATR。
 BREATH_BNB: Dict[str, Any] = {
     "name": "BNB",
     "initial_sl_atr": 0.0,
     "fee_cover_pct": 0.0008,
     "stop_exec_buffer": 0.3,
     "early_be_atr": 0.0,
-    "step_trigger_atr": 1.01,   # 0.375×breath_tp12
-    "step_advance_atr": 0.66,   # 0.65×step_trigger
-    "phase_switch_atr": 3.0,
-    "tp1_atr": 1.35,
-    "tp1_floor_atr": 0.0,
-    "tp2_atr": 2.5,
-    "tp2_floor_atr": 0.0,
-    "breath_tp12": 2.68,  # 覆盖实测中位数回调(2.68)
-    "breath_tp23": 3.26,  # 覆盖实测75分位回调(3.26)
-    "phase2_trail_mult": 1.0,
-    "min_mult": 4.0,      # 0.72×max_mult（沿用币安BNB自己的min/max比例）
-    "max_mult": 5.5,      # 覆盖实测90分位回调(5.19)以上
-    "ratio_floor": RATIO_FLOOR,
-    "ratio_ceiling": RATIO_CEILING,
-    "tick_size": 0.01,
-    "entry_score": 3,
-    "exit_score": 2,
-}
-
-# OPENAI 基线 —— 2026-09-12新增，150分钟周期假设（见上方模块docstring局限
-# 说明；这个周期有宝贝给的TV警报截图佐证）。CoinW真实30m K线合成150m，
-# 299根覆盖约31天，58个摆动点、50个回调样本。ATR%=1.90%——盘前品种波动率
-# 偏高，跟币安OPENAI的观察一致。回调分布：P50=2.39×ATR，P75=3.52×ATR，
-# P90=4.51×ATR。
-BREATH_OPENAI: Dict[str, Any] = {
-    "name": "OPENAI",
-    "initial_sl_atr": 0.0,
-    "fee_cover_pct": 0.0008,
-    "stop_exec_buffer": 0.3,
-    "early_be_atr": 0.0,
-    "step_trigger_atr": 0.90,   # 0.375×breath_tp12
+    "step_trigger_atr": 0.91,   # 0.375×breath_tp12
     "step_advance_atr": 0.59,   # 0.65×step_trigger
     "phase_switch_atr": 3.0,
     "tp1_atr": 1.35,
     "tp1_floor_atr": 0.0,
     "tp2_atr": 2.5,
     "tp2_floor_atr": 0.0,
-    "breath_tp12": 2.39,  # 覆盖实测中位数回调(2.39)
-    "breath_tp23": 3.52,  # 覆盖实测75分位回调(3.52)
+    "breath_tp12": 2.43,  # 覆盖实测中位数回调(2.43)
+    "breath_tp23": 3.20,  # 覆盖实测75分位回调(3.20)
     "phase2_trail_mult": 1.0,
-    "min_mult": 3.8,      # 0.8×max_mult（沿用币安OPENAI自己的min/max比例）
-    "max_mult": 4.8,      # 覆盖实测90分位回调(4.51)以上
+    "min_mult": 3.4,      # 0.72×max_mult（沿用币安BNB自己的min/max比例）
+    "max_mult": 4.7,      # 覆盖实测90分位回调(4.41)以上
     "ratio_floor": RATIO_FLOOR,
     "ratio_ceiling": RATIO_CEILING,
     "tick_size": 0.01,
@@ -135,28 +115,58 @@ BREATH_OPENAI: Dict[str, Any] = {
     "exit_score": 2,
 }
 
-# SNDK 基线 —— 2026-09-12新增，150分钟周期假设（见上方模块docstring局限
-# 说明）。CoinW真实30m K线合成150m，299根覆盖约31天，55个摆动点、42个
-# 回调样本。ATR%=1.42%。回调分布：P50=2.75×ATR，P75=3.75×ATR，
-# P90=6.42×ATR。
+# OPENAI 基线 —— 2026-09-12二次校准：真实TV周期2小时/120分钟（宝贝截图
+# 确认，第一版150分钟假设作废）。120分钟正好是CoinW原生K线粒度，不用
+# 合成，1500根覆盖约109天（比第一版31天厚实很多），262个摆动点、197个
+# 回调样本。ATR%=1.43%。回调分布：P50=2.25×ATR，P75=3.59×ATR，
+# P90=5.12×ATR。
+BREATH_OPENAI: Dict[str, Any] = {
+    "name": "OPENAI",
+    "initial_sl_atr": 0.0,
+    "fee_cover_pct": 0.0008,
+    "stop_exec_buffer": 0.3,
+    "early_be_atr": 0.0,
+    "step_trigger_atr": 0.84,   # 0.375×breath_tp12
+    "step_advance_atr": 0.55,   # 0.65×step_trigger
+    "phase_switch_atr": 3.0,
+    "tp1_atr": 1.35,
+    "tp1_floor_atr": 0.0,
+    "tp2_atr": 2.5,
+    "tp2_floor_atr": 0.0,
+    "breath_tp12": 2.25,  # 覆盖实测中位数回调(2.25)
+    "breath_tp23": 3.59,  # 覆盖实测75分位回调(3.59)
+    "phase2_trail_mult": 1.0,
+    "min_mult": 4.3,      # 0.8×max_mult（沿用币安OPENAI自己的min/max比例）
+    "max_mult": 5.4,      # 覆盖实测90分位回调(5.12)以上
+    "ratio_floor": RATIO_FLOOR,
+    "ratio_ceiling": RATIO_CEILING,
+    "tick_size": 0.01,
+    "entry_score": 3,
+    "exit_score": 2,
+}
+
+# SNDK 基线 —— 2026-09-12二次校准：真实TV周期75分钟（宝贝截图确认，第
+# 一版150分钟假设作废）。CoinW真实15m K线合成75m，299根覆盖约15.5天，
+# 62个摆动点、51个回调样本。ATR%=0.63%。回调分布：P50=2.42×ATR，
+# P75=4.09×ATR，P90=6.44×ATR。
 BREATH_SNDK: Dict[str, Any] = {
     "name": "SNDK",
     "initial_sl_atr": 0.0,
     "fee_cover_pct": 0.0008,
     "stop_exec_buffer": 0.3,
     "early_be_atr": 0.0,
-    "step_trigger_atr": 1.03,   # 0.375×breath_tp12
-    "step_advance_atr": 0.67,   # 0.65×step_trigger
+    "step_trigger_atr": 0.91,   # 0.375×breath_tp12
+    "step_advance_atr": 0.59,   # 0.65×step_trigger
     "phase_switch_atr": 3.0,
     "tp1_atr": 1.35,
     "tp1_floor_atr": 0.0,
     "tp2_atr": 2.5,
     "tp2_floor_atr": 0.0,
-    "breath_tp12": 2.75,  # 覆盖实测中位数回调(2.75)
-    "breath_tp23": 3.75,  # 覆盖实测75分位回调(3.75)
+    "breath_tp12": 2.42,  # 覆盖实测中位数回调(2.42)
+    "breath_tp23": 4.09,  # 覆盖实测75分位回调(4.09)
     "phase2_trail_mult": 1.0,
     "min_mult": 4.8,      # 0.72×max_mult（沿用币安SNDK自己的min/max比例）
-    "max_mult": 6.7,      # 覆盖实测90分位回调(6.42)以上
+    "max_mult": 6.7,      # 覆盖实测90分位回调(6.44)以上
     "ratio_floor": RATIO_FLOOR,
     "ratio_ceiling": RATIO_CEILING,
     "tick_size": 0.01,
@@ -164,28 +174,28 @@ BREATH_SNDK: Dict[str, Any] = {
     "exit_score": 2,
 }
 
-# XPD 基线（钯金）—— 2026-09-12新增，150分钟周期假设（见上方模块docstring
-# 局限说明；这个周期有宝贝给的TV警报截图佐证）。CoinW真实30m K线合成
-# 150m，299根覆盖约31天，51个摆动点、35个回调样本。ATR%=0.85%。回调分布：
-# P50=2.87×ATR，P75=4.51×ATR，P90=6.53×ATR。
+# XPD 基线（钯金）—— 2026-09-12二次校准：真实TV周期45分钟（宝贝截图确认，
+# 第一版150分钟假设作废）。CoinW真实15m K线合成45m，499根覆盖约15.6天，
+# 93个摆动点、73个回调样本。ATR%=0.28%。回调分布：P50=2.19×ATR，
+# P75=3.58×ATR，P90=5.87×ATR。
 BREATH_XPD: Dict[str, Any] = {
     "name": "XPD",
     "initial_sl_atr": 0.0,
     "fee_cover_pct": 0.0008,
     "stop_exec_buffer": 0.3,
     "early_be_atr": 0.0,
-    "step_trigger_atr": 1.08,   # 0.375×breath_tp12
-    "step_advance_atr": 0.70,   # 0.65×step_trigger
+    "step_trigger_atr": 0.82,   # 0.375×breath_tp12
+    "step_advance_atr": 0.53,   # 0.65×step_trigger
     "phase_switch_atr": 3.0,
     "tp1_atr": 1.35,
     "tp1_floor_atr": 0.0,
     "tp2_atr": 2.5,
     "tp2_floor_atr": 0.0,
-    "breath_tp12": 2.87,  # 覆盖实测中位数回调(2.87)
-    "breath_tp23": 4.51,  # 覆盖实测75分位回调(4.51)
+    "breath_tp12": 2.19,  # 覆盖实测中位数回调(2.19)
+    "breath_tp23": 3.58,  # 覆盖实测75分位回调(3.58)
     "phase2_trail_mult": 1.0,
-    "min_mult": 5.4,      # 0.79×max_mult（沿用币安XPD自己的min/max比例）
-    "max_mult": 6.8,      # 覆盖实测90分位回调(6.53)以上
+    "min_mult": 4.9,      # 0.79×max_mult（沿用币安XPD自己的min/max比例）
+    "max_mult": 6.2,      # 覆盖实测90分位回调(5.87)以上
     "ratio_floor": RATIO_FLOOR,
     "ratio_ceiling": RATIO_CEILING,
     "tick_size": 0.01,

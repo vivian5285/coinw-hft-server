@@ -51,46 +51,87 @@ def get_supervisor(symbol: str = "ETH"):
 
 # ==================== Webhook路由 ====================
 
-@app.route('/webhook', methods=['POST'])
-def webhook():
-    """TV Webhook入口"""
-    # 1) 解析JSON
-    data = request.get_json(force=True, silent=True)
-    if not data:
-        try:
-            raw_data = request.get_data(as_text=True)
-            data = json.loads(raw_data)
-        except Exception:
-            return jsonify({"status": "error", "message": "无效的JSON数据"}), 400
-
-    # 2) 验证secret
+def _dispatch_one_webhook_item(item):
+    """处理单条信号payload（原/webhook逻辑，2026-09-12抽成独立函数以支持
+    批量数组）。返回 (body_dict, http_status)。"""
     from webhook_parser import parse_webhook
-    signal = parse_webhook(data)
+    signal = parse_webhook(item)
 
     if not signal.valid:
         logger.warning(f"Webhook鉴权失败: {signal.error}")
-        return jsonify({"status": "error", "message": "Invalid secret"}), 403
+        return {"status": "error", "message": signal.error or "Invalid secret"}, 403
 
     logger.info(f"Webhook收到信号: {signal.action} {signal.symbol}")
 
-    # 3) 获取对应的Supervisor
     supervisor = get_supervisor(signal.symbol)
 
-    # 4) 异步处理
     def process():
         try:
-            result = supervisor.handle_signal(data)
+            result = supervisor.handle_signal(item)
             logger.info(f"信号处理完成: {result}")
         except Exception as e:
-            logger.error(f"信号处理异常: {e}")
+            logger.error(f"信号处理异常: {e}", exc_info=True)
 
     threading.Thread(target=process, daemon=True).start()
 
-    return jsonify({
+    return {
         "status": "success",
         "message": "Signal processing started",
         "version": COINW_WEBHOOK_VERSION,
-    }), 200
+    }, 200
+
+
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    """TV Webhook入口"""
+    try:
+        # 1) 解析JSON
+        data = request.get_json(force=True, silent=True)
+        if not data:
+            try:
+                raw_data = request.get_data(as_text=True)
+                data = json.loads(raw_data)
+            except Exception:
+                return jsonify({"status": "error", "message": "无效的JSON数据"}), 400
+
+        # 2026-09-12修复：新策略"Webhook 对齐版 + tier 动态分档"（新测试
+        # 策略源码.txt 第十四节）反手场景会把同一根K线的"先平后开"两条
+        # 信号打包成 `[close_obj, entry_obj]` 的JSON数组一次性发过来，不
+        # 是单个JSON对象。修复前这里直接把data(此时是list)传进
+        # parse_webhook -> WebhookParser.parse() 的 `dict(raw or {})`——
+        # dict()构造函数接一个dict列表会直接TypeError（dict()期望的是
+        # (key,value)二元组序列，不是一堆dict），这个异常在本函数外层
+        # 没有任何try/except兜底，Flask直接给TV返回500——2026-09-12
+        # 20:00 OPENAI一次真实反手信号(CLOSE_QUICK_EXIT+SHORT)就是这么
+        # 炸的，TV那边显示"Webhook发送失败 500"，平仓和新开仓两条都没
+        # 执行到。现在按数组顺序（pine脚本自己拼的顺序就是"先平后开"）
+        # 逐条处理，单条格式错误不牵连同批其它条；整个/webhook外层再包
+        # 一层try/except，任何未预料到的解析/处理异常都返回干净的4xx/5xx
+        # JSON而不是让Flask原始报500——跟币安 eth-webhook-server 的
+        # process_webhook_payload()对齐（那边ValueError会被显式捕获成
+        # 400，不会有未处理异常冒出来）。
+        items = data if isinstance(data, list) else [data]
+        if not items:
+            return jsonify({"status": "error", "message": "empty_payload"}), 400
+
+        results = []
+        for item in items:
+            if not isinstance(item, dict):
+                results.append(({"status": "error", "message": "invalid_item_not_object"}, 400))
+                continue
+            results.append(_dispatch_one_webhook_item(item))
+
+        if len(results) == 1:
+            body, code = results[0]
+            return jsonify(body), code
+
+        codes = [c for _, c in results]
+        overall = 200 if all(c == 200 for c in codes) else 207
+        return jsonify({"status": "batch", "count": len(results),
+                         "results": [b for b, _ in results]}), overall
+    except Exception as e:
+        logger.error(f"Webhook处理异常(顶层兜底): {e}", exc_info=True)
+        return jsonify({"status": "error", "message": f"internal_error: {e}"}), 500
 
 
 # ==================== 健康检查 ====================
