@@ -143,6 +143,25 @@ STRUCT_CONFIRM = 3             # fractal pivot 左右各3根确认（跟本项�
 STRUCT_BUFFER_ATR = 0.3        # 摆动点缓冲垫（×ATR）
 ATR_PERIOD = 14
 
+# 2026-09-12 v2（宝贝反复强调的点）：弱趋势该止损就止损（紧），强趋势+
+# 真放量的话要给呼吸空间（宽），不能让一个恰好离得近的摆动点把"该给宽
+# 止损"的意图吞掉。v1 里 struct/ATR 永远取"更紧的那个"(多头max/空头min)，
+# 这其实等价于"永远优先保护本金、从不优先给呼吸空间"——强 tier 时哪怕
+# ATR保护带算出来很宽，只要现价附近恰好有个摆动点，还是会被拉回紧的
+# 那侧，跟"强趋势该宽"的诉求正好反着。v2 改成按"趋势是否真强"切换
+# 取舍方向：
+#   弱/中 tier，或强 tier但没查到真实放量confirmation → 沿用v1，取更紧者
+#     （结构位/ATR保护带谁离现价近听谁的，宁可紧不可松）
+#   强 tier 且查到真实放量confirmation → 反过来取更宽者（结构位/ATR保护带
+#     谁离现价远听谁的，允许趋势呼吸，不因为凑巧路过一个摆动点就把它当
+#     硬止损杀掉）
+# "真实放量"不只信TV自己给的tier（那是开仓那一刻pine脚本算的静态值，
+# 不会随行情实时更新）——VPS自己拿同一批klines算最近几根量能是否明显
+# 放大，双重确认，防止tier=2但其实量没跟上的假强势。
+VOLUME_CONFIRM_LOOKBACK = 20   # 基准量能取这个窗口内、最近N根之前的均量
+VOLUME_CONFIRM_RECENT_N = 3    # 最近几根的均量拿来跟基准比
+VOLUME_CONFIRM_MULT = 1.3      # 最近量能 ≥ 基准 × 此倍数 才算"真放量"
+
 
 def _true_ranges(bars: List[list]) -> List[float]:
     trs = []
@@ -188,6 +207,29 @@ def _last_confirmed_pivot(bars: List[list], side: str, confirm: int = STRUCT_CON
     return None
 
 
+def _volume_confirmed(
+    bars: List[list],
+    lookback: int = VOLUME_CONFIRM_LOOKBACK,
+    recent_n: int = VOLUME_CONFIRM_RECENT_N,
+    mult: float = VOLUME_CONFIRM_MULT,
+) -> bool:
+    """最近 recent_n 根均量是否 ≥ 之前 lookback 根均量的 mult 倍——真放量
+    确认，不信 TV 开仓那一刻给的静态 tier，VPS 自己用同一批 klines 复核。
+    数据不够时保守返回 False（不确认 = 不放宽，跟止损"数据不全按紧算"
+    一致）。"""
+    if len(bars) < lookback + recent_n:
+        return False
+    base = bars[-(lookback + recent_n):-recent_n]
+    recent = bars[-recent_n:]
+    if not base or not recent:
+        return False
+    base_avg = sum(float(b[5]) for b in base) / len(base)
+    recent_avg = sum(float(b[5]) for b in recent) / len(recent)
+    if base_avg <= 0:
+        return False
+    return recent_avg >= mult * base_avg
+
+
 def calc_smart_hard_stop_price(
     side: str,
     entry_price: float,
@@ -198,6 +240,7 @@ def calc_smart_hard_stop_price(
     struct_buffer_atr: float = STRUCT_BUFFER_ATR,
     atr_period: int = ATR_PERIOD,
     k_tier: Optional[Dict[int, float]] = None,
+    strong_tier: int = 2,
 ) -> Tuple[float, Dict[str, Any], bool, str]:
     """
     综合硬止损：结构摆动点(fractal pivot) + 分档ATR保护带，取更保守者。
@@ -208,7 +251,14 @@ def calc_smart_hard_stop_price(
             最后一根可以是未收盘的成型K线（结构/ATR计算对此不敏感）。
 
     返回 (hard_stop_price, meta, ok, error)。meta 含 atr/struct_stop/
-    atr_stop/tier/k_tier/pivot_found，用于日志与人工核查。
+    atr_stop/tier/k_tier/pivot_found/volume_confirmed/combo_mode，用于
+    日志与人工核查。
+
+    combo_mode：
+      "tight"（弱/中tier，或强tier但没查到真放量）——struct/ATR两个候选
+        取更靠近成交价的那个（多头取更高、空头取更低），宁紧不松。
+      "wide"（强tier且查到真放量确认）——反过来取更远离成交价的那个，
+        允许趋势呼吸，不被恰好路过的摆动点/过紧ATR带提前打出去。
     """
     side = str(side or "").upper()
     entry_price = float(entry_price or 0)
@@ -232,6 +282,9 @@ def calc_smart_hard_stop_price(
         t = 0  # tier缺失/非法：止损防线宁可按最紧档保守，不同于仓位公式的取向
     k = float(k_map.get(t, k_map.get(0, 1.5)))
 
+    vol_ok = _volume_confirmed(bars)
+    wide_mode = (t >= strong_tier) and vol_ok
+
     pivot = _last_confirmed_pivot(bars, side, confirm)
 
     if side == "LONG":
@@ -240,7 +293,7 @@ def calc_smart_hard_stop_price(
             struct_stop = pivot - struct_buffer_atr * atr
         else:
             struct_stop = min(float(b[3]) for b in bars)  # 找不到摆动点：简单窗口最低点兜底
-        hard_sl = max(struct_stop, atr_stop)
+        hard_sl = min(struct_stop, atr_stop) if wide_mode else max(struct_stop, atr_stop)
         if hard_sl >= entry_price:
             return 0.0, {}, False, f"stop_above_entry_long:{hard_sl}>={entry_price}"
     else:
@@ -249,7 +302,7 @@ def calc_smart_hard_stop_price(
             struct_stop = pivot + struct_buffer_atr * atr
         else:
             struct_stop = max(float(b[2]) for b in bars)
-        hard_sl = min(struct_stop, atr_stop)
+        hard_sl = max(struct_stop, atr_stop) if wide_mode else min(struct_stop, atr_stop)
         if hard_sl <= entry_price:
             return 0.0, {}, False, f"stop_below_entry_short:{hard_sl}<={entry_price}"
 
@@ -261,6 +314,8 @@ def calc_smart_hard_stop_price(
         "atr_stop": round(atr_stop, 4),
         "pivot_found": pivot is not None,
         "bars_used": len(bars),
+        "volume_confirmed": vol_ok,
+        "combo_mode": "wide" if wide_mode else "tight",
     }
     return round(hard_sl, 2), meta, True, ""
 

@@ -95,16 +95,16 @@ REGIME_STEP_MULT = {"0": 0.85, "1": 1.0, "2": 1.20}
 REGIME_BREATH_MULT = {"0": 0.90, "1": 1.0, "2": 1.15}
 WATCHDOG_STALE_SEC = float(os.getenv("WATCHDOG_STALE_SEC", "120"))   # 监控循环这么久没跳 -> 重启
 
-# ==================== TradFi 品种周末停开仓 ====================
-# 2026-09-12新增（宝贝要求）：OPENAI(盘前未上市股权)/XPD(钯金,COMEX)/
-# SNDK(SanDisk股票代理) 这三个品种的底层是传统金融市场，周末现实中休市，
-# 但包装成的USDT永续在CoinW仍然7×24挂着——TV那套双均线策略仍会在这段
-# 低流动性/宽点差窗口继续给方向，实盘会吃更差的滑点+不必要的手续费，
-# 收益预期上不划算。BNB是纯加密货币，全周正常交易，不受影响。
-# 简单按UTC周几判断（周六0点~周一0点UTC视为周末），只挡"新开仓"（LONG/
-# SHORT），不影响CLOSE/HEARTBEAT——已经持有过周末的仓位该怎么管理(硬止损/
-# 雷达/平仓)完全不受影响，只是不再新开。
-WEEKEND_PAUSE_OPEN_ENABLED = os.getenv("WEEKEND_PAUSE_OPEN", "1").lower() in ("1", "true", "yes")
+# ==================== TradFi 品种周末停开仓（默认关闭） ====================
+# 2026-09-12新增（宝贝要求）后，当天晚些时候宝贝又改主意撤回："还是都
+# 打开吧，有时候行情也就是在周末铺垫的，万一错过趋势更是后悔了"——机制
+# 保留（可逆、随时能重新打开），默认开关改成关闭。OPENAI(盘前未上市
+# 股权)/XPD(钯金,COMEX)/SNDK(SanDisk股票代理) 这三个品种的底层是传统
+# 金融市场，周末现实中休市，但包装成的USDT永续在CoinW仍然7×24挂着——
+# 如果以后又想重新拦截，把 WEEKEND_PAUSE_OPEN 环境变量设成 "1" 即可，
+# 不用改代码。简单按UTC周几判断（周六0点~周一0点UTC视为周末），只挡
+# "新开仓"（LONG/SHORT），不影响CLOSE/HEARTBEAT/已有仓位管理。
+WEEKEND_PAUSE_OPEN_ENABLED = os.getenv("WEEKEND_PAUSE_OPEN", "0").lower() in ("1", "true", "yes")
 WEEKEND_PAUSE_SYMBOLS = {
     s.strip().upper()
     for s in os.getenv("WEEKEND_PAUSE_SYMBOLS", "OPENAI,XPD,SNDK").split(",")
