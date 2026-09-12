@@ -15,6 +15,8 @@ import json
 import logging
 from flask import Blueprint, request, jsonify
 
+from symbol_config import ACTIVE_SYMBOLS
+
 logger = logging.getLogger(__name__)
 
 console_bp = Blueprint('console', __name__, url_prefix='/console')
@@ -125,7 +127,7 @@ def get_status():
     from risk_manager import get_risk_manager
 
     # 获取所有品种状态
-    symbols = ["ETH", "BTC", "XAU", "BNB"]
+    symbols = ACTIVE_SYMBOLS
     pipelines = {}
 
     for sym in symbols:

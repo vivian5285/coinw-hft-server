@@ -16,6 +16,8 @@ import logging
 from typing import Any, Dict, Optional, Tuple
 from dataclasses import dataclass
 
+from symbol_config import ACTIVE_SYMBOLS
+
 logger = logging.getLogger(__name__)
 
 # 有效动作
@@ -24,8 +26,11 @@ logger = logging.getLogger(__name__)
 VALID_ACTIONS = {"LONG", "SHORT", "CLOSE", "CLOSE_QUICK_EXIT", "CLOSE_RSI_EXIT",
                  "PING", "HEARTBEAT"}
 
-# 支持的交易对
-VALID_SYMBOLS = {"ETH", "BTC", "XAU", "BNB"}
+# 支持的交易对——2026-09-12改为从 symbol_config.ACTIVE_SYMBOLS 派生，不再
+# 本地单独维护一份（这里是全系统真正的品种白名单闸门，跟 app.py/
+# console_api.py/state_manager.py/position_supervisor_coinw.py 里另外4处
+# 曾经各自独立硬编码同款清单——已改用同一权威来源）。
+VALID_SYMBOLS = set(ACTIVE_SYMBOLS)
 
 
 @dataclass

@@ -15,6 +15,8 @@ from flask import Flask, request, jsonify
 # 添加当前目录到路径
 sys.path.insert(0, os.path.dirname(__file__))
 
+from symbol_config import ACTIVE_SYMBOLS
+
 # 版本
 COINW_WEBHOOK_VERSION = "v16.22.1-coinw-init"
 
@@ -101,7 +103,7 @@ def health():
 
     from pipeline_ledger import Phase
 
-    symbols = ["ETH", "BTC", "XAU", "BNB"]
+    symbols = ACTIVE_SYMBOLS
     pipelines = {}
 
     for sym in symbols:
@@ -428,10 +430,16 @@ def _start_housekeeping():
         from position_supervisor_coinw import housekeep, HOUSEKEEP_SEC
         while True:
             time.sleep(HOUSEKEEP_SEC)
-            try:
-                housekeep("ETH")
-            except Exception as e:
-                logger.error(f"housekeep 异常: {e}")
+            # 2026-09-12修复：此前只巡检硬编码的"ETH"一个品种，BNB/XAU/BTC
+            # 及新增的OPENAI/SNDK/XPD全都没有孤儿单清扫/无人管持仓兜底/
+            # watchdog停跳重启这三重保护——现在按ACTIVE_SYMBOLS逐个巡检，
+            # 单品种异常不中断其它品种（housekeep内部try/except只吞自己的
+            # 异常，这里再包一层双保险）。
+            for sym in ACTIVE_SYMBOLS:
+                try:
+                    housekeep(sym)
+                except Exception as e:
+                    logger.error(f"[{sym}] housekeep 异常: {e}")
     threading.Thread(target=_run, daemon=True, name="coinw-housekeeping").start()
 
 

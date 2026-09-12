@@ -12,6 +12,8 @@ import threading
 import time
 from typing import Dict, Optional
 
+from symbol_config import ACTIVE_SYMBOLS
+
 
 class StateManager:
     """状态管理器"""
@@ -116,6 +118,6 @@ def save_all_states():
 
 def load_all_states():
     """加载所有状态"""
-    for sym in ["ETH", "BTC", "XAU", "BNB"]:
+    for sym in ACTIVE_SYMBOLS:
         mgr = get_state_manager(sym)
         mgr.load()

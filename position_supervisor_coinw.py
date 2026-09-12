@@ -21,6 +21,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from pipeline_ledger import PipelineLedger, get_pipeline, Phase, Role
+from symbol_config import ACTIVE_SYMBOLS
 
 # 版本号
 COINW_SUPERVISOR_VERSION = "v16.22.1-coinw-init"
@@ -1578,8 +1579,13 @@ def block_catchup(symbol: str = "ETH", seconds: float = None):
 
 def recover_all_on_start():
     """引擎启动时对所有活跃品种做一次在场持仓恢复。"""
+    # 2026-09-12修复：此前硬编码只恢复"ETH"一个品种——BNB当时已经在
+    # webhook_parser.VALID_SYMBOLS里"名义支持"却漏在这里，等于重启后
+    # BNB万一有仓位完全不会被recover_on_start接管，是个既存的孤儿仓
+    # 风险缺口。现在跟其它5处品种清单一样改用symbol_config.ACTIVE_SYMBOLS
+    # 统一权威来源。
     from app import get_supervisor
-    for sym in ("ETH",):
+    for sym in ACTIVE_SYMBOLS:
         try:
             get_supervisor(sym).recover_on_start()
         except Exception as e:
