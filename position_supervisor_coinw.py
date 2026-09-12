@@ -95,6 +95,30 @@ REGIME_STEP_MULT = {"0": 0.85, "1": 1.0, "2": 1.20}
 REGIME_BREATH_MULT = {"0": 0.90, "1": 1.0, "2": 1.15}
 WATCHDOG_STALE_SEC = float(os.getenv("WATCHDOG_STALE_SEC", "120"))   # 监控循环这么久没跳 -> 重启
 
+# ==================== TradFi 品种周末停开仓 ====================
+# 2026-09-12新增（宝贝要求）：OPENAI(盘前未上市股权)/XPD(钯金,COMEX)/
+# SNDK(SanDisk股票代理) 这三个品种的底层是传统金融市场，周末现实中休市，
+# 但包装成的USDT永续在CoinW仍然7×24挂着——TV那套双均线策略仍会在这段
+# 低流动性/宽点差窗口继续给方向，实盘会吃更差的滑点+不必要的手续费，
+# 收益预期上不划算。BNB是纯加密货币，全周正常交易，不受影响。
+# 简单按UTC周几判断（周六0点~周一0点UTC视为周末），只挡"新开仓"（LONG/
+# SHORT），不影响CLOSE/HEARTBEAT——已经持有过周末的仓位该怎么管理(硬止损/
+# 雷达/平仓)完全不受影响，只是不再新开。
+WEEKEND_PAUSE_OPEN_ENABLED = os.getenv("WEEKEND_PAUSE_OPEN", "1").lower() in ("1", "true", "yes")
+WEEKEND_PAUSE_SYMBOLS = {
+    s.strip().upper()
+    for s in os.getenv("WEEKEND_PAUSE_SYMBOLS", "OPENAI,XPD,SNDK").split(",")
+    if s.strip()
+}
+
+
+def _is_weekend_utc(now_ts: Optional[float] = None) -> bool:
+    """UTC周六0点 ~ 周一0点视为周末（周六=5，周日=6，Python Monday=0）。"""
+    import datetime
+    t = now_ts if now_ts is not None else time.time()
+    wd = datetime.datetime.utcfromtimestamp(t).weekday()
+    return wd in (5, 6)
+
 
 class PositionSupervisorCoinW:
     """
@@ -217,6 +241,13 @@ class PositionSupervisorCoinW:
         if trading_paused:
             logger.warning("交易暂停中，拒绝开仓")
             return {"ok": False, "error": "trading_paused"}
+
+        # TradFi品种周末停开仓（底层现实市场休市，7×24永续仍在挂单，滑点/
+        # 手续费不划算）——只挡新开仓，已有仓位/智能再入的平仓管理不受影响。
+        if (WEEKEND_PAUSE_OPEN_ENABLED and self.symbol in WEEKEND_PAUSE_SYMBOLS
+                and _is_weekend_utc()):
+            logger.info(f"[{self.symbol}] 周末休市窗口，跳过新开仓 {signal.action}")
+            return {"ok": False, "error": "weekend_market_closed"}
 
         # 止损后冷却：非再入的同向 TV 信号在冷却期内忽略（防抖，再入走独立通道）
         if (not is_reentry and COOLDOWN_IGNORE_TV

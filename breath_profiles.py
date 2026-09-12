@@ -28,12 +28,21 @@
 是原生粒度，直接拉，不用合成；BNB/XPD的45分钟、SNDK的75分钟都不是原生
 粒度，用能整除的最细原生粒度15分钟K线合成（45=15×3，75=15×5）。
 
-**数据量**：CoinW 公开 klines 接口单次最多回1500根、不支持分页翻更早
-历史（实测 endTime/before 参数均无效）——OPENAI用120m原生粒度，1500根
-覆盖约109天（197个回调样本，比第一版31天/50样本厚实很多）；BNB/XPD/SNDK
-用15m合成，1500根15m只能覆盖约15.6天（51~73个回调样本，比币安同品种
-60~83天的样本更薄——这是CoinW数据接口的硬限制，用更细粒度合成换不来更长
-历史，等实盘跑出更长真实历史后应该重新校准一遍加厚样本）。
+**数据量·第三版（2026-09-12当天三次修正，池化校准）**：CoinW 公开 klines
+接口单次最多回1500根、不支持分页翻更早历史（实测 endTime/before 参数均
+无效）——单独用 CoinW 自己的数据，BNB/XPD/SNDK 这三个45/75分钟品种只能
+拿到约15.6天（51~73个回调样本），明显比币安同品种校准的60~83天薄。
+宝贝提议"同时拉币安和币赢的一起做比对"——币安用公开 futures klines 接口
+（分页，能拿到60~100天历史）在**同样的目标周期**上独立跑同一套 fractal
+pivot+ATR(14) 分析，把两边算出来的"回调距离/本地ATR"**比值样本池化到
+一起**重新算 P50/P75/P90（这是无量纲比值，两个交易所对同一底层资产的
+相对波动特征足够接近，池化后 CoinW 单独样本 vs 池化样本的 P50/P75 差异
+都在 0.1×ATR 以内，验证了这么做合理）。池化后样本量：BNB 343
+(CoinW57+币安286)、XPD 360(73+287)、SNDK 247(51+196)、OPENAI 370
+(197+173，OPENAI 本来CoinW自己就有109天/197样本，池化后进一步加厚)。
+**注意**：池化只用来算"回调/ATR的比例关系"，实盘下单用的**绝对 ATR 数值
+仍然只认 CoinW 自己最新的K线**（币安的绝对价格/ATR跟CoinW盘口不是同一
+个订单簿，不能拿来定位止损距离，只用它的"形状"不用它的"刻度"）。
 
 tp1_atr/tp2_atr/phase_switch_atr/fee_cover_pct/stop_exec_buffer/
 tick_size/entry_score/exit_score 沿用全系统统一默认值（这几项从来都不是
@@ -86,28 +95,28 @@ BREATH_ETH: Dict[str, Any] = {
     "exit_score": 2,
 }
 
-# BNB 基线 —— 2026-09-12二次校准：真实TV周期45分钟（宝贝截图确认，第一版
-# 150分钟假设作废）。CoinW真实15m K线合成45m，499根覆盖约15.6天，87个
-# 摆动点、56个回调样本。ATR%=0.44%。回调分布：P50=2.43×ATR，P75=3.20×ATR，
-# P90=4.41×ATR。
+# BNB 基线 —— 2026-09-12三次校准：真实TV周期45分钟，CoinW(499根/15.6天/
+# 56样本) + 币安(1973根合成/61.6天/286样本) 池化，共343个回调样本。
+# 池化回调分布：P50=2.45×ATR，P75=3.56×ATR，P90=5.07×ATR。实盘ATR仍取
+# CoinW自己最新值(不用币安的绝对ATR)。
 BREATH_BNB: Dict[str, Any] = {
     "name": "BNB",
     "initial_sl_atr": 0.0,
     "fee_cover_pct": 0.0008,
     "stop_exec_buffer": 0.3,
     "early_be_atr": 0.0,
-    "step_trigger_atr": 0.91,   # 0.375×breath_tp12
-    "step_advance_atr": 0.59,   # 0.65×step_trigger
+    "step_trigger_atr": 0.92,   # 0.375×breath_tp12
+    "step_advance_atr": 0.60,   # 0.65×step_trigger
     "phase_switch_atr": 3.0,
     "tp1_atr": 1.35,
     "tp1_floor_atr": 0.0,
     "tp2_atr": 2.5,
     "tp2_floor_atr": 0.0,
-    "breath_tp12": 2.43,  # 覆盖实测中位数回调(2.43)
-    "breath_tp23": 3.20,  # 覆盖实测75分位回调(3.20)
+    "breath_tp12": 2.45,  # 池化中位数回调(2.45)
+    "breath_tp23": 3.56,  # 池化75分位回调(3.56)
     "phase2_trail_mult": 1.0,
-    "min_mult": 3.4,      # 0.72×max_mult（沿用币安BNB自己的min/max比例）
-    "max_mult": 4.7,      # 覆盖实测90分位回调(4.41)以上
+    "min_mult": 3.9,      # 0.72×max_mult（沿用币安BNB自己的min/max比例）
+    "max_mult": 5.4,      # 覆盖池化90分位回调(5.07)以上
     "ratio_floor": RATIO_FLOOR,
     "ratio_ceiling": RATIO_CEILING,
     "tick_size": 0.01,
@@ -115,71 +124,12 @@ BREATH_BNB: Dict[str, Any] = {
     "exit_score": 2,
 }
 
-# OPENAI 基线 —— 2026-09-12二次校准：真实TV周期2小时/120分钟（宝贝截图
-# 确认，第一版150分钟假设作废）。120分钟正好是CoinW原生K线粒度，不用
-# 合成，1500根覆盖约109天（比第一版31天厚实很多），262个摆动点、197个
-# 回调样本。ATR%=1.43%。回调分布：P50=2.25×ATR，P75=3.59×ATR，
-# P90=5.12×ATR。
+# OPENAI 基线 —— 2026-09-12三次校准：真实TV周期2小时/120分钟，CoinW
+# (1310根原生/109.1天/197样本) + 币安(1200根原生2h/99.9天/173样本) 池化，
+# 共370个回调样本。池化回调分布：P50=2.17×ATR，P75=3.53×ATR，
+# P90=5.03×ATR。实盘ATR仍取CoinW自己最新值。
 BREATH_OPENAI: Dict[str, Any] = {
     "name": "OPENAI",
-    "initial_sl_atr": 0.0,
-    "fee_cover_pct": 0.0008,
-    "stop_exec_buffer": 0.3,
-    "early_be_atr": 0.0,
-    "step_trigger_atr": 0.84,   # 0.375×breath_tp12
-    "step_advance_atr": 0.55,   # 0.65×step_trigger
-    "phase_switch_atr": 3.0,
-    "tp1_atr": 1.35,
-    "tp1_floor_atr": 0.0,
-    "tp2_atr": 2.5,
-    "tp2_floor_atr": 0.0,
-    "breath_tp12": 2.25,  # 覆盖实测中位数回调(2.25)
-    "breath_tp23": 3.59,  # 覆盖实测75分位回调(3.59)
-    "phase2_trail_mult": 1.0,
-    "min_mult": 4.3,      # 0.8×max_mult（沿用币安OPENAI自己的min/max比例）
-    "max_mult": 5.4,      # 覆盖实测90分位回调(5.12)以上
-    "ratio_floor": RATIO_FLOOR,
-    "ratio_ceiling": RATIO_CEILING,
-    "tick_size": 0.01,
-    "entry_score": 3,
-    "exit_score": 2,
-}
-
-# SNDK 基线 —— 2026-09-12二次校准：真实TV周期75分钟（宝贝截图确认，第
-# 一版150分钟假设作废）。CoinW真实15m K线合成75m，299根覆盖约15.5天，
-# 62个摆动点、51个回调样本。ATR%=0.63%。回调分布：P50=2.42×ATR，
-# P75=4.09×ATR，P90=6.44×ATR。
-BREATH_SNDK: Dict[str, Any] = {
-    "name": "SNDK",
-    "initial_sl_atr": 0.0,
-    "fee_cover_pct": 0.0008,
-    "stop_exec_buffer": 0.3,
-    "early_be_atr": 0.0,
-    "step_trigger_atr": 0.91,   # 0.375×breath_tp12
-    "step_advance_atr": 0.59,   # 0.65×step_trigger
-    "phase_switch_atr": 3.0,
-    "tp1_atr": 1.35,
-    "tp1_floor_atr": 0.0,
-    "tp2_atr": 2.5,
-    "tp2_floor_atr": 0.0,
-    "breath_tp12": 2.42,  # 覆盖实测中位数回调(2.42)
-    "breath_tp23": 4.09,  # 覆盖实测75分位回调(4.09)
-    "phase2_trail_mult": 1.0,
-    "min_mult": 4.8,      # 0.72×max_mult（沿用币安SNDK自己的min/max比例）
-    "max_mult": 6.7,      # 覆盖实测90分位回调(6.44)以上
-    "ratio_floor": RATIO_FLOOR,
-    "ratio_ceiling": RATIO_CEILING,
-    "tick_size": 0.01,
-    "entry_score": 3,
-    "exit_score": 2,
-}
-
-# XPD 基线（钯金）—— 2026-09-12二次校准：真实TV周期45分钟（宝贝截图确认，
-# 第一版150分钟假设作废）。CoinW真实15m K线合成45m，499根覆盖约15.6天，
-# 93个摆动点、73个回调样本。ATR%=0.28%。回调分布：P50=2.19×ATR，
-# P75=3.58×ATR，P90=5.87×ATR。
-BREATH_XPD: Dict[str, Any] = {
-    "name": "XPD",
     "initial_sl_atr": 0.0,
     "fee_cover_pct": 0.0008,
     "stop_exec_buffer": 0.3,
@@ -191,11 +141,69 @@ BREATH_XPD: Dict[str, Any] = {
     "tp1_floor_atr": 0.0,
     "tp2_atr": 2.5,
     "tp2_floor_atr": 0.0,
-    "breath_tp12": 2.19,  # 覆盖实测中位数回调(2.19)
-    "breath_tp23": 3.58,  # 覆盖实测75分位回调(3.58)
+    "breath_tp12": 2.17,  # 池化中位数回调(2.17)
+    "breath_tp23": 3.53,  # 池化75分位回调(3.53)
+    "phase2_trail_mult": 1.0,
+    "min_mult": 4.2,      # 0.8×max_mult（沿用币安OPENAI自己的min/max比例）
+    "max_mult": 5.3,      # 覆盖池化90分位回调(5.03)以上
+    "ratio_floor": RATIO_FLOOR,
+    "ratio_ceiling": RATIO_CEILING,
+    "tick_size": 0.01,
+    "entry_score": 3,
+    "exit_score": 2,
+}
+
+# SNDK 基线 —— 2026-09-12三次校准：真实TV周期75分钟，CoinW(299根/15.5天/
+# 51样本) + 币安(1191根合成/62.0天/196样本) 池化，共247个回调样本。
+# 池化回调分布：P50=2.36×ATR，P75=3.90×ATR，P90=5.86×ATR。实盘ATR仍取
+# CoinW自己最新值。
+BREATH_SNDK: Dict[str, Any] = {
+    "name": "SNDK",
+    "initial_sl_atr": 0.0,
+    "fee_cover_pct": 0.0008,
+    "stop_exec_buffer": 0.3,
+    "early_be_atr": 0.0,
+    "step_trigger_atr": 0.88,   # 0.375×breath_tp12
+    "step_advance_atr": 0.57,   # 0.65×step_trigger
+    "phase_switch_atr": 3.0,
+    "tp1_atr": 1.35,
+    "tp1_floor_atr": 0.0,
+    "tp2_atr": 2.5,
+    "tp2_floor_atr": 0.0,
+    "breath_tp12": 2.36,  # 池化中位数回调(2.36)
+    "breath_tp23": 3.90,  # 池化75分位回调(3.90)
+    "phase2_trail_mult": 1.0,
+    "min_mult": 4.5,      # 0.72×max_mult（沿用币安SNDK自己的min/max比例）
+    "max_mult": 6.2,      # 覆盖池化90分位回调(5.86)以上
+    "ratio_floor": RATIO_FLOOR,
+    "ratio_ceiling": RATIO_CEILING,
+    "tick_size": 0.01,
+    "entry_score": 3,
+    "exit_score": 2,
+}
+
+# XPD 基线（钯金）—— 2026-09-12三次校准：真实TV周期45分钟，CoinW(499根/
+# 15.6天/73样本) + 币安(1973根合成/61.6天/287样本) 池化，共360个回调
+# 样本。池化回调分布：P50=2.46×ATR，P75=3.68×ATR，P90=5.86×ATR。实盘
+# ATR仍取CoinW自己最新值。
+BREATH_XPD: Dict[str, Any] = {
+    "name": "XPD",
+    "initial_sl_atr": 0.0,
+    "fee_cover_pct": 0.0008,
+    "stop_exec_buffer": 0.3,
+    "early_be_atr": 0.0,
+    "step_trigger_atr": 0.92,   # 0.375×breath_tp12
+    "step_advance_atr": 0.60,   # 0.65×step_trigger
+    "phase_switch_atr": 3.0,
+    "tp1_atr": 1.35,
+    "tp1_floor_atr": 0.0,
+    "tp2_atr": 2.5,
+    "tp2_floor_atr": 0.0,
+    "breath_tp12": 2.46,  # 池化中位数回调(2.46)
+    "breath_tp23": 3.68,  # 池化75分位回调(3.68)
     "phase2_trail_mult": 1.0,
     "min_mult": 4.9,      # 0.79×max_mult（沿用币安XPD自己的min/max比例）
-    "max_mult": 6.2,      # 覆盖实测90分位回调(5.87)以上
+    "max_mult": 6.2,      # 覆盖池化90分位回调(5.86)以上
     "ratio_floor": RATIO_FLOOR,
     "ratio_ceiling": RATIO_CEILING,
     "tick_size": 0.01,
