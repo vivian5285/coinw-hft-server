@@ -126,6 +126,24 @@ DUAL_MA_EXIT_INTERVAL_MIN = {
 }
 DUAL_MA_EXIT_DEFAULT_INTERVAL_MIN = 45
 
+# 2026-09-13再新增(宝贝实盘截图复盘BNBUSDT.P发现)："突发放量反转K线快速
+# 锁保本"——三层防线里最快的一层，跟币安B系统(eth-webhook-server同名
+# commit)同步实施。背景：等K线收盘价真正站上/跌破双均线才反应，对一根
+# 走势凌厉的反转K线来说已经晚了。宝贝原话："等阳线站上双均线再平仓就
+# 已经晚了"。
+#   1) IMPULSE_EXIT(本机制，最快，~1分钟轮询一次)：只看最新一根K线自己
+#      够不够"决定性"(实体够大+真放量)，够的话立刻锁到保本价，不直接
+#      平仓，抢在双均线确认之前先落袋一部分保护。
+#   2) DUAL_MA_EXIT(已有，5分钟轮询)：双均线真正被突破+放量确认 →
+#      直接清仓。
+#   3) REVLOCK(已有，4h裸K)：最慢的兜底安全网。
+IMPULSE_EXIT_ENABLED = os.getenv("IMPULSE_EXIT", "1").lower() in ("1", "true", "yes")
+IMPULSE_BODY_RATIO = 0.6
+IMPULSE_VOL_MULT = 1.5
+IMPULSE_VOL_LOOKBACK = 20
+IMPULSE_REFRESH_SEC = 60.0
+IMPULSE_KLINE_LIMIT = 30
+
 # ==================== 追单确认观察窗 / 孤儿单清扫 ====================
 CHASE_WATCH_ENABLED = os.getenv("CHASE_WATCH", "1").lower() in ("1", "true", "yes")
 CHASE_CONFIRM_COUNT = int(os.getenv("CHASE_CONFIRM_COUNT", "3"))     # 连续 N 次合格心跳
@@ -1125,6 +1143,17 @@ class PositionSupervisorCoinW:
                 if new_sl:
                     self._update_radar_sl(new_sl)
 
+                # 4.5) 突发放量反转K线快速锁保本——见IMPULSE_EXIT_*常量顶部
+                # 注释。三层防线里最快的一层，排在双均线破位检查之前：宝贝
+                # 实盘截图复盘发现"等阳线站上双均线再平仓就已经晚了"，这个
+                # 检查不等双均线正式突破确认，只看最新一根K线自己够不够
+                # "决定性"，够的话立刻锁到保本价。
+                if IMPULSE_EXIT_ENABLED:
+                    try:
+                        self._maybe_fast_lock_on_impulse_candle(current_price)
+                    except Exception as _e:
+                        logger.debug(f"突发反转K线快速锁保本异常: {_e}")
+
                 # 5) 双均线破位快速平仓——见DUAL_MA_EXIT_*常量顶部注释。故意
                 # 排在反转锁利**之前**调用——宝贝原话"双均线权重大于反转
                 # 锁利，因为它是最快速反应市场趋势的、最敏捷的一个"，优先
@@ -1445,6 +1474,85 @@ class PositionSupervisorCoinW:
             out.append([ch[0][0], ch[0][1], max(c[2] for c in ch),
                         min(c[3] for c in ch), ch[-1][4], sum(c[5] for c in ch)])
         return out
+
+    def _maybe_fast_lock_on_impulse_candle(self, current_price: float):
+        """突发放量反转K线快速锁保本——见上方IMPULSE_EXIT_*常量顶部注释。
+        三层防线里速度最快的一层：不等双均线正式突破确认，只看最新一根
+        K线自己够不够"决定性"(实体够大+真放量)，够的话立刻把止损棘轮到
+        保本价——不清仓(单根K线可能只是插针)，真正决定性的清仓交给
+        _maybe_fast_exit_on_dual_ma_break。"""
+        if not IMPULSE_EXIT_ENABLED:
+            return
+        side = str(self.pipeline.data.get("side") or "").upper()
+        if side not in ("LONG", "SHORT"):
+            return
+        now = time.time()
+        last_check = float(getattr(self, "_impulse_exit_last_check_ts", 0) or 0)
+        if last_check > 0 and (now - last_check) < IMPULSE_REFRESH_SEC:
+            return
+        self._impulse_exit_last_check_ts = now
+
+        bars = self._fetch_dual_ma_exit_klines()
+        if not bars or len(bars) < IMPULSE_VOL_LOOKBACK + 2:
+            return
+
+        last = bars[-1]
+        try:
+            bar_time = int(last[0])
+            o, h, l, c, v = (float(last[i]) for i in (1, 2, 3, 4, 5))
+        except (TypeError, ValueError, IndexError):
+            return
+        rng = max(h - l, 1e-9)
+        body_ratio = abs(c - o) / rng
+        decisive_bear = c < o and body_ratio >= IMPULSE_BODY_RATIO
+        decisive_bull = c > o and body_ratio >= IMPULSE_BODY_RATIO
+        against_position = (side == "LONG" and decisive_bear) or (side == "SHORT" and decisive_bull)
+        if not against_position:
+            return
+
+        prior = bars[-(IMPULSE_VOL_LOOKBACK + 1):-1]
+        if len(prior) < IMPULSE_VOL_LOOKBACK:
+            return
+        vol_avg = sum(float(b[5]) for b in prior) / len(prior)
+        if not (vol_avg > 0 and v >= vol_avg * IMPULSE_VOL_MULT):
+            return
+
+        entry = float(self.pipeline.data.get("entry") or 0)
+        if entry <= 0:
+            return
+        st = self.radar.get_state()
+        atr = float(st.initial_atr or getattr(self.radar, "_atr", 0) or 0)
+        if atr <= 0:
+            return
+        try:
+            from breath_stop import initial_stop_price
+            from breath_profiles import get_breath_profile
+            breakeven = float(initial_stop_price(
+                side, entry, atr, profile=get_breath_profile(self.symbol),
+            ) or 0)
+        except Exception:
+            return
+        if breakeven <= 0:
+            return
+        cur = float(st.current_sl or 0)
+        if side == "LONG":
+            improved = breakeven > cur
+        else:
+            improved = cur <= 0 or breakeven < cur
+        if not improved:
+            return
+
+        self.radar.seed_stop(round(breakeven, 2))
+        self._update_radar_sl(round(breakeven, 2))
+        already = int(getattr(self, "_impulse_exit_alerted_bar", 0) or 0)
+        if already != bar_time:
+            self._impulse_exit_alerted_bar = bar_time
+            self._safe_alert(
+                f"突发放量反转K线快速锁保本：{side} 实体比={body_ratio:.2f} "
+                f"量能={(v / vol_avg if vol_avg > 0 else 0):.2f}倍 → "
+                f"止损顶至保本价 {cur}→{round(breakeven, 2)}(双均线一旦真的被突破+放量"
+                f"确认会直接清仓)"
+            )
 
     def _maybe_fast_exit_on_dual_ma_break(self, current_price: float):
         """双均线破位快速平仓——见上方DUAL_MA_EXIT_*常量顶部注释。跟
