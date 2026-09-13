@@ -101,6 +101,31 @@ REVLOCK_BODY_ATR = float(os.getenv("REVLOCK_BODY_ATR", "1.1"))
 REVLOCK_VOL_MULT = float(os.getenv("REVLOCK_VOL_MULT", "1.4"))
 REVLOCK_MIN_PROFIT_ATR = float(os.getenv("REVLOCK_MIN_PROFIT_ATR", "0.8"))  # 至少这么多浮盈才收保本
 
+# 2026-09-13新增(宝贝拍板，跟币安B系统同步实施)："双均线破位快速平仓"。
+# 背景：币安B系统OPENAI靠ATR跟踪止损雷达在反弹时被打出，同一时刻CoinW的
+# OPENAI止损还停在更远处没被打到、仍在持仓——宝贝指出雷达不该只是单一的
+# ATR跟踪系数去锁利润，还要主动看这个品种自己真实周期的裸K是否跌破/站上
+# 快慢双均线(做空=收盘价还在双均线下方才算趋势仍成立；做多=还在上方才算
+# 成立)。跟上面REVLOCK(4h裸K单根反转实体+放量，固定4h不管品种周期，只
+# 朝有利方向棘轮到保本价不直接平仓)是两套独立机制，可以同时生效，职责
+# 不同：REVLOCK负责"保住不由盈转亏"这条底线，DUAL_MA_EXIT负责"趋势真的
+# 走完了就别等ATR慢慢追"。真实放量确认破位时直接清仓；量能没确认(疑似
+# 假突破)时不强平，只把止损适度收紧到破位K线收盘价附近，给行情留时间
+# 验证是否真反转。
+DUAL_MA_EXIT_ENABLED = os.getenv("DUAL_MA_EXIT", "1").lower() in ("1", "true", "yes")
+DUAL_MA_EXIT_FAST_LEN = 8
+DUAL_MA_EXIT_SLOW_LEN = 20
+DUAL_MA_EXIT_KLINE_LIMIT = 80
+DUAL_MA_EXIT_REFRESH_SEC = 300.0
+DUAL_MA_EXIT_SOFT_TIGHTEN_BUFFER_ATR = 0.3
+DUAL_MA_EXIT_NATIVE_BASE_MIN = 15  # CoinW原生支持15/120，45/75靠15合成(×3/×5)
+# 每个品种自己真实的TV周期——同一份数值跟币安B系统
+# (radar_reentry_mixin.py::DUAL_MA_EXIT_INTERVAL_MIN)保持一致。
+DUAL_MA_EXIT_INTERVAL_MIN = {
+    "BNB": 45, "XPD": 45, "SNDK": 75, "OPENAI": 120, "XAU": 45, "XPT": 45,
+}
+DUAL_MA_EXIT_DEFAULT_INTERVAL_MIN = 45
+
 # ==================== 追单确认观察窗 / 孤儿单清扫 ====================
 CHASE_WATCH_ENABLED = os.getenv("CHASE_WATCH", "1").lower() in ("1", "true", "yes")
 CHASE_CONFIRM_COUNT = int(os.getenv("CHASE_CONFIRM_COUNT", "3"))     # 连续 N 次合格心跳
@@ -1107,6 +1132,15 @@ class PositionSupervisorCoinW:
                     except Exception as _e:
                         logger.debug(f"反转锁利异常: {_e}")
 
+                # 5.5) 双均线破位快速平仓——见DUAL_MA_EXIT_*常量顶部注释。
+                # 跟反转锁利同一个位置、职责不同：反转锁利只朝有利方向棘轮
+                # 到保本价，这个检查真放量确认破位时会直接清仓。
+                if DUAL_MA_EXIT_ENABLED:
+                    try:
+                        self._maybe_fast_exit_on_dual_ma_break(current_price)
+                    except Exception as _e:
+                        logger.debug(f"双均线破位快速平仓异常: {_e}")
+
                 # 每 ~60s 打一条监控存活/状态日志（冒烟/复盘可见）
                 if self._naked_tick % 15 == 0:
                     _rs = self.radar.get_state()
@@ -1378,6 +1412,117 @@ class PositionSupervisorCoinW:
             self.radar.seed_stop(new_sl)
             self._update_radar_sl(new_sl)
             self._safe_alert(f"反转锁利：4h逆向放量反转({det})，止损收到保本 {new_sl}")
+
+    def _fetch_dual_ma_exit_klines(self) -> list:
+        """双均线破位检查专用取K线——品种自己真实TV周期，CoinW原生只支持
+        15/120分钟等固定枚举，45/75分钟(BNB/XPD/XAU/XPT=45，SNDK=75)靠
+        15分钟合成(×3/×5)，OPENAI=120分钟原生直接拉，不用合成。合成逻辑
+        跟_synth_150同一套(open取首根/high取窗口最高/low取窗口最低/close
+        取末根/volume求和)，只是把固定的f=5换成按品种查表的通用倍数。"""
+        interval_min = DUAL_MA_EXIT_INTERVAL_MIN.get(self.symbol, DUAL_MA_EXIT_DEFAULT_INTERVAL_MIN)
+        if interval_min == DUAL_MA_EXIT_NATIVE_BASE_MIN or interval_min not in (45, 75):
+            try:
+                return self.client.get_klines(self.symbol, interval_min, DUAL_MA_EXIT_KLINE_LIMIT)
+            except Exception:
+                return []
+        factor = interval_min // DUAL_MA_EXIT_NATIVE_BASE_MIN
+        try:
+            raw = self.client.get_klines(
+                self.symbol, DUAL_MA_EXIT_NATIVE_BASE_MIN,
+                DUAL_MA_EXIT_KLINE_LIMIT * factor + factor,
+            )
+        except Exception:
+            return []
+        if not raw or len(raw) < factor:
+            return []
+        n = len(raw) - (len(raw) % factor)
+        out = []
+        for i in range(0, n, factor):
+            ch = raw[i:i + factor]
+            out.append([ch[0][0], ch[0][1], max(c[2] for c in ch),
+                        min(c[3] for c in ch), ch[-1][4], sum(c[5] for c in ch)])
+        return out
+
+    def _maybe_fast_exit_on_dual_ma_break(self, current_price: float):
+        """双均线破位快速平仓——见上方DUAL_MA_EXIT_*常量顶部注释。跟
+        _apply_reversal_lock同一个位置调用、同一种"自己处理副作用、不
+        返回值"的写法，但这个检查更决断：真实放量确认破位时直接
+        self._clear_position()清仓；没放量确认时只顺着_update_radar_sl
+        同款写法适度收紧止损，不强平。"""
+        if not DUAL_MA_EXIT_ENABLED:
+            return
+        side = str(self.pipeline.data.get("side") or "").upper()
+        if side not in ("LONG", "SHORT"):
+            return
+        now = time.time()
+        last_check = float(getattr(self, "_dual_ma_exit_last_check_ts", 0) or 0)
+        if last_check > 0 and (now - last_check) < DUAL_MA_EXIT_REFRESH_SEC:
+            return
+        self._dual_ma_exit_last_check_ts = now
+
+        bars = self._fetch_dual_ma_exit_klines()
+        if not bars or len(bars) < DUAL_MA_EXIT_SLOW_LEN + 2:
+            return
+
+        try:
+            from dual_ma_trend import dual_ma_trend_ok
+            ok, meta = dual_ma_trend_ok(
+                side, bars, fast_len=DUAL_MA_EXIT_FAST_LEN, slow_len=DUAL_MA_EXIT_SLOW_LEN,
+            )
+        except Exception as e:
+            logger.debug(f"[{self.symbol}] 双均线破位判断跳过: {e}")
+            return
+        if ok:
+            return  # 空头仍在双均线下方/多头仍在双均线上方，趋势仍成立
+
+        close_px = float(bars[-1][4])
+        bar_time = int(bars[-1][0])
+        try:
+            from atr_scenario import _volume_confirmed
+            vol_ok = _volume_confirmed(bars)
+        except Exception:
+            vol_ok = False
+
+        if vol_ok:
+            already = int(getattr(self, "_dual_ma_exit_closed_bar", 0) or 0)
+            if already == bar_time:
+                return  # 同一根K线已经处理过，不重复触发
+            self._dual_ma_exit_closed_bar = bar_time
+            interval_min = DUAL_MA_EXIT_INTERVAL_MIN.get(self.symbol, DUAL_MA_EXIT_DEFAULT_INTERVAL_MIN)
+            self._safe_alert(
+                f"双均线破位快速平仓：{side} {interval_min}分钟K线"
+                f"{'跌破' if side == 'LONG' else '站上'}双均线"
+                f"({DUAL_MA_EXIT_FAST_LEN}/{DUAL_MA_EXIT_SLOW_LEN})，真实放量确认(非假突破)，"
+                f"close={close_px:.4f} fast_ma={meta.get('ma_fast', 0):.4f} "
+                f"slow_ma={meta.get('ma_slow', 0):.4f} → 市价清仓"
+            )
+            try:
+                self._clear_position("双均线破位+放量确认快速平仓")
+            except Exception as e:
+                logger.error(f"[{self.symbol}] 双均线破位快速平仓执行异常: {e}")
+            return
+
+        # 放量没确认——疑似假突破，不强平，只适度收紧止损到破位K线收盘价
+        # 附近，给行情一点时间验证是否真反转。
+        st = self.radar.get_state()
+        atr = float(st.initial_atr or getattr(self.radar, "_atr", 0) or 0)
+        if atr <= 0:
+            return
+        cur = float(st.current_sl or 0)
+        if side == "LONG":
+            tighter = round(close_px - DUAL_MA_EXIT_SOFT_TIGHTEN_BUFFER_ATR * atr, 2)
+            improved = tighter > cur
+        else:
+            tighter = round(close_px + DUAL_MA_EXIT_SOFT_TIGHTEN_BUFFER_ATR * atr, 2)
+            improved = cur <= 0 or tighter < cur
+        if not improved:
+            return
+        self.radar.seed_stop(tighter)
+        self._update_radar_sl(tighter)
+        logger.info(
+            f"[{self.symbol}] 双均线破位但放量未确认(疑似假突破) | {side} | "
+            f"close={close_px:.4f} → 止损适度收紧 {cur}→{tighter}，暂不强平"
+        )
 
     def _do_reentry(self, ex: dict, px: float, bars_150: list):
         from webhook_parser import ParsedSignal
