@@ -254,6 +254,63 @@ BREATH_XPT: Dict[str, Any] = {
     "exit_score": 2,
 }
 
+# XRP(瑞波币) —— 2026-09-13新增品种，同批跟币安B系统同步实施，同一份
+# 45分钟校准(直接复用币安侧真实K线校准结果，91.1天2916根合成K线、453个
+# 真实摆动点识别回调样本：中位数回调2.42×ATR/75分位3.50×ATR/90分位
+# 4.96×ATR，ATR%=0.47%)。min/max比例借用同族BNB比例(0.72)。
+BREATH_XRP: Dict[str, Any] = {
+    "name": "XRP",
+    "initial_sl_atr": 0.0,
+    "fee_cover_pct": 0.0008,
+    "stop_exec_buffer": 0.3,
+    "early_be_atr": 0.0,
+    "step_trigger_atr": 0.91,
+    "step_advance_atr": 0.59,
+    "phase_switch_atr": 3.0,
+    "tp1_atr": 1.35,
+    "tp1_floor_atr": 0.0,
+    "tp2_atr": 2.5,
+    "tp2_floor_atr": 0.0,
+    "breath_tp12": 2.42,
+    "breath_tp23": 3.50,
+    "phase2_trail_mult": 1.0,
+    "min_mult": 3.8,
+    "max_mult": 5.3,
+    "ratio_floor": RATIO_FLOOR,
+    "ratio_ceiling": RATIO_CEILING,
+    "tick_size": 0.0001,
+    "entry_score": 3,
+    "exit_score": 2,
+}
+
+# SOL(Solana) —— 2026-09-13新增品种，同批。真实K线校准(91.1天2916根
+# 合成K线、439个真实摆动点识别回调样本)：中位数回调2.46×ATR/75分位
+# 3.48×ATR/90分位5.01×ATR，ATR%=0.45%。同XRP借用BNB的min/max比例。
+BREATH_SOL: Dict[str, Any] = {
+    "name": "SOL",
+    "initial_sl_atr": 0.0,
+    "fee_cover_pct": 0.0008,
+    "stop_exec_buffer": 0.3,
+    "early_be_atr": 0.0,
+    "step_trigger_atr": 0.92,
+    "step_advance_atr": 0.60,
+    "phase_switch_atr": 3.0,
+    "tp1_atr": 1.35,
+    "tp1_floor_atr": 0.0,
+    "tp2_atr": 2.5,
+    "tp2_floor_atr": 0.0,
+    "breath_tp12": 2.46,
+    "breath_tp23": 3.48,
+    "phase2_trail_mult": 1.0,
+    "min_mult": 3.8,
+    "max_mult": 5.3,
+    "ratio_floor": RATIO_FLOOR,
+    "ratio_ceiling": RATIO_CEILING,
+    "tick_size": 0.01,
+    "entry_score": 3,
+    "exit_score": 2,
+}
+
 _BY_SYMBOL: Dict[str, Dict[str, Any]] = {
     "ETH": BREATH_ETH,
     "BNB": BREATH_BNB,
@@ -261,6 +318,8 @@ _BY_SYMBOL: Dict[str, Dict[str, Any]] = {
     "SNDK": BREATH_SNDK,
     "XPD": BREATH_XPD,
     "XPT": BREATH_XPT,
+    "XRP": BREATH_XRP,
+    "SOL": BREATH_SOL,
 }
 
 

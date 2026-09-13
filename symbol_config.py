@@ -34,7 +34,14 @@ from typing import Dict, List, Optional
 # 公开行情接口(/v1/perpumPublic/ticker?instrument=XPT)，contract_id=195，
 # 真实挂着USDT永续合约(fair_price≈1794.51, max_leverage=120)。跟币安B
 # 系统同批上线，45分钟周期，同一份BREATH_XPT。
-ACTIVE_SYMBOLS: List[str] = ["ETH", "BTC", "XAU", "BNB", "OPENAI", "SNDK", "XPD", "XPT"]
+# 2026-09-13（同一天再新增）：新增 XRP/SOL（主流加密货币，不是贵金属/
+# TradFi类）——核实过/v1/perpumPublic/ticker，XRP contract_id=15
+# (fair_price≈1.35, max_leverage=100)，SOL contract_id=24
+# (fair_price≈100.63, max_leverage=110)，都真实挂着USDT永续合约。跟
+# 币安B系统同批上线，45分钟周期。
+ACTIVE_SYMBOLS: List[str] = [
+    "ETH", "BTC", "XAU", "BNB", "OPENAI", "SNDK", "XPD", "XPT", "XRP", "SOL",
+]
 
 
 class SymbolConfig:
@@ -50,6 +57,8 @@ class SymbolConfig:
         "SNDK": "SNDK",
         "XPD": "XPD",
         "XPT": "XPT",
+        "XRP": "XRP",
+        "SOL": "SOL",
     }
 
     # 品种精度（见上方class docstring：当前未被实际下单路径读取）
@@ -62,6 +71,8 @@ class SymbolConfig:
         "SNDK": 2,
         "XPD": 2,
         "XPT": 2,
+        "XRP": 4,
+        "SOL": 2,
     }
 
     QTY_PRECISION = {
@@ -73,6 +84,8 @@ class SymbolConfig:
         "SNDK": 4,
         "XPD": 4,
         "XPT": 4,
+        "XRP": 4,
+        "SOL": 4,
     }
 
     # 默认杠杆
@@ -88,6 +101,8 @@ class SymbolConfig:
         "SNDK": 1.0,
         "XPD": 1.0,
         "XPT": 1.0,
+        "XRP": 1.0,
+        "SOL": 1.0,
     }
 
     @classmethod
