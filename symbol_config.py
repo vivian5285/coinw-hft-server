@@ -30,7 +30,11 @@ from typing import Dict, List, Optional
 # recover_all_on_start() 重启恢复循环、app.py 的周期housekeep巡检——压根
 # 没被列进去，属于既存漏洞：BNB 名义上"支持"但重启不恢复、巡检不覆盖。
 # 五处调用点已改为从这里导入，不再各自维护一份，防止再出现同类遗漏。
-ACTIVE_SYMBOLS: List[str] = ["ETH", "BTC", "XAU", "BNB", "OPENAI", "SNDK", "XPD"]
+# 2026-09-13：新增 XPT（铂金，跟XAU/XPD同族贵金属永续）——核实过CoinW
+# 公开行情接口(/v1/perpumPublic/ticker?instrument=XPT)，contract_id=195，
+# 真实挂着USDT永续合约(fair_price≈1794.51, max_leverage=120)。跟币安B
+# 系统同批上线，45分钟周期，同一份BREATH_XPT。
+ACTIVE_SYMBOLS: List[str] = ["ETH", "BTC", "XAU", "BNB", "OPENAI", "SNDK", "XPD", "XPT"]
 
 
 class SymbolConfig:
@@ -45,6 +49,7 @@ class SymbolConfig:
         "OPENAI": "OPENAI",
         "SNDK": "SNDK",
         "XPD": "XPD",
+        "XPT": "XPT",
     }
 
     # 品种精度（见上方class docstring：当前未被实际下单路径读取）
@@ -56,6 +61,7 @@ class SymbolConfig:
         "OPENAI": 2,
         "SNDK": 2,
         "XPD": 2,
+        "XPT": 2,
     }
 
     QTY_PRECISION = {
@@ -66,6 +72,7 @@ class SymbolConfig:
         "OPENAI": 4,
         "SNDK": 4,
         "XPD": 4,
+        "XPT": 4,
     }
 
     # 默认杠杆
@@ -80,6 +87,7 @@ class SymbolConfig:
         "OPENAI": 1.0,
         "SNDK": 1.0,
         "XPD": 1.0,
+        "XPT": 1.0,
     }
 
     @classmethod

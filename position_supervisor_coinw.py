@@ -125,10 +125,13 @@ WATCHDOG_STALE_SEC = float(os.getenv("WATCHDOG_STALE_SEC", "120"))   # 监控循
 # 如果以后又想重新拦截，把 WEEKEND_PAUSE_OPEN 环境变量设成 "1" 即可，
 # 不用改代码。简单按UTC周几判断（周六0点~周一0点UTC视为周末），只挡
 # "新开仓"（LONG/SHORT），不影响CLOSE/HEARTBEAT/已有仓位管理。
+# 2026-09-13：新增XPT(铂金,NYMEX/COMEX)——跟XPD同为传统贵金属期货底层，
+# 现实中同样周末休市，补进默认清单保持分类一致（机制本身仍默认关闭，
+# 加入清单不代表现在真的会拦截新开仓）。
 WEEKEND_PAUSE_OPEN_ENABLED = os.getenv("WEEKEND_PAUSE_OPEN", "0").lower() in ("1", "true", "yes")
 WEEKEND_PAUSE_SYMBOLS = {
     s.strip().upper()
-    for s in os.getenv("WEEKEND_PAUSE_SYMBOLS", "OPENAI,XPD,SNDK").split(",")
+    for s in os.getenv("WEEKEND_PAUSE_SYMBOLS", "OPENAI,XPD,SNDK,XPT").split(",")
     if s.strip()
 }
 

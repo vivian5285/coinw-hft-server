@@ -221,12 +221,46 @@ class _BreathDict(dict):
         return self
 
 
+# XPT(铂金) —— 2026-09-13新增品种，跟币安B系统同批上线，同一份45分钟
+# 校准，直接复用币安侧真实K线校准结果（91.1天2916根15m合成45分钟K线、
+# 418个真实摆动点识别回调样本）：中位数回调2.71×ATR、75分位3.91×ATR、
+# 90分位5.74×ATR，ATR%=0.13%（跟CoinW实盘XPT行情价位量级一致，均为
+# ~1800美元附近，跨交易所直接复用没有价格量级错位问题）。全新品种没有
+# 自己的历史min/max比例可循，借用同周期(45分钟)、同为贵金属商品的XPD
+# 比例(4.9/6.2=0.79)——跟币安侧BREATH_XPT完全同一份参数，方法一致故
+# 数值一致，不是巧合。
+BREATH_XPT: Dict[str, Any] = {
+    "name": "XPT",
+    "initial_sl_atr": 0.0,
+    "fee_cover_pct": 0.0008,
+    "stop_exec_buffer": 0.3,
+    "early_be_atr": 0.0,
+    "step_trigger_atr": 1.02,   # 0.375×breath_tp12
+    "step_advance_atr": 0.66,   # 0.65×step_trigger
+    "phase_switch_atr": 3.0,
+    "tp1_atr": 1.35,
+    "tp1_floor_atr": 0.0,
+    "tp2_atr": 2.5,
+    "tp2_floor_atr": 0.0,
+    "breath_tp12": 2.71,
+    "breath_tp23": 3.91,
+    "phase2_trail_mult": 1.0,
+    "min_mult": 4.7,
+    "max_mult": 6.0,
+    "ratio_floor": RATIO_FLOOR,
+    "ratio_ceiling": RATIO_CEILING,
+    "tick_size": 0.01,
+    "entry_score": 3,
+    "exit_score": 2,
+}
+
 _BY_SYMBOL: Dict[str, Dict[str, Any]] = {
     "ETH": BREATH_ETH,
     "BNB": BREATH_BNB,
     "OPENAI": BREATH_OPENAI,
     "SNDK": BREATH_SNDK,
     "XPD": BREATH_XPD,
+    "XPT": BREATH_XPT,
 }
 
 

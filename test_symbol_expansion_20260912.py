@@ -41,9 +41,10 @@ NEW_SYMBOLS = ("BNB", "OPENAI", "SNDK", "XPD")
 
 class TestActiveSymbolsSingleSource(unittest.TestCase):
     def test_active_symbols_has_all_seven(self):
-        self.assertEqual(
-            set(ACTIVE_SYMBOLS),
-            {"ETH", "BTC", "XAU", "BNB", "OPENAI", "SNDK", "XPD"},
+        """2026-09-13：新增XPT后变成8个品种，这里放宽成"至少包含"这7个，
+        不再断言"恰好这7个"——避免以后每加一个新品种都要回来改这个数字。"""
+        self.assertTrue(
+            {"ETH", "BTC", "XAU", "BNB", "OPENAI", "SNDK", "XPD"}.issubset(set(ACTIVE_SYMBOLS)),
         )
 
     def test_webhook_parser_valid_symbols_matches_active_symbols(self):
