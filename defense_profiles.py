@@ -29,14 +29,18 @@ logger = logging.getLogger(__name__)
 TIER_RISK_PCT = {0: 0.20, 1: 0.30, 2: 0.40}
 DEFAULT_RISK_PCT = 0.40
 
-# 2026-09-12 新公式（宝贝拍板，替代上面的tier缩放）：
-#   下单名义 = 本金余额 × FIXED_POSITION_PCT × FIXED_LEVERAGE_MULT
-#            = 本金余额 × 20% × 3 = 本金余额 × 0.6 名义（约0.6倍杠杆敞口）
-# 不再按 signal.tier 缩放仓位——tier 只用于硬止损的 K_tier 保护带宽度
-# （见 atr_scenario.py::calc_smart_hard_stop_price），职责拆开：
-#   仓位大小 = 固定公式；止损远近 = 按tier智能判断。
+# 2026-09-12 新公式：下单名义 = 本金余额 × FIXED_POSITION_PCT ×
+# FIXED_LEVERAGE_MULT，当天曾短暂改成"不再按tier缩放"的纯固定公式。
+# 2026-09-13再拍板：恢复按趋势强弱分档，但换成全新的一套百分比——
+# 弱40%/中50%/强60%(本金notional占比)，风险比例FIXED_POSITION_PCT仍
+# 固定20%不变，只有杠杆按档位变化(2.0/2.5/3.0x，对应20%×lev=40%/50%/60%)。
+# tier缺失/非法按最强档(60%/3.0x)兜底，跟原TIER_RISK_PCT"未知按最强档"
+# 同一个惯例。硬止损的K_tier保护带宽度(atr_scenario.py)不受这次改动
+# 影响，两件事继续分开管。币安B系统(webhook_parser.py::B_TIER_LEVERAGE)
+# 同步这份表，保持两边"仓位管理权重一样"。
 FIXED_POSITION_PCT = 0.20
-FIXED_LEVERAGE_MULT = 3.0
+FIXED_LEVERAGE_MULT = 3.0  # 保留：tier缺失/非法时的兜底杠杆(=强档)
+TIER_LEVERAGE: Dict[int, float] = {0: 2.0, 1: 2.5, 2: 3.0}
 
 
 def get_tier_risk_pct(tier) -> float:
@@ -90,20 +94,24 @@ class DefenseProfile:
 
     def calc_position_size(self, balance: float, entry_price: float, tier=None) -> float:
         """
-        2026-09-12起：下单名义 = 本金余额 × 20% × 3倍杠杆，不再按 tier 缩放
-        （宝贝拍板固定公式）。tier 参数仍保留在签名里（调用方/shadow_contest
-        等历史调用点不用改），只用于日志展示，不参与仓位计算——tier 的实际
-        作用转移到硬止损的 K_tier 保护带宽度（见 atr_scenario.py）。
+        2026-09-13起：下单名义 = 本金余额 × FIXED_POSITION_PCT(20%) ×
+        按tier查表的杠杆(TIER_LEVERAGE) = 本金×40%/50%/60%(弱/中/强)。
+        tier缺失/非法按最强档(60%)兜底。
         """
         if entry_price <= 0:
             return 0.0
-        notional = balance * FIXED_POSITION_PCT * FIXED_LEVERAGE_MULT
+        try:
+            t = int(str(tier).strip())
+        except (TypeError, ValueError):
+            t = None
+        lev = float(TIER_LEVERAGE.get(t, FIXED_LEVERAGE_MULT))
+        notional = balance * FIXED_POSITION_PCT * lev
         qty = notional / entry_price
         tier_s = str(tier).strip() if tier is not None else ""
         logger.info(
-            f"[{self.symbol}] 固定仓位公式 本金×{FIXED_POSITION_PCT:.0%}×"
-            f"{FIXED_LEVERAGE_MULT:.0f} 名义 {notional:.1f}U "
-            f"(tier={tier_s or '—'}，不影响仓位大小)  qty={qty:.6f}"
+            f"[{self.symbol}] 分档仓位公式 本金×{FIXED_POSITION_PCT:.0%}×"
+            f"{lev:.1f} 名义 {notional:.1f}U (tier={tier_s or '—(按强档兜底)'}) "
+            f"qty={qty:.6f}"
         )
         return qty
 

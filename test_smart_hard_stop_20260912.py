@@ -132,21 +132,33 @@ class TestSmartHardStopTierWidens(unittest.TestCase):
 
 
 class TestFixedPositionSizing(unittest.TestCase):
-    """defense_profiles.calc_position_size：本金×20%×3倍杠杆，不再按tier缩放。"""
+    """defense_profiles.calc_position_size：2026-09-13起恢复按tier分档——
+    弱40%/中50%/强60%(本金notional占比)，风险比例固定20%不变，只有杠杆
+    按档位变化(2.0/2.5/3.0x)。"""
 
     def setUp(self):
         self.profile = DefenseProfile("OPENAI")
 
-    def test_notional_is_20pct_times_3x_regardless_of_tier(self):
+    def test_tier_scaled_notional_40_50_60_pct(self):
         balance = 1000.0
         entry = 1500.0
-        expected_qty = (balance * 0.20 * 3.0) / entry
-        for tier in (0, 1, 2, None, "garbage"):
+        expected = {0: 0.40, 1: 0.50, 2: 0.60}
+        for tier, frac in expected.items():
             qty = self.profile.calc_position_size(balance, entry, tier)
+            expected_qty = (balance * frac) / entry
             self.assertAlmostEqual(
                 qty, expected_qty, places=8,
-                msg=f"tier={tier!r} 不应该影响仓位大小（新公式固定20%×3倍）",
+                msg=f"tier={tier} 应该对应本金×{frac:.0%}名义",
             )
+
+    def test_missing_or_invalid_tier_defaults_to_strongest(self):
+        """tier缺失/非法 → 按最强档(60%)兜底。"""
+        balance = 1000.0
+        entry = 1500.0
+        expected_qty = (balance * 0.60) / entry
+        for tier in (None, "garbage"):
+            qty = self.profile.calc_position_size(balance, entry, tier)
+            self.assertAlmostEqual(qty, expected_qty, places=8, msg=f"tier={tier!r}")
 
     def test_zero_entry_price_returns_zero(self):
         self.assertEqual(self.profile.calc_position_size(1000.0, 0), 0.0)
