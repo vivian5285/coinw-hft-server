@@ -143,6 +143,17 @@ STRUCT_CONFIRM = 3             # fractal pivot 左右各3根确认（跟本项�
 STRUCT_BUFFER_ATR = 0.3        # 摆动点缓冲垫（×ATR）
 ATR_PERIOD = 14
 
+# 2026-09-13新增：宝贝实盘发现同一笔OPENAI空单，币安B系统(tier=2强·真
+# 放量确认→wide组合)硬止损距entry约1.68×k×ATR，比CoinW(tier=0弱→tight，
+# 两边TV各自独立分析各自venue价格走势算出不同tier，不是bug)明显宽很多
+# ——根因是wide模式原来对"结构止损离多远"完全没有上限，找到的摆动点
+# 可能是60根K线窗口内很久以前的一个高点/低点，一旦离得太远，赶上开错
+# 方向会让亏损被显著放大。修复：wide模式最终距离不能超过tight基准距离
+# (k×ATR)的WIDE_MODE_CEILING_MULT倍——继续保留wide模式本意，但给"多喘
+# 的空间"设一个绝对上限。跟币安B系统(smart_hard_stop.py)完全同一份
+# 数值/同一套逻辑，两边保持一致。
+WIDE_MODE_CEILING_MULT = 1.5
+
 # 2026-09-12 v2（宝贝反复强调的点）：弱趋势该止损就止损（紧），强趋势+
 # 真放量的话要给呼吸空间（宽），不能让一个恰好离得近的摆动点把"该给宽
 # 止损"的意图吞掉。v1 里 struct/ATR 永远取"更紧的那个"(多头max/空头min)，
@@ -287,6 +298,8 @@ def calc_smart_hard_stop_price(
 
     pivot = _last_confirmed_pivot(bars, side, confirm)
 
+    wide_ceiling_dist = WIDE_MODE_CEILING_MULT * k * atr
+    ceiling_applied = False
     if side == "LONG":
         atr_stop = entry_price - k * atr
         if pivot is not None:
@@ -294,6 +307,9 @@ def calc_smart_hard_stop_price(
         else:
             struct_stop = min(float(b[3]) for b in bars)  # 找不到摆动点：简单窗口最低点兜底
         hard_sl = min(struct_stop, atr_stop) if wide_mode else max(struct_stop, atr_stop)
+        if wide_mode and (entry_price - hard_sl) > wide_ceiling_dist:
+            hard_sl = entry_price - wide_ceiling_dist
+            ceiling_applied = True
         if hard_sl >= entry_price:
             return 0.0, {}, False, f"stop_above_entry_long:{hard_sl}>={entry_price}"
     else:
@@ -303,6 +319,9 @@ def calc_smart_hard_stop_price(
         else:
             struct_stop = max(float(b[2]) for b in bars)
         hard_sl = max(struct_stop, atr_stop) if wide_mode else min(struct_stop, atr_stop)
+        if wide_mode and (hard_sl - entry_price) > wide_ceiling_dist:
+            hard_sl = entry_price + wide_ceiling_dist
+            ceiling_applied = True
         if hard_sl <= entry_price:
             return 0.0, {}, False, f"stop_below_entry_short:{hard_sl}<={entry_price}"
 
@@ -316,6 +335,8 @@ def calc_smart_hard_stop_price(
         "bars_used": len(bars),
         "volume_confirmed": vol_ok,
         "combo_mode": "wide" if wide_mode else "tight",
+        "wide_ceiling_applied": ceiling_applied,
+        "wide_ceiling_dist": round(wide_ceiling_dist, 4) if wide_mode else 0.0,
     }
     return round(hard_sl, 2), meta, True, ""
 
