@@ -139,14 +139,18 @@ DUAL_MA_EXIT_DEFAULT_INTERVAL_MIN = 45
 # 根源：DUAL_MA_EXIT/IMPULSE_EXIT这两层"聪明判断"目前只管激活*之后*的
 # 止损收紧决策，激活那一刻本身是entry锚定的纯保本公式，一旦价格触发
 # 激活线立刻实打实挂到交易所，双均线判断没机会介入这"第一次锁"的环节。
-# 方案：只在首次开仓(reentry_count==0)触发激活的那一刻，多看一眼双均线
-# 状态(跟DUAL_MA_EXIT同一份8/20判断)——如果现价还稳稳站在双均线保护内
-# (趋势没有破位迹象，最常见情形，因为能摸到激活线本身就说明行情朝有利
-# 方向走了)，就不要一步到位锁死在纯手续费保本位，改用"现价±ATR缓冲"这
-# 个更贴近当前真实波动的锚点，取两者中更宽松(更不容易被正常噪音打中)的
-# 那个——但绝不允许比综合硬止损(hard_sl_px)更松，也绝不允许比纯保本更
-# 紧。双均线判定趋势有问题(极少数情形)时直接跳过加宽，原样用现有纯
-# 保本公式，不改变现有保守默认。
+# 方案(2026-09-14首版)：只在首次开仓(reentry_count==0)触发激活的那一
+# 刻，先检查双均线是否已经确认趋势——上线当天两笔实盘复现(跟币安B系统
+# 同一批：BNBUSDT多头、XPTUSDT多头"插针触及TP1后回落"那笔)都显示：
+# 双均线用的是45分钟K线8/20周期均线，天然滞后于"价格刚摸到激活线"这个
+# 更快的瞬时判据(往往几分钟内就触发)——均线还没来得及跟上，加宽被
+# 双均线门槛拦下，等于形同虚设，两笔实盘都验证到最终锁的还是纯保本
+# 原值。
+# 2026-09-14当天改版：去掉"必须双均线先确认"这个前置门槛，只要触发了
+# 激活(本身已经证明价格朝有利方向走出了距离)，就无条件用"现价±ATR缓冲"
+# 跟纯保本位取更松的那个——真正的安全阀不是滞后的均线，而是下面两条
+# 硬性边界：绝不允许比综合硬止损(hard_sl_px)更松，也绝不允许倒退到
+# 比纯保本更紧。
 DUAL_MA_ACTIVATION_GATE_ENABLED = os.getenv("DUAL_MA_ACTIVATION_GATE", "1").lower() in ("1", "true", "yes")
 DUAL_MA_ACTIVATION_BUFFER_ATR = 0.5  # 略宽于DUAL_MA_EXIT自己收紧用的0.3，专用于首次激活加宽
 
@@ -1253,34 +1257,27 @@ class PositionSupervisorCoinW:
         return tp1_filled, tp2_filled
 
     def _dual_ma_activation_anchor(self, side: str, curr_px: float):
-        """见上方DUAL_MA_ACTIVATION_GATE_*常量顶部注释："保本激活双均线
-        加宽"。只在首次开仓触发激活的那一刻调用一次(非每tick)，判断现价
-        是否还稳稳站在双均线保护内；是的话返回一个"现价±ATR缓冲"的更宽
-        锚点供调用方跟纯保本位取更松的那个，不是的话/判断失败返回None
-        (调用方原样使用现有纯保本公式，不改变默认行为)。"""
+        """见上方DUAL_MA_ACTIVATION_GATE_*常量顶部注释："保本激活加宽"。
+        只在首次开仓触发激活的那一刻调用一次(非每tick)，返回一个"现价±
+        ATR缓冲"的更宽锚点供调用方跟纯保本位取更松的那个，无效时返回
+        None(调用方原样使用现有纯保本公式，不改变默认行为)。
+        2026-09-14改版：不再要求双均线先确认趋势——45分钟8/20均线天然
+        滞后于"刚摸到激活线"这个更快的瞬时判据，两笔实盘(跟币安B系统
+        同一批：BNB多头/XPT插针回落多头)验证均线门槛几乎总是拦下加宽，
+        形同虚设。真正的安全阀交给调用方的硬止损封顶+纯保本下限两条
+        硬性边界。"""
         if not DUAL_MA_ACTIVATION_GATE_ENABLED:
             return None
         side = str(side or "").upper()
         if side not in ("LONG", "SHORT"):
             return None
-        bars = self._fetch_dual_ma_exit_klines()
-        if not bars or len(bars) < DUAL_MA_EXIT_SLOW_LEN + 2:
-            return None
-        try:
-            from dual_ma_trend import dual_ma_trend_ok
-            ok, _meta = dual_ma_trend_ok(
-                side, bars, fast_len=DUAL_MA_EXIT_FAST_LEN, slow_len=DUAL_MA_EXIT_SLOW_LEN,
-            )
-        except Exception as e:
-            logger.debug(f"[{self.symbol}] 保本激活加宽双均线判断跳过: {e}")
-            return None
-        if not ok:
-            return None  # 双均线判定趋势有问题——极少数情形，跳过加宽，走现有纯保本
-
         st = self.radar.get_state()
         atr = float(st.initial_atr or getattr(self.radar, "_atr", 0) or 0)
         px = float(curr_px or 0)
         if atr <= 0 or px <= 0:
+            logger.info(
+                f"[{self.symbol}] 保本激活加宽跳过(atr={atr} curr_px={px} 无效) → 走现有纯保本"
+            )
             return None
         if side == "LONG":
             return px - DUAL_MA_ACTIVATION_BUFFER_ATR * atr
@@ -2042,6 +2039,62 @@ class PositionSupervisorCoinW:
                     hard_sl = slx
         except Exception as e:
             logger.warning(f"启动恢复：查TPSL失败 {e}")
+
+        # 2026-09-14新增：addTpsl记录里没查到硬止损，不代表真的裸仓——
+        # 持仓自身还有一个独立的止损标量字段(stopLossPrice，跟addTpsl是
+        # 两套不同的止损系统，见coinw_client.py::get_tp_sl_info顶部注释)，
+        # 先认这个，避免把"用另一套机制挂过止损"的仓位误判成裸仓、重复
+        # 现算一遍。
+        if hard_sl <= 0:
+            try:
+                scalar_sl = float(pos.get("stopLossPrice") or 0)
+                if scalar_sl > 0:
+                    hard_sl = scalar_sl
+            except (TypeError, ValueError):
+                pass
+
+        # 2026-09-14新增：实盘复现(XAUUSDT/XPTUSDT，宝贝手工在CoinW APP
+        # 补开仓位)——两套止损记录都查不到时，此前直接原样记0，形同裸仓
+        # 交给下游"裸单守护"，但裸单守护只会重挂一个已经算好、缓存在
+        # 账本里的止损价，对手工开的仓位从没算过，等于什么都不做。这里
+        # 改成：查不到任何已有止损时，现拉真实K线、用综合硬止损公式
+        # (结构摆动点+ATR分档，固定按tier=1中档估算——手工仓位没有TV原始
+        # tier信息)现算一个，立刻挂到交易所，不再指望下游"重挂缓存值"
+        # 这条路补上。
+        if hard_sl <= 0 and entry > 0:
+            try:
+                bars = self._fetch_dual_ma_exit_klines()
+                from atr_scenario import calc_smart_hard_stop_price
+                computed, meta, calc_ok, err = calc_smart_hard_stop_price(
+                    side, entry, bars or [], tier=1,
+                )
+            except Exception as e:
+                computed, calc_ok, err = 0.0, False, str(e)
+                meta = {}
+            if calc_ok and computed > 0:
+                try:
+                    self.client.set_sl_tp(
+                        position_id=pid, instrument=self.symbol,
+                        stop_loss_price=round(computed, 2),
+                    )
+                    hard_sl = computed
+                    logger.warning(
+                        f"启动恢复：交易所无任何止损记录(疑似手工开仓)，"
+                        f"现算综合硬止损并挂上 @{hard_sl:.2f} | {meta}"
+                    )
+                    self._safe_alert(
+                        f"检测到无保护仓位(可能是手工开仓)：{side} {amt} @{entry} "
+                        f"→ 已自动计算并挂上综合硬止损 @{hard_sl:.2f}"
+                    )
+                except Exception as e:
+                    logger.error(f"启动恢复：现算硬止损后挂单失败 {e}")
+                    self._safe_alert(
+                        f"⚠️ 检测到无保护仓位且自动挂止损失败({e})，请立即人工核查！"
+                        f"建议止损价 @{computed:.2f}"
+                    )
+            else:
+                logger.error(f"启动恢复：交易所无止损且综合硬止损计算失败({err})，仍为裸仓")
+                self._safe_alert(f"⚠️ 检测到无保护仓位且自动计算硬止损失败({err})，请立即人工核查！")
 
         self.pipeline.sync_position(side=side, qty=amt, entry=entry,
                                     position_id=pid, allow_initial=True)
