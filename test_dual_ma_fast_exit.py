@@ -123,6 +123,24 @@ class TestDualMaFastExit(unittest.TestCase):
         tightened = s._update_radar_sl.call_args[0][0]
         self.assertAlmostEqual(tightened, round(close_px + 0.3 * 2.0, 2), places=2)
 
+    def test_soft_tighten_never_weaker_than_breakeven(self):
+        """2026-09-13新增(宝贝拍板："双均线权重大于反转锁盈")：破位但放量
+        未确认时，收紧结果不能比反转锁利本来会给的保本线更松——entry=100
+        的SHORT，close刚好拉回到100(close+0.3×ATR=100.6比保本价99.91
+        更松)，最终应该采用更紧的保本价99.91。"""
+        s = _mk_supervisor()
+        s.pipeline.data["entry"] = 100.0
+        s.radar.get_state.return_value = _FakeRadarState(current_sl=200.0, initial_atr=2.0)
+        bars = _make_bars(decline_n=25, decline_step=-1.0, rally_n=10, rally_step=1.0,
+                           start=115.0, surge=False)
+        self.assertEqual(bars[-1][4], 100.0)
+        s.client.get_klines = MagicMock(return_value=bars)
+        s._maybe_fast_exit_on_dual_ma_break(bars[-1][4])
+        s._clear_position.assert_not_called()
+        s._update_radar_sl.assert_called_once()
+        tightened = s._update_radar_sl.call_args[0][0]
+        self.assertAlmostEqual(tightened, 99.91, places=2)
+
     def test_break_confirmed_same_bar_not_retriggered(self):
         s = _mk_supervisor()
         bars = _make_bars(decline_n=40, rally_n=10, surge=True)

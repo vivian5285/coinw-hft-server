@@ -1125,21 +1125,24 @@ class PositionSupervisorCoinW:
                 if new_sl:
                     self._update_radar_sl(new_sl)
 
-                # 5) 反转锁利：4h 逆向放量反转 + 浮盈中 -> 收保本
-                if REVLOCK_ENABLED:
-                    try:
-                        self._apply_reversal_lock(current_price)
-                    except Exception as _e:
-                        logger.debug(f"反转锁利异常: {_e}")
-
-                # 5.5) 双均线破位快速平仓——见DUAL_MA_EXIT_*常量顶部注释。
-                # 跟反转锁利同一个位置、职责不同：反转锁利只朝有利方向棘轮
-                # 到保本价，这个检查真放量确认破位时会直接清仓。
+                # 5) 双均线破位快速平仓——见DUAL_MA_EXIT_*常量顶部注释。故意
+                # 排在反转锁利**之前**调用——宝贝原话"双均线权重大于反转
+                # 锁利，因为它是最快速反应市场趋势的、最敏捷的一个"，优先
+                # 让双均线先判断。真放量确认破位时直接清仓；没确认时收紧到
+                # 至少不低于保本线(内部顺带算了一次跟反转锁利同一个保本
+                # 公式，取更紧的那个)。
                 if DUAL_MA_EXIT_ENABLED:
                     try:
                         self._maybe_fast_exit_on_dual_ma_break(current_price)
                     except Exception as _e:
                         logger.debug(f"双均线破位快速平仓异常: {_e}")
+
+                # 5.5) 反转锁利：4h 逆向放量反转 + 浮盈中 -> 收保本
+                if REVLOCK_ENABLED:
+                    try:
+                        self._apply_reversal_lock(current_price)
+                    except Exception as _e:
+                        logger.debug(f"反转锁利异常: {_e}")
 
                 # 每 ~60s 打一条监控存活/状态日志（冒烟/复盘可见）
                 if self._naked_tick % 15 == 0:
@@ -1504,16 +1507,38 @@ class PositionSupervisorCoinW:
 
         # 放量没确认——疑似假突破，不强平，只适度收紧止损到破位K线收盘价
         # 附近，给行情一点时间验证是否真反转。
+        # 2026-09-13再补充(宝贝拍板："双均线权重大于反转锁盈，因为它是
+        # 最快速反应市场趋势的、最敏捷的一个")：顺带把保本价(跟
+        # _apply_reversal_lock同一个initial_stop_price公式)也算进来，两个
+        # 候选取更紧的那个——哪怕这次放量没确认，双均线自己给出的破位
+        # 判断也至少要收紧到反转锁盈本来会给的保本线，不能因为"没放量
+        # 确认"就比反转锁盈更保守。
         st = self.radar.get_state()
         atr = float(st.initial_atr or getattr(self.radar, "_atr", 0) or 0)
         if atr <= 0:
             return
         cur = float(st.current_sl or 0)
         if side == "LONG":
-            tighter = round(close_px - DUAL_MA_EXIT_SOFT_TIGHTEN_BUFFER_ATR * atr, 2)
+            tighter = close_px - DUAL_MA_EXIT_SOFT_TIGHTEN_BUFFER_ATR * atr
+        else:
+            tighter = close_px + DUAL_MA_EXIT_SOFT_TIGHTEN_BUFFER_ATR * atr
+        entry = float(self.pipeline.data.get("entry") or 0)
+        if entry > 0:
+            try:
+                from breath_stop import initial_stop_price
+                from breath_profiles import get_breath_profile
+                breakeven = float(initial_stop_price(
+                    side, entry, atr, profile=get_breath_profile(self.symbol),
+                ) or 0)
+            except Exception:
+                breakeven = 0.0
+            if breakeven > 0:
+                # 更紧(更保护)的那个胜出：多头更高的价更紧，空头更低的价更紧。
+                tighter = max(tighter, breakeven) if side == "LONG" else min(tighter, breakeven)
+        tighter = round(tighter, 2)
+        if side == "LONG":
             improved = tighter > cur
         else:
-            tighter = round(close_px + DUAL_MA_EXIT_SOFT_TIGHTEN_BUFFER_ATR * atr, 2)
             improved = cur <= 0 or tighter < cur
         if not improved:
             return
@@ -1521,7 +1546,7 @@ class PositionSupervisorCoinW:
         self._update_radar_sl(tighter)
         logger.info(
             f"[{self.symbol}] 双均线破位但放量未确认(疑似假突破) | {side} | "
-            f"close={close_px:.4f} → 止损适度收紧 {cur}→{tighter}，暂不强平"
+            f"close={close_px:.4f} → 止损适度收紧 {cur}→{tighter}(不低于保本线)，暂不强平"
         )
 
     def _do_reentry(self, ex: dict, px: float, bars_150: list):
