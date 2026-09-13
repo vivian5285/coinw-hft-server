@@ -129,6 +129,27 @@ DUAL_MA_EXIT_INTERVAL_MIN = {
 }
 DUAL_MA_EXIT_DEFAULT_INTERVAL_MIN = 45
 
+# 2026-09-14新增(宝贝拍板，跟币安B系统同步实施)："保本激活双均线加宽"。
+# 背景：实盘复现(XPTUSDT)——同一笔TV信号币安B/CoinW同时开空，币安B的
+# 雷达激活公式(initial_stop_price: entry∓tick∓fee)完全按entry锚定、不看
+# 现价/ATR/趋势结构，价格才刚朝有利方向走一点点就摸到激活线，止损立刻
+# 锁死在纯手续费保本位，随后一次很正常的回踩就把这条贴着保本的止损打
+# 穿，只赚了一点点就出局。CoinW用的是同一个initial_stop_price公式，
+# 理论上有一样的风险，只是这次巧合没先摸到自己的激活线才躲过。
+# 根源：DUAL_MA_EXIT/IMPULSE_EXIT这两层"聪明判断"目前只管激活*之后*的
+# 止损收紧决策，激活那一刻本身是entry锚定的纯保本公式，一旦价格触发
+# 激活线立刻实打实挂到交易所，双均线判断没机会介入这"第一次锁"的环节。
+# 方案：只在首次开仓(reentry_count==0)触发激活的那一刻，多看一眼双均线
+# 状态(跟DUAL_MA_EXIT同一份8/20判断)——如果现价还稳稳站在双均线保护内
+# (趋势没有破位迹象，最常见情形，因为能摸到激活线本身就说明行情朝有利
+# 方向走了)，就不要一步到位锁死在纯手续费保本位，改用"现价±ATR缓冲"这
+# 个更贴近当前真实波动的锚点，取两者中更宽松(更不容易被正常噪音打中)的
+# 那个——但绝不允许比综合硬止损(hard_sl_px)更松，也绝不允许比纯保本更
+# 紧。双均线判定趋势有问题(极少数情形)时直接跳过加宽，原样用现有纯
+# 保本公式，不改变现有保守默认。
+DUAL_MA_ACTIVATION_GATE_ENABLED = os.getenv("DUAL_MA_ACTIVATION_GATE", "1").lower() in ("1", "true", "yes")
+DUAL_MA_ACTIVATION_BUFFER_ATR = 0.5  # 略宽于DUAL_MA_EXIT自己收紧用的0.3，专用于首次激活加宽
+
 # 2026-09-13再新增(宝贝实盘截图复盘BNBUSDT.P发现)："突发放量反转K线快速
 # 锁保本"——三层防线里最快的一层，跟币安B系统(eth-webhook-server同名
 # commit)同步实施。背景：等K线收盘价真正站上/跌破双均线才反应，对一根
@@ -1125,7 +1146,7 @@ class PositionSupervisorCoinW:
                 if not self.radar.get_state().activated:
                     should, reason = self.radar.should_activate(current_price)
                     if should:
-                        self._activate_radar()
+                        self._activate_radar(current_price)
 
                 # 4) 雷达止损更新（币安 v2.1 价格分区 + regime 自适应 + 三条硬地板 + tp2_patience）
                 profile = self._regime_profile(breath_profiles.get_breath_profile(self.symbol))
@@ -1231,7 +1252,41 @@ class PositionSupervisorCoinW:
 
         return tp1_filled, tp2_filled
 
-    def _activate_radar(self):
+    def _dual_ma_activation_anchor(self, side: str, curr_px: float):
+        """见上方DUAL_MA_ACTIVATION_GATE_*常量顶部注释："保本激活双均线
+        加宽"。只在首次开仓触发激活的那一刻调用一次(非每tick)，判断现价
+        是否还稳稳站在双均线保护内；是的话返回一个"现价±ATR缓冲"的更宽
+        锚点供调用方跟纯保本位取更松的那个，不是的话/判断失败返回None
+        (调用方原样使用现有纯保本公式，不改变默认行为)。"""
+        if not DUAL_MA_ACTIVATION_GATE_ENABLED:
+            return None
+        side = str(side or "").upper()
+        if side not in ("LONG", "SHORT"):
+            return None
+        bars = self._fetch_dual_ma_exit_klines()
+        if not bars or len(bars) < DUAL_MA_EXIT_SLOW_LEN + 2:
+            return None
+        try:
+            from dual_ma_trend import dual_ma_trend_ok
+            ok, _meta = dual_ma_trend_ok(
+                side, bars, fast_len=DUAL_MA_EXIT_FAST_LEN, slow_len=DUAL_MA_EXIT_SLOW_LEN,
+            )
+        except Exception as e:
+            logger.debug(f"[{self.symbol}] 保本激活加宽双均线判断跳过: {e}")
+            return None
+        if not ok:
+            return None  # 双均线判定趋势有问题——极少数情形，跳过加宽，走现有纯保本
+
+        st = self.radar.get_state()
+        atr = float(st.initial_atr or getattr(self.radar, "_atr", 0) or 0)
+        px = float(curr_px or 0)
+        if atr <= 0 or px <= 0:
+            return None
+        if side == "LONG":
+            return px - DUAL_MA_ACTIVATION_BUFFER_ATR * atr
+        return px + DUAL_MA_ACTIVATION_BUFFER_ATR * atr
+
+    def _activate_radar(self, curr_px: float = 0.0):
         """激活雷达"""
         import breath_profiles
         entry_price = float(self.pipeline.data.get("entry", 0) or 0)
@@ -1253,6 +1308,33 @@ class PositionSupervisorCoinW:
         initial_sl = self.radar.get_state().current_sl
         if not initial_sl or initial_sl <= 0:
             initial_sl = entry_price - 0.01 if direction == "LONG" else entry_price + 0.01
+
+        # 2026-09-14新增：见上方DUAL_MA_ACTIVATION_GATE_*常量顶部注释"保本
+        # 激活双均线加宽"。只对首次开仓生效(重入沿用现有更严格的纯保本，
+        # 不做加宽)。
+        if int(self.radar.get_state().reentry_count or 0) == 0:
+            try:
+                widened = self._dual_ma_activation_anchor(direction, curr_px)
+            except Exception as e:
+                widened = None
+                logger.debug(f"[{self.symbol}] 保本激活加宽异常跳过: {e}")
+            if widened is not None and widened > 0:
+                hard_ceiling = float(self.pipeline.data.get("hard_sl_px") or 0)
+                if direction == "LONG":
+                    final_sl = min(initial_sl, widened)
+                    if hard_ceiling > 0:
+                        final_sl = max(final_sl, hard_ceiling)
+                else:
+                    final_sl = max(initial_sl, widened)
+                    if hard_ceiling > 0:
+                        final_sl = min(final_sl, hard_ceiling)
+                if abs(final_sl - initial_sl) > 1e-9:
+                    logger.info(
+                        f"[{self.symbol}] 保本激活双均线加宽 {initial_sl:.4f}→{final_sl:.4f} "
+                        f"(双均线趋势仍成立，现价±{DUAL_MA_ACTIVATION_BUFFER_ATR}×ATR更宽)"
+                    )
+                initial_sl = final_sl
+                self.radar.seed_stop(final_sl)
 
         self.client.set_sl_tp(
             position_id=position_id,
