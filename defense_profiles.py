@@ -34,13 +34,17 @@ DEFAULT_RISK_PCT = 0.40
 # 2026-09-13再拍板：恢复按趋势强弱分档，但换成全新的一套百分比——
 # 弱40%/中50%/强60%(本金notional占比)，风险比例FIXED_POSITION_PCT仍
 # 固定20%不变，只有杠杆按档位变化(2.0/2.5/3.0x，对应20%×lev=40%/50%/60%)。
-# tier缺失/非法按最强档(60%/3.0x)兜底，跟原TIER_RISK_PCT"未知按最强档"
-# 同一个惯例。硬止损的K_tier保护带宽度(atr_scenario.py)不受这次改动
-# 影响，两件事继续分开管。币安B系统(webhook_parser.py::B_TIER_LEVERAGE)
-# 同步这份表，保持两边"仓位管理权重一样"。
+# tier缺失/非法按最强档兜底，跟原TIER_RISK_PCT"未知按最强档"同一个
+# 惯例。硬止损的K_tier保护带宽度(atr_scenario.py)不受这次改动影响，
+# 两件事继续分开管。币安B系统(webhook_parser.py::B_TIER_LEVERAGE)同步
+# 这份表，保持两边"仓位管理权重一样"。
+# 2026-09-14再下调：宝贝拍板"币种有点多，仓位都下降"——弱/中/强三档
+# 从40%/50%/60%整体收窄到10%/15%/20%，风险比例仍20%不变，杠杆查表
+# 从2.0/2.5/3.0统一下调到0.5/0.75/1.0(=20%×0.5/0.75/1.0=10%/15%/20%)。
+# 同一天同一批币安B系统一起改，保持两边权重继续一致。
 FIXED_POSITION_PCT = 0.20
-FIXED_LEVERAGE_MULT = 3.0  # 保留：tier缺失/非法时的兜底杠杆(=强档)
-TIER_LEVERAGE: Dict[int, float] = {0: 2.0, 1: 2.5, 2: 3.0}
+FIXED_LEVERAGE_MULT = 1.0  # 保留：tier缺失/非法时的兜底杠杆(=强档)
+TIER_LEVERAGE: Dict[int, float] = {0: 0.5, 1: 0.75, 2: 1.0}
 
 
 def get_tier_risk_pct(tier) -> float:

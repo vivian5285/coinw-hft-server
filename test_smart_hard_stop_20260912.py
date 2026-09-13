@@ -139,10 +139,10 @@ class TestFixedPositionSizing(unittest.TestCase):
     def setUp(self):
         self.profile = DefenseProfile("OPENAI")
 
-    def test_tier_scaled_notional_40_50_60_pct(self):
+    def test_tier_scaled_notional_10_15_20_pct(self):
         balance = 1000.0
         entry = 1500.0
-        expected = {0: 0.40, 1: 0.50, 2: 0.60}
+        expected = {0: 0.10, 1: 0.15, 2: 0.20}
         for tier, frac in expected.items():
             qty = self.profile.calc_position_size(balance, entry, tier)
             expected_qty = (balance * frac) / entry
@@ -152,10 +152,10 @@ class TestFixedPositionSizing(unittest.TestCase):
             )
 
     def test_missing_or_invalid_tier_defaults_to_strongest(self):
-        """tier缺失/非法 → 按最强档(60%)兜底。"""
+        """tier缺失/非法 → 按最强档(20%)兜底。"""
         balance = 1000.0
         entry = 1500.0
-        expected_qty = (balance * 0.60) / entry
+        expected_qty = (balance * 0.20) / entry
         for tier in (None, "garbage"):
             qty = self.profile.calc_position_size(balance, entry, tier)
             self.assertAlmostEqual(qty, expected_qty, places=8, msg=f"tier={tier!r}")

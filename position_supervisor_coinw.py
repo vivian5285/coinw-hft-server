@@ -578,6 +578,14 @@ class PositionSupervisorCoinW:
                         and not self._hard_sl_present():
                     sl = float(self.pipeline.data.get("hard_sl_px") or 0)
                     pid = self.pipeline.data.get("position_id")
+                    entry_px = float(self.pipeline.data.get("entry") or 0)
+                    if sl <= 0 and entry_px > 0 and live and pid:
+                        sl = self._compute_fresh_hard_stop(
+                            side=live, entry=entry_px, amt=have, pid=pid,
+                            source="心跳(无side)裸单守护",
+                        )
+                        return {"ok": True, "status": "heartbeat",
+                                "action": "computed_sl" if sl > 0 else "computed_sl_failed", "sl": sl}
                     if sl > 0 and pid:
                         self.client.set_sl_tp(position_id=pid, instrument=self.symbol,
                                               stop_loss_price=round(sl, 2))
@@ -609,8 +617,25 @@ class PositionSupervisorCoinW:
             if have != 0 and live == hb_side:
                 if NAKED_GUARD_ENABLED and not self.radar.get_state().activated \
                         and not self._hard_sl_present():
-                    sl = float(self.pipeline.data.get("hard_sl_px") or 0) or float(signal.stop_loss or 0)
+                    sl = float(self.pipeline.data.get("hard_sl_px") or 0)
                     pid = self.pipeline.data.get("position_id")
+                    entry_px = float(self.pipeline.data.get("entry") or hb_entry or 0)
+                    if sl <= 0 and entry_px > 0 and pid:
+                        # 2026-09-14修复(实盘复现XRPUSDT，止损被TV自己的
+                        # stop_loss参考带成过紧的1.35，entry=1.3547只有
+                        # 0.35%距离)：这里原来查不到hard_sl_px就直接退回
+                        # signal.stop_loss(TV心跳自带的止损参考)当成我们
+                        # 自己的综合硬止损去挂——TV这个字段是它自己Pine
+                        # 脚本内部逻辑算出来的，跟我们结构摆动点+ATR分档
+                        # 的方法论完全不同，可能过紧也可能过松，不该被
+                        # 当成综合硬止损直接采信。改成现算，详见
+                        # _compute_fresh_hard_stop顶部注释。
+                        sl = self._compute_fresh_hard_stop(
+                            side=hb_side, entry=entry_px, amt=have, pid=pid,
+                            source="心跳裸单守护",
+                        )
+                        return {"ok": True, "status": "heartbeat",
+                                "action": "computed_sl" if sl > 0 else "computed_sl_failed", "sl": sl}
                     if sl > 0 and pid:
                         self.client.set_sl_tp(position_id=pid, instrument=self.symbol,
                                               stop_loss_price=round(sl, 2))
@@ -1999,6 +2024,62 @@ class PositionSupervisorCoinW:
             logger.warning(f"重算ATR失败: {e}")
             return 0.0
 
+    def _compute_fresh_hard_stop(self, side, entry, amt, pid, source=""):
+        """2026-09-14新增：查不到任何已有止损(addTpsl记录+position自身
+        stopLossPrice标量都没有)时的统一兜底——现拉真实K线，用综合硬
+        止损公式(结构摆动点+ATR分档，固定tier=1中档估算)现算一个并
+        立刻挂到交易所。recover_on_start()和_handle_heartbeat()的裸单
+        守护共用这一份，不再各自为政、各写各的口径。
+
+        2026-09-14实盘复现(XRPUSDT)：_handle_heartbeat()原来查不到
+        hard_sl_px时会直接退回`signal.stop_loss`(TV心跳自带的止损参考)
+        当成我们自己的综合硬止损去挂——TV这个字段是它自己Pine脚本内部
+        的止损逻辑算出来的，跟我们综合硬止损(结构摆动点+ATR分档)是两套
+        完全不同的方法论，可能松可能紧，这次实盘就复现了一次明显过紧
+        (entry=1.3547，TV给的止损只有1.35，距离仅0.35%，一个正常波动
+        就会打穿)。改成两条路都统一现算综合硬止损，不再把TV自己的
+        止损参考直接当成我们的硬止损用。
+
+        返回计算成功挂上的止损价，失败返回0(调用方据此判断是否仍是
+        裸仓)。"""
+        try:
+            bars = self._fetch_dual_ma_exit_klines()
+            from atr_scenario import calc_smart_hard_stop_price
+            computed, meta, calc_ok, err = calc_smart_hard_stop_price(
+                side, entry, bars or [], tier=1,
+            )
+        except Exception as e:
+            computed, calc_ok, err = 0.0, False, str(e)
+            meta = {}
+        if calc_ok and computed > 0:
+            try:
+                self.client.set_sl_tp(
+                    position_id=pid, instrument=self.symbol,
+                    stop_loss_price=round(computed, 2),
+                )
+                logger.warning(
+                    f"{source}：交易所无任何止损记录，现算综合硬止损并"
+                    f"挂上 @{computed:.2f} | {meta}"
+                )
+                self._safe_alert(
+                    f"检测到无保护仓位：{side} {amt} @{entry} → 已自动"
+                    f"计算并挂上综合硬止损 @{computed:.2f} | {source}"
+                )
+                return float(computed)
+            except Exception as e:
+                logger.error(f"{source}：现算硬止损后挂单失败 {e}")
+                self._safe_alert(
+                    f"⚠️ 检测到无保护仓位且自动挂止损失败({e})，请立即人工"
+                    f"核查！建议止损价 @{computed:.2f} | {source}"
+                )
+                return 0.0
+        logger.error(f"{source}：交易所无止损且综合硬止损计算失败({err})，仍为裸仓")
+        self._safe_alert(
+            f"⚠️ 检测到无保护仓位且自动计算硬止损失败({err})，请立即人工"
+            f"核查！| {source}"
+        )
+        return 0.0
+
     def recover_on_start(self):
         """引擎重启时，如交易所仍有在场持仓，重建 pipeline + 雷达并恢复监控。
         止损锚定交易所现值（只进不退），绝不因恢复而放松。"""
@@ -2057,44 +2138,14 @@ class PositionSupervisorCoinW:
         # 补开仓位)——两套止损记录都查不到时，此前直接原样记0，形同裸仓
         # 交给下游"裸单守护"，但裸单守护只会重挂一个已经算好、缓存在
         # 账本里的止损价，对手工开的仓位从没算过，等于什么都不做。这里
-        # 改成：查不到任何已有止损时，现拉真实K线、用综合硬止损公式
-        # (结构摆动点+ATR分档，固定按tier=1中档估算——手工仓位没有TV原始
-        # tier信息)现算一个，立刻挂到交易所，不再指望下游"重挂缓存值"
-        # 这条路补上。
+        # 改成：查不到任何已有止损时，现拉真实K线、用综合硬止损公式现算
+        # 一个，立刻挂到交易所，不再指望下游"重挂缓存值"这条路补上——
+        # 抽成_compute_fresh_hard_stop()共用方法，_handle_heartbeat()的
+        # 裸单守护也复用同一份(见其顶部注释)，不再各自为政。
         if hard_sl <= 0 and entry > 0:
-            try:
-                bars = self._fetch_dual_ma_exit_klines()
-                from atr_scenario import calc_smart_hard_stop_price
-                computed, meta, calc_ok, err = calc_smart_hard_stop_price(
-                    side, entry, bars or [], tier=1,
-                )
-            except Exception as e:
-                computed, calc_ok, err = 0.0, False, str(e)
-                meta = {}
-            if calc_ok and computed > 0:
-                try:
-                    self.client.set_sl_tp(
-                        position_id=pid, instrument=self.symbol,
-                        stop_loss_price=round(computed, 2),
-                    )
-                    hard_sl = computed
-                    logger.warning(
-                        f"启动恢复：交易所无任何止损记录(疑似手工开仓)，"
-                        f"现算综合硬止损并挂上 @{hard_sl:.2f} | {meta}"
-                    )
-                    self._safe_alert(
-                        f"检测到无保护仓位(可能是手工开仓)：{side} {amt} @{entry} "
-                        f"→ 已自动计算并挂上综合硬止损 @{hard_sl:.2f}"
-                    )
-                except Exception as e:
-                    logger.error(f"启动恢复：现算硬止损后挂单失败 {e}")
-                    self._safe_alert(
-                        f"⚠️ 检测到无保护仓位且自动挂止损失败({e})，请立即人工核查！"
-                        f"建议止损价 @{computed:.2f}"
-                    )
-            else:
-                logger.error(f"启动恢复：交易所无止损且综合硬止损计算失败({err})，仍为裸仓")
-                self._safe_alert(f"⚠️ 检测到无保护仓位且自动计算硬止损失败({err})，请立即人工核查！")
+            hard_sl = self._compute_fresh_hard_stop(
+                side=side, entry=entry, amt=amt, pid=pid, source="启动恢复",
+            )
 
         self.pipeline.sync_position(side=side, qty=amt, entry=entry,
                                     position_id=pid, allow_initial=True)

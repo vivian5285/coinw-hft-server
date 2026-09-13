@@ -96,7 +96,7 @@ class TestNakedManualPositionGetsFreshHardStop(unittest.TestCase):
         # recover_on_start末尾还有一条既有的"重建监控"汇总报警，这里只关心
         # 我方新增的"检测到无保护仓位"这一条确实发出去了。
         alert_texts = [c[0][0] for c in s._safe_alert.call_args_list]
-        self.assertTrue(any("手工开仓" in t for t in alert_texts))
+        self.assertTrue(any("检测到无保护仓位" in t for t in alert_texts))
 
     def test_position_scalar_stop_loss_price_respected_no_recompute(self):
         """position自身已经带着stopLossPrice标量(另一套止损系统)——直接
