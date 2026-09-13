@@ -121,8 +121,10 @@ DUAL_MA_EXIT_SOFT_TIGHTEN_BUFFER_ATR = 0.3
 DUAL_MA_EXIT_NATIVE_BASE_MIN = 15  # CoinW原生支持15/120，45/75靠15合成(×3/×5)
 # 每个品种自己真实的TV周期——同一份数值跟币安B系统
 # (radar_reentry_mixin.py::DUAL_MA_EXIT_INTERVAL_MIN)保持一致。
+# 2026-09-13：OPENAI从120分钟改成45分钟(宝贝把TV alert周期改了，跟其余
+# 品种统一，实盘目前只剩SNDK还是75分钟)。
 DUAL_MA_EXIT_INTERVAL_MIN = {
-    "BNB": 45, "XPD": 45, "SNDK": 75, "OPENAI": 120, "XAU": 45, "XPT": 45,
+    "BNB": 45, "XPD": 45, "SNDK": 75, "OPENAI": 45, "XAU": 45, "XPT": 45,
     "XRP": 45, "SOL": 45,
 }
 DUAL_MA_EXIT_DEFAULT_INTERVAL_MIN = 45

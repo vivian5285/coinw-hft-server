@@ -30,7 +30,9 @@ import position_supervisor_coinw as psc  # noqa: E402
 
 
 def _make_bars(decline_n=40, decline_step=-1.0, rally_n=10, rally_step=3.0,
-               start=100.0, surge=False, period_min=120):
+               start=100.0, surge=False, period_min=15):
+    # 2026-09-13：默认符号OPENAI从120分钟(原生直取)改成45分钟(15分钟合成)
+    # 后，默认K线间距也要跟着从120改成15，否则合成分桶对不上时间戳。
     bars = []
     t0 = 1_700_000_000_000
     period_ms = period_min * 60 * 1000
@@ -95,7 +97,10 @@ class TestDualMaFastExit(unittest.TestCase):
         """空头仍在双均线下方(纯下跌，没有拉回)——不触发任何动作。"""
         s = _mk_supervisor()
         bars = _make_bars(decline_n=50, rally_n=0)
-        s.client.get_klines = MagicMock(return_value=bars)
+        # 2026-09-13：直接mock _fetch_dual_ma_exit_klines(已合成好的最终
+        # K线)，跟趋势判定逻辑本身解耦，不受默认符号OPENAI改45分钟(15分钟
+        # 合成)影响——同test_impulse_candle_lock.py已验证过的手法。
+        s._fetch_dual_ma_exit_klines = MagicMock(return_value=bars)
         s._maybe_fast_exit_on_dual_ma_break(bars[-1][4])
         s._clear_position.assert_not_called()
         s._update_radar_sl.assert_not_called()
@@ -104,7 +109,7 @@ class TestDualMaFastExit(unittest.TestCase):
         """空头收盘价拉回站上双均线 + 真实放量确认 → 直接清仓。"""
         s = _mk_supervisor()
         bars = _make_bars(decline_n=40, rally_n=10, surge=True)
-        s.client.get_klines = MagicMock(return_value=bars)
+        s._fetch_dual_ma_exit_klines = MagicMock(return_value=bars)
         s._maybe_fast_exit_on_dual_ma_break(bars[-1][4])
         s._clear_position.assert_called_once()
         self.assertIn("双均线破位", s._clear_position.call_args[0][0])
@@ -116,7 +121,7 @@ class TestDualMaFastExit(unittest.TestCase):
         s.radar.get_state.return_value = _FakeRadarState(current_sl=999.0, initial_atr=2.0)
         bars = _make_bars(decline_n=40, rally_n=10, surge=False)
         close_px = bars[-1][4]
-        s.client.get_klines = MagicMock(return_value=bars)
+        s._fetch_dual_ma_exit_klines = MagicMock(return_value=bars)
         s._maybe_fast_exit_on_dual_ma_break(close_px)
         s._clear_position.assert_not_called()
         s._update_radar_sl.assert_called_once()
@@ -134,7 +139,7 @@ class TestDualMaFastExit(unittest.TestCase):
         bars = _make_bars(decline_n=25, decline_step=-1.0, rally_n=10, rally_step=1.0,
                            start=115.0, surge=False)
         self.assertEqual(bars[-1][4], 100.0)
-        s.client.get_klines = MagicMock(return_value=bars)
+        s._fetch_dual_ma_exit_klines = MagicMock(return_value=bars)
         s._maybe_fast_exit_on_dual_ma_break(bars[-1][4])
         s._clear_position.assert_not_called()
         s._update_radar_sl.assert_called_once()
@@ -144,7 +149,7 @@ class TestDualMaFastExit(unittest.TestCase):
     def test_break_confirmed_same_bar_not_retriggered(self):
         s = _mk_supervisor()
         bars = _make_bars(decline_n=40, rally_n=10, surge=True)
-        s.client.get_klines = MagicMock(return_value=bars)
+        s._fetch_dual_ma_exit_klines = MagicMock(return_value=bars)
         s._maybe_fast_exit_on_dual_ma_break(bars[-1][4])
         s._dual_ma_exit_last_check_ts = 0.0  # 模拟节流窗口已过期
         s._maybe_fast_exit_on_dual_ma_break(bars[-1][4])
@@ -157,13 +162,15 @@ class TestDualMaFastExit(unittest.TestCase):
         s._maybe_fast_exit_on_dual_ma_break(90.0)
         s.client.get_klines.assert_not_called()
 
-    def test_uses_native_120_for_openai_no_synthesis(self):
+    def test_synthesizes_45m_from_15m_for_openai(self):
+        """2026-09-13起：OPENAI从120分钟改成45分钟，不再原生直取，改用
+        15分钟合成(跟BNB/XPD/XAU/XPT/XRP/SOL同一套)。"""
         s = _mk_supervisor(symbol="OPENAI")
-        bars = _make_bars(decline_n=50, rally_n=0)
+        bars = _make_bars(decline_n=50, rally_n=0, period_min=15)
         s.client.get_klines = MagicMock(return_value=bars)
         s._maybe_fast_exit_on_dual_ma_break(bars[-1][4])
         args, kwargs = s.client.get_klines.call_args
-        self.assertEqual(args, (self._sym_or("OPENAI"), 120, 80))
+        self.assertEqual(args[1], 15)  # 用15分钟原生base
 
     def test_synthesizes_45m_from_15m_for_bnb(self):
         s = _mk_supervisor(symbol="BNB")
