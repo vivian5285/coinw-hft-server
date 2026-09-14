@@ -83,14 +83,21 @@ TREND_REENTRY_ENABLED = os.getenv("TREND_REENTRY_ENABLED", "1").lower() in ("1",
 TREND_REENTRY_FAST_LEN = int(os.getenv("TREND_REENTRY_FAST_LEN", "15"))
 TREND_REENTRY_SLOW_LEN = int(os.getenv("TREND_REENTRY_SLOW_LEN", "30"))
 TREND_REENTRY_MA_TYPE = os.getenv("TREND_REENTRY_MA_TYPE", "SMA")
-TREND_REENTRY_KLINE_INTERVAL_MIN = int(os.getenv("TREND_REENTRY_KLINE_INTERVAL_MIN", "30"))
+# 2026-09-15：30→45分钟(宝贝原话明确指定45分钟双均线，同时把确认口径
+# 从单纯dual_ma_trend_ok换成trend_confirmed_with_volume——见
+# _maybe_trend_reentry顶部注释)
+TREND_REENTRY_KLINE_INTERVAL_MIN = int(os.getenv("TREND_REENTRY_KLINE_INTERVAL_MIN", "45"))
 TREND_REENTRY_KLINE_LIMIT = int(os.getenv("TREND_REENTRY_KLINE_LIMIT", "80"))
+TREND_REENTRY_CANDLE_RUN = int(os.getenv("TREND_REENTRY_CANDLE_RUN", "3"))
 # 每次尝试(不管成功/趋势不确认)之间至少间隔这么久，避免现价刚好贴在均线
 # 附近来回穿越时每次心跳都触发一轮开/查
 TREND_REENTRY_COOLDOWN_SEC = float(os.getenv("TREND_REENTRY_COOLDOWN_SEC", "300"))
 TREND_REENTRY_TP1_ATR = float(os.getenv("TREND_REENTRY_TP1_ATR", "1.35"))
 TREND_REENTRY_TP2_ATR = float(os.getenv("TREND_REENTRY_TP2_ATR", "2.5"))
 TREND_REENTRY_SIZE_FACTOR = float(os.getenv("TREND_REENTRY_SIZE_FACTOR", "0.6"))
+# 2026-09-15新增(宝贝确认)：每个品种每天最多允许这套机制自主开仓几次，
+# 冷却+条件复核之外的额外风控上限，防止震荡行情里反复触发磨损
+TREND_REENTRY_MAX_PER_DAY = int(os.getenv("TREND_REENTRY_MAX_PER_DAY", "3"))
 
 # ==================== 高潮否决 / 反转锁利 ====================
 CLIMAX_VETO_ENABLED = os.getenv("CLIMAX_VETO", "1").lower() in ("1", "true", "yes")
@@ -259,6 +266,8 @@ class PositionSupervisorCoinW:
         self._last_nonflat_hb_side = ""    # TV心跳最后一个非FLAT方向（重启清零，等下次心跳重新填）
         self._last_nonflat_hb_entry = 0.0
         self._trend_reentry_next_try_ts = 0.0  # 冷却：同方向下次允许再评估的时间
+        # 2026-09-15新增：趋势确认重入每日次数上限，{"date": "YYYY-MM-DD", "count": N}
+        self._trend_reentry_daily = {"date": "", "count": 0}
 
         # 初始化模块
         self._init_modules()
@@ -351,6 +360,12 @@ class PositionSupervisorCoinW:
     def _handle_open(self, signal, is_reentry: bool = False) -> dict:
         """处理开仓信号"""
         global trading_paused
+        # 2026-09-15修复：BreathStop.set_reentry_count()此前从未被调用，
+        # 导致重入开仓也一直用首次开仓更近的(TP1+TP2)/2激活线，而不是
+        # 设计里更远、更保守的纯TP2激活线(见breath_stop.py
+        # _activation_gate_price)。这里记一个瞬时标记，供_place_defense_
+        # orders()里的radar.arm()之后据此告诉雷达这是不是重入仓位。
+        self._is_reentry_open = bool(is_reentry)
 
         if trading_paused:
             logger.warning("交易暂停中(全局管理员暂停)，拒绝开仓")
@@ -687,6 +702,15 @@ class PositionSupervisorCoinW:
                     self._chase_watch = {}
                     return {"ok": True, "status": "heartbeat", "state": "catchup_blocked",
                             "until": round(self._catchup_blocked_until, 0)}
+                # 2026-09-15新增：更强的技术确认(双均线+3根同向+放量)可以
+                # 抢在_chase_watch_step的多周期持续确认窗口跑完之前直接
+                # 入场——今天OPENAI在B账户被误判止损后TV其实还在持有，
+                # 就是这里要补的口子。trend_reentry标记只在真的尝试过
+                # 开仓(成功或失败)时才出现，"未确认/冷却中/日上限"等
+                # 中间状态原样落回下面既有的追单确认流程，不打断它。
+                fast_path = self._maybe_trend_reentry(override_side=hb_side)
+                if fast_path and fast_path.get("trend_reentry"):
+                    return fast_path
                 px = float(self._get_current_price() or 0)
                 hb_sig = self._synthesize_open_signal(signal, hb_side, hb_entry, px)
                 if float(hb_sig.atr or 0) <= 0:
@@ -1138,6 +1162,7 @@ class PositionSupervisorCoinW:
             self.radar.set_atr(signal.atr)
             self.radar.reset()
             self.radar.arm(tp1_price=signal.tp1, tp2_price=signal.tp2, direction=direction)
+            self.radar.set_reentry_count(1 if getattr(self, "_is_reentry_open", False) else 0)
 
             logger.info(f"防线就绪: SL={hard_sl_price}, TP1={signal.tp1}, TP2={signal.tp2}")
 
@@ -1840,15 +1865,41 @@ class PositionSupervisorCoinW:
 
     # ==================== TV方向+双均线趋势自主重入 ====================
 
-    def _maybe_trend_reentry(self) -> Optional[dict]:
+    def _trend_reentry_daily_allow(self) -> bool:
+        """2026-09-15新增：每个品种每天最多TREND_REENTRY_MAX_PER_DAY次
+        (宝贝确认的风控上限，独立于冷却+条件复核之外)。返回True时顺带
+        把计数+1；调用方应只在真的要开仓前调用一次。"""
+        import datetime
+        today = datetime.datetime.utcnow().strftime("%Y-%m-%d")
+        rec = self._trend_reentry_daily
+        if rec.get("date") != today:
+            rec = {"date": today, "count": 0}
+        if int(rec.get("count") or 0) >= TREND_REENTRY_MAX_PER_DAY:
+            self._trend_reentry_daily = rec
+            return False
+        rec["count"] = int(rec.get("count") or 0) + 1
+        self._trend_reentry_daily = rec
+        return True
+
+    def _maybe_trend_reentry(self, override_side: str = "") -> Optional[dict]:
         """
         2026-09-13新增(宝贝拍板)：只在VPS空仓、TV心跳当前也是FLAT时被
         调用(见_handle_heartbeat"两边都空"分支)。TV最后一个非FLAT方向
-        (self._last_nonflat_hb_side)如果仍然满足双均线趋势确认(定义
-        跟TV策略源码自己的开平仓逻辑完全一致——多头close>MA15 and
-        close>MA30，空头反过来)，就自主开仓——用综合硬止损+ATR估算
-        TP123自己管理这笔仓位，直到TV发出全新真实开仓信号为止(那条
-        路径走_handle_open的is_reentry=False分支，自动接管权威)。
+        (self._last_nonflat_hb_side)如果仍然满足趋势确认，就自主开仓——
+        用综合硬止损+ATR估算TP123自己管理这笔仓位，直到TV发出全新真实
+        开仓信号为止(那条路径走_handle_open的is_reentry=False分支，
+        自动接管权威)。
+
+        2026-09-15增强(宝贝反馈OPENAI连续3根阳线放量上涨且站上45分钟
+        双均线)："趋势确认"从单纯dual_ma_trend_ok换成更严格的
+        trend_confirmed_with_volume(双均线+最近3根同向实体+放量三者
+        都满足)，并新增override_side参数——TV心跳仍非FLAT但VPS已空仓
+        (今天OPENAI在B账户被误判止损后TV其实还在持有的真实场景)时，
+        由_handle_heartbeat的"TV有仓VPS空"分支传入hb_side，作为比现有
+        _chase_watch_step多周期持续确认窗口更快的平行判据——同一套
+        开仓/仓位/止损逻辑，只是方向来源不同。override_side为空时沿用
+        原有"两边都空"场景，从self._last_nonflat_hb_side取方向。
+        同时新增每日次数上限(TREND_REENTRY_MAX_PER_DAY)。
 
         跟本类既有的"止损后小区间智能再入"(_start_reentry_watcher，只
         在VPS自己刚被止损、价格没跑远时生效)是两套独立机制：那套要求
@@ -1857,12 +1908,12 @@ class PositionSupervisorCoinW:
         自己做主，仓位缩小(TREND_REENTRY_SIZE_FACTOR)对冲这份自主性
         带来的额外风险。
 
-        返回None表示"这次没有可评估的东西"，调用方按原有"both_flat"
-        逻辑处理；返回dict表示已经处理过，直接作为心跳响应返回。
+        返回None表示"这次没有可评估的东西"，调用方按原有逻辑处理；
+        返回dict表示已经处理过，直接作为心跳响应返回。
         """
         if not TREND_REENTRY_ENABLED:
             return None
-        side = str(self._last_nonflat_hb_side or "").upper()
+        side = str(override_side or self._last_nonflat_hb_side or "").upper()
         if side not in ("LONG", "SHORT"):
             return None  # 从没见过TV给过方向，没什么好评估的
 
@@ -1884,15 +1935,20 @@ class PositionSupervisorCoinW:
             logger.debug(f"自主重入拉K线失败: {e}")
             return {"ok": True, "status": "heartbeat", "state": "trend_reentry_kline_failed"}
 
-        from dual_ma_trend import dual_ma_trend_ok
-        ok, meta = dual_ma_trend_ok(
+        from dual_ma_trend import trend_confirmed_with_volume
+        ok, meta = trend_confirmed_with_volume(
             side, bars, fast_len=TREND_REENTRY_FAST_LEN, slow_len=TREND_REENTRY_SLOW_LEN,
-            ma_type=TREND_REENTRY_MA_TYPE,
+            ma_type=TREND_REENTRY_MA_TYPE, candle_run=TREND_REENTRY_CANDLE_RUN,
         )
         if not ok:
             logger.debug(f"自主重入：趋势未确认 {side} {meta}")
             return {"ok": True, "status": "heartbeat", "state": "trend_not_confirmed",
                     "side": side, "meta": meta}
+
+        if not self._trend_reentry_daily_allow():
+            logger.warning(f"自主重入：今日次数已达上限({TREND_REENTRY_MAX_PER_DAY}) {side}")
+            return {"ok": True, "status": "heartbeat", "state": "trend_reentry_daily_cap",
+                    "side": side}
 
         px = float(self._get_current_price() or 0)
         if px <= 0:

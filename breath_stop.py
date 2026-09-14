@@ -217,10 +217,34 @@ def calculate_stop_long(price, entry_price, initial_atr, initial_stop, current_s
     if zone == "pre_tp1" and tp1_px > 0:
         pre_tp1_floor = new_highest - PRE_TP1_TP1_DIST_FRAC * abs(float(tp1_px) - entry_price)
         candidate = min(candidate, pre_tp1_floor) if candidate > 0 else pre_tp1_floor
-    if zone == "pre_tp1" and step_count == 0 and trail_dist > 0:
-        breath_floor = entry_price - PRE_TP1_BREATH_FLOOR_FRAC * trail_dist
+    # 2026-09-15"悬崖变坡道"：原来PRE_TP1_BREATH_FLOOR_FRAC只在step_count==0
+    # 生效，但激活线本身离entry就有约1.9×step_trigger那么远，价格一摸线，
+    # step_count在武装后第一个tick就已经跳到1(阶梯"每次最多前进一档"棘轮
+    # 保护，反而让它跳过了0)——这条本该给最早期缓冲的地板在实盘里几乎
+    # 打不到，武装后止损直接从纯保本跳到阶梯第一档，等于"一点正常波动就
+    # 被雷达打掉"。改成随价格从entry走到TP1的进度连续收窄的坡道：进度=0
+    # (刚武装)时坡道宽度=硬止损自己的距离(tv_stop_dist)，进度=1(价格走到
+    # TP1)时收窄到跟现有pre_tp1标称宽度(trail_dist)一致，不引入新的不
+    # 衔接点；不依赖step_count，不会再被"武装第一tick就跳过0"打穿。
+    if zone == "pre_tp1" and trail_dist > 0:
+        if tp1_px > 0:
+            tp1_dist = abs(float(tp1_px) - entry_price)
+        else:
+            tp1_dist = float(p.get("tp1_atr") or TP1_ATR) * initial_atr
+        progress = 0.0
+        if tp1_dist > 0:
+            progress = max(0.0, min(1.0, (new_highest - entry_price) / tp1_dist))
         if tv_stop_dist > 0:
-            breath_floor = max(breath_floor, entry_price - tv_stop_dist)
+            # trail_dist>tv_stop_dist时(硬止损比pre_tp1标称宽度还紧)，原始
+            # 插值会在中间progress上短暂超出tv_stop_dist——"雷达给的耐心
+            # 不该超过TV自己愿意承担的风险"，补一道上限，这种形状下坡道
+            # 退化成常数tv_stop_dist。
+            ramp_dist = tv_stop_dist - (tv_stop_dist - trail_dist) * progress
+            ramp_dist = max(ramp_dist, trail_dist)
+            ramp_dist = min(ramp_dist, tv_stop_dist)
+            breath_floor = entry_price - ramp_dist
+        else:
+            breath_floor = entry_price - PRE_TP1_BREATH_FLOOR_FRAC * trail_dist
         candidate = min(candidate, breath_floor) if candidate > 0 else breath_floor
 
     return round(float(candidate), 2), round(float(new_highest), 2), bool(new_phase), int(step_count)
@@ -296,10 +320,22 @@ def calculate_stop_short(price, entry_price, initial_atr, initial_stop, current_
     if zone == "pre_tp1" and tp1_px > 0:
         pre_tp1_floor = new_lowest + PRE_TP1_TP1_DIST_FRAC * abs(float(tp1_px) - entry_price)
         candidate = max(candidate, pre_tp1_floor) if candidate > 0 else pre_tp1_floor
-    if zone == "pre_tp1" and step_count == 0 and trail_dist > 0:
-        breath_floor = entry_price + PRE_TP1_BREATH_FLOOR_FRAC * trail_dist
+    # 2026-09-15"悬崖变坡道"：见calculate_stop_long同日期注释，SHORT对称版。
+    if zone == "pre_tp1" and trail_dist > 0:
+        if tp1_px > 0:
+            tp1_dist = abs(float(tp1_px) - entry_price)
+        else:
+            tp1_dist = float(p.get("tp1_atr") or TP1_ATR) * initial_atr
+        progress = 0.0
+        if tp1_dist > 0:
+            progress = max(0.0, min(1.0, (entry_price - new_lowest) / tp1_dist))
         if tv_stop_dist > 0:
-            breath_floor = min(breath_floor, entry_price + tv_stop_dist)
+            ramp_dist = tv_stop_dist - (tv_stop_dist - trail_dist) * progress
+            ramp_dist = max(ramp_dist, trail_dist)
+            ramp_dist = min(ramp_dist, tv_stop_dist)
+            breath_floor = entry_price + ramp_dist
+        else:
+            breath_floor = entry_price + PRE_TP1_BREATH_FLOOR_FRAC * trail_dist
         candidate = max(candidate, breath_floor) if candidate > 0 else breath_floor
 
     return round(float(candidate), 2), round(float(new_lowest), 2), bool(new_phase), int(step_count)
@@ -492,11 +528,21 @@ class BreathStop:
                 b = float(st.best_price or st.entry_price)
                 best = min(b, price) if b > 0 else price
 
+            # 2026-09-15修复：这里此前从未传breathing_coefficient，
+            # calculate_breath_stop的函数签名默认值1.0原样穿透到tp3_plus区，
+            # min_mult/max_mult(profile本来设计的4~6×ATR深盈利呼吸空间)从未
+            # 被trail_distance_multiplier插值用上——深盈利区实际按死板的
+            # 1.0×ATR收紧，比pre_tp1区的breath_tp12(2.3~2.5×ATR)还紧，完全
+            # 反直觉("赚得越多雷达反而卡得越死")。用已有的cold_start_
+            # multiplier(profile)算出一个基于min_mult/max_mult插值的静态
+            # 系数替代死板的1.0，不引入新的ADX/动量数据源。
+            coeff = cold_start_multiplier(p)
             res = calculate_breath_stop(
                 side=side, price=price, entry_price=st.entry_price,
                 initial_atr=atr, initial_stop=st.initial_stop,
                 current_stop=st.current_sl, best_price=best,
                 breakeven_phase=(st.phase == "dynamic"), profile=p,
+                breathing_coefficient=coeff,
                 tp1_px=float(tp1_px or 0), tp2_px=float(tp2_px or 0),
                 tp3_px=float(tp3_px or 0),
                 prev_step_count=int(getattr(st, "step_count", 0) or 0),
