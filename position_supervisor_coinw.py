@@ -147,12 +147,28 @@ DUAL_MA_EXIT_DEFAULT_INTERVAL_MIN = 45
 # 双均线门槛拦下，等于形同虚设，两笔实盘都验证到最终锁的还是纯保本
 # 原值。
 # 2026-09-14当天改版：去掉"必须双均线先确认"这个前置门槛，只要触发了
-# 激活(本身已经证明价格朝有利方向走出了距离)，就无条件用"现价±ATR缓冲"
-# 跟纯保本位取更松的那个——真正的安全阀不是滞后的均线，而是下面两条
-# 硬性边界：绝不允许比综合硬止损(hard_sl_px)更松，也绝不允许倒退到
-# 比纯保本更紧。
+# 激活(本身已经证明价格朝有利方向走出了距离)，就无条件用一个更宽的
+# 锚点跟纯保本位取更松的那个——真正的安全阀不是滞后的均线，而是下面
+# 两条硬性边界：绝不允许比综合硬止损(hard_sl_px)更松，也绝不允许倒退
+# 到比纯保本更紧。
+# 2026-09-14当天第三版(跟币安B系统同一批改)：实盘复现(BNBUSDT，10小时
+# 内两账户各触发5次同一模式)显示"现价±0.5×ATR"这个缓冲量级根本不够
+# 用——激活线本身就是(TP1+TP2)/2算出来的，价格往往"刚摸到激活线就
+# 触发"，几乎不会有明显超涨。这种最常见的"刚好到线"情形下，现价-缓冲
+# 算出来的锚点反而比纯保本更紧(因为激活线离entry本来就有相当距离，
+# 减掉缓冲后仍然比纯保本远)，取更松那个又回退到纯保本，加宽形同虚设。
+# 第三版最初的方案是改成锚定"激活线相对entry走的那段距离"(entry±0.5×
+# gate_dist)，写完后用BNB真实数字复算才发现同样的方向性漏洞：这个新
+# 锚点是跟纯保本完全独立算出来的，"谁更松"取决于两个不相关公式的巧
+# 合——当纯保本手续费缓冲(通常远小于1个ATR)本来就比这个新锚点更贴近
+# entry时，新锚点反而比纯保本更贴近激活线、更紧，取更松的min/max结果
+# 又回退成纯保本，跟前两版殊途同归地形同虚设(BNB正是这种情形)。
+# 第三版最终修正：不再独立算锚点去比较，而是直接在纯保本(initial_sl)
+# 的基础上做加减法——保本位再往回让出ACTIVATION_RETAIN_FRAC(50%)比例
+# 的gate_dist当额外缓冲。由构造保证100%比纯保本更松，不再依赖任何巧合
+# 的数值关系，同时依然随激活线的远近(gate_dist)自适应。
 DUAL_MA_ACTIVATION_GATE_ENABLED = os.getenv("DUAL_MA_ACTIVATION_GATE", "1").lower() in ("1", "true", "yes")
-DUAL_MA_ACTIVATION_BUFFER_ATR = 0.5  # 略宽于DUAL_MA_EXIT自己收紧用的0.3，专用于首次激活加宽
+DUAL_MA_ACTIVATION_RETAIN_FRAC = 0.5  # 在纯保本基础上，额外让出的gate_dist比例当止损缓冲
 
 # 2026-09-13再新增(宝贝实盘截图复盘BNBUSDT.P发现)："突发放量反转K线快速
 # 锁保本"——三层防线里最快的一层，跟币安B系统(eth-webhook-server同名
@@ -1303,32 +1319,41 @@ class PositionSupervisorCoinW:
 
         return tp1_filled, tp2_filled
 
-    def _dual_ma_activation_anchor(self, side: str, curr_px: float):
+    def _dual_ma_activation_anchor(self, side: str, curr_px: float, init_breakeven: float = 0.0):
         """见上方DUAL_MA_ACTIVATION_GATE_*常量顶部注释："保本激活加宽"。
-        只在首次开仓触发激活的那一刻调用一次(非每tick)，返回一个"现价±
-        ATR缓冲"的更宽锚点供调用方跟纯保本位取更松的那个，无效时返回
-        None(调用方原样使用现有纯保本公式，不改变默认行为)。
-        2026-09-14改版：不再要求双均线先确认趋势——45分钟8/20均线天然
-        滞后于"刚摸到激活线"这个更快的瞬时判据，两笔实盘(跟币安B系统
-        同一批：BNB多头/XPT插针回落多头)验证均线门槛几乎总是拦下加宽，
-        形同虚设。真正的安全阀交给调用方的硬止损封顶+纯保本下限两条
-        硬性边界。"""
+        只在首次开仓触发激活的那一刻调用一次(非每tick)，返回一个更宽的
+        锚点供调用方跟纯保本位取更松的那个，无效时返回None(调用方原样
+        使用现有纯保本公式，不改变默认行为)。
+        2026-09-14第三版修正(跟币安B系统同一批改)：不再独立算一个锚点去
+        跟纯保本比"谁更松"(那样谁更松取决于两个不相关公式的巧合，BNB
+        实盘复算证明会巧合失效)，而是直接在纯保本(init_breakeven)基础
+        上，按gate_dist(激活线((TP1+TP2)/2中点)相对entry走了多远)的
+        ACTIVATION_RETAIN_FRAC比例再让出一段缓冲——由构造保证100%比纯
+        保本更松，同时随行情走出的距离自适应。"""
         if not DUAL_MA_ACTIVATION_GATE_ENABLED:
             return None
         side = str(side or "").upper()
         if side not in ("LONG", "SHORT"):
             return None
-        st = self.radar.get_state()
-        atr = float(st.initial_atr or getattr(self.radar, "_atr", 0) or 0)
-        px = float(curr_px or 0)
-        if atr <= 0 or px <= 0:
+        entry = float(self.pipeline.data.get("entry") or 0)
+        init_breakeven = float(init_breakeven or 0)
+        try:
+            gate_px = float(self.radar._activation_gate_price() or 0)
+        except Exception as e:
+            logger.info(f"[{self.symbol}] 保本激活加宽跳过(激活线取值异常): {e} → 走现有纯保本")
+            return None
+        if entry <= 0 or gate_px <= 0 or init_breakeven <= 0:
             logger.info(
-                f"[{self.symbol}] 保本激活加宽跳过(atr={atr} curr_px={px} 无效) → 走现有纯保本"
+                f"[{self.symbol}] 保本激活加宽跳过(entry={entry} gate={gate_px} "
+                f"init={init_breakeven} 无效) → 走现有纯保本"
             )
             return None
+        gate_dist = abs(gate_px - entry)
+        if gate_dist <= 0:
+            return None
         if side == "LONG":
-            return px - DUAL_MA_ACTIVATION_BUFFER_ATR * atr
-        return px + DUAL_MA_ACTIVATION_BUFFER_ATR * atr
+            return init_breakeven - DUAL_MA_ACTIVATION_RETAIN_FRAC * gate_dist
+        return init_breakeven + DUAL_MA_ACTIVATION_RETAIN_FRAC * gate_dist
 
     def _activate_radar(self, curr_px: float = 0.0):
         """激活雷达"""
@@ -1358,7 +1383,7 @@ class PositionSupervisorCoinW:
         # 不做加宽)。
         if int(self.radar.get_state().reentry_count or 0) == 0:
             try:
-                widened = self._dual_ma_activation_anchor(direction, curr_px)
+                widened = self._dual_ma_activation_anchor(direction, curr_px, init_breakeven=initial_sl)
             except Exception as e:
                 widened = None
                 logger.debug(f"[{self.symbol}] 保本激活加宽异常跳过: {e}")
@@ -1374,8 +1399,8 @@ class PositionSupervisorCoinW:
                         final_sl = min(final_sl, hard_ceiling)
                 if abs(final_sl - initial_sl) > 1e-9:
                     logger.info(
-                        f"[{self.symbol}] 保本激活双均线加宽 {initial_sl:.4f}→{final_sl:.4f} "
-                        f"(双均线趋势仍成立，现价±{DUAL_MA_ACTIVATION_BUFFER_ATR}×ATR更宽)"
+                        f"[{self.symbol}] 保本激活加宽 {initial_sl:.4f}→{final_sl:.4f} "
+                        f"(保留激活线距entry {DUAL_MA_ACTIVATION_RETAIN_FRAC:.0%}距离当缓冲)"
                     )
                 initial_sl = final_sl
                 self.radar.seed_stop(final_sl)
