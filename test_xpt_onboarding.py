@@ -24,7 +24,9 @@ import breath_profiles  # noqa: E402
 
 class TestXptSymbolConfig(unittest.TestCase):
     def test_active_symbols(self):
-        self.assertIn("XPT", symbol_config.ACTIVE_SYMBOLS)
+        # 2026-09-15暂停(注释形式，非删除)：宝贝拍板只精细化做BNB/XPD/
+        # SNDK/OPENAI/XAU这5个，见symbol_config.py同日期注释。
+        self.assertNotIn("XPT", symbol_config.ACTIVE_SYMBOLS)
 
     def test_symbol_map(self):
         self.assertEqual(symbol_config.SymbolConfig.get_symbol("XPTUSDT"), "XPT")
@@ -39,7 +41,9 @@ class TestXptSymbolConfig(unittest.TestCase):
 class TestXptWebhookParsing(unittest.TestCase):
     def test_normalize_and_valid(self):
         from webhook_parser import WebhookParser, VALID_SYMBOLS
-        self.assertIn("XPT", VALID_SYMBOLS)
+        # 2026-09-15暂停：VALID_SYMBOLS=set(ACTIVE_SYMBOLS)，见
+        # symbol_config.py同日期注释；归一化本身不受影响。
+        self.assertNotIn("XPT", VALID_SYMBOLS)
         p = WebhookParser()
         self.assertEqual(p._normalize_symbol("XPTUSDT.P"), "XPT")
         self.assertEqual(p._normalize_symbol("XPT"), "XPT")

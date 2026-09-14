@@ -41,10 +41,12 @@ NEW_SYMBOLS = ("BNB", "OPENAI", "SNDK", "XPD")
 
 class TestActiveSymbolsSingleSource(unittest.TestCase):
     def test_active_symbols_has_all_seven(self):
-        """2026-09-13：新增XPT后变成8个品种，这里放宽成"至少包含"这7个，
-        不再断言"恰好这7个"——避免以后每加一个新品种都要回来改这个数字。"""
+        """2026-09-15更新：宝贝拍板"精细化做好这几个"，只留BNB/XPD/SNDK/
+        OPENAI/XAU精细打磨，ETH/BTC/XPT/XRP/SOL暂停(注释形式非删除，见
+        symbol_config.py同日期注释)——这里改成断言当前实际打算长期启用
+        的这5个都在，不再要求ETH/BTC也在内。"""
         self.assertTrue(
-            {"ETH", "BTC", "XAU", "BNB", "OPENAI", "SNDK", "XPD"}.issubset(set(ACTIVE_SYMBOLS)),
+            {"XAU", "BNB", "OPENAI", "SNDK", "XPD"}.issubset(set(ACTIVE_SYMBOLS)),
         )
 
     def test_webhook_parser_valid_symbols_matches_active_symbols(self):

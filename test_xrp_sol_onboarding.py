@@ -25,8 +25,11 @@ import breath_profiles  # noqa: E402
 
 class TestXrpSolSymbolConfig(unittest.TestCase):
     def test_active_symbols(self):
-        self.assertIn("XRP", symbol_config.ACTIVE_SYMBOLS)
-        self.assertIn("SOL", symbol_config.ACTIVE_SYMBOLS)
+        # 2026-09-15：宝贝拍板"精细化做好BNB/XPD/SNDK/OPENAI/XAU"这5个，
+        # XRP/SOL暂停(注释形式，非删除，见symbol_config.py同日期注释)——
+        # 当前不在活跃清单里是预期状态，不是本次onboarding的回归。
+        self.assertNotIn("XRP", symbol_config.ACTIVE_SYMBOLS)
+        self.assertNotIn("SOL", symbol_config.ACTIVE_SYMBOLS)
 
     def test_symbol_map(self):
         self.assertEqual(symbol_config.SymbolConfig.get_symbol("XRPUSDT"), "XRP")
@@ -44,8 +47,11 @@ class TestXrpSolSymbolConfig(unittest.TestCase):
 class TestXrpSolWebhookParsing(unittest.TestCase):
     def test_normalize_and_valid(self):
         from webhook_parser import WebhookParser, VALID_SYMBOLS
-        self.assertIn("XRP", VALID_SYMBOLS)
-        self.assertIn("SOL", VALID_SYMBOLS)
+        # 2026-09-15暂停：VALID_SYMBOLS=set(ACTIVE_SYMBOLS)，暂停期间新
+        # 开仓信号应该被拒收，见symbol_config.py同日期注释。归一化本身
+        # (下面两行)不受影响，纯字符串处理，跟是否暂停无关。
+        self.assertNotIn("XRP", VALID_SYMBOLS)
+        self.assertNotIn("SOL", VALID_SYMBOLS)
         p = WebhookParser()
         self.assertEqual(p._normalize_symbol("XRPUSDT.P"), "XRP")
         self.assertEqual(p._normalize_symbol("SOLUSDT.P"), "SOL")

@@ -39,8 +39,15 @@ from typing import Dict, List, Optional
 # (fair_price≈1.35, max_leverage=100)，SOL contract_id=24
 # (fair_price≈100.63, max_leverage=110)，都真实挂着USDT永续合约。跟
 # 币安B系统同批上线，45分钟周期。
+# 2026-09-15：宝贝拍板"精细化做好这几个"——只留BNB/XPD/SNDK/OPENAI/XAU
+# 这5个精细打磨，ETH/BTC/XPT/XRP/SOL暂停(不是删除，恢复直接取消注释加
+# 回列表即可，跟币安symbol_config.py同批改、同一套可逆写法)。暂停只挡
+# webhook_parser.py::VALID_SYMBOLS新开仓入口，已有仓位(如SOL当时还有
+# 持仓)交给引擎自己的硬止损/雷达管到自然平仓，不强制清仓——跟币安
+# 0deff95既定语义一致。
 ACTIVE_SYMBOLS: List[str] = [
-    "ETH", "BTC", "XAU", "BNB", "OPENAI", "SNDK", "XPD", "XPT", "XRP", "SOL",
+    "XAU", "BNB", "OPENAI", "SNDK", "XPD",
+    # "ETH", "BTC", "XPT", "XRP", "SOL",  # 2026-09-15暂停，恢复直接取消注释
 ]
 
 
