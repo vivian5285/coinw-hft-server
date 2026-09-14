@@ -163,10 +163,21 @@ def health():
         for sym, phase_val in pipelines.items()
     }
 
+    # 2026-09-14新增：配合_pause_trading()改成per-symbol暂停(见其顶部
+    # 注释)，/health一次性亮出所有品种的暂停状态，不用逐个品种去猜——
+    # 之前一个品种审计失败卡住交易好几个小时都没人发现，就是因为这个
+    # 状态藏得太深。只有已经实例化过的品种才查得到(还没收到过任何信号
+    # 的品种自然也不可能被暂停过)。
+    symbol_paused = {}
+    for sym in symbols:
+        if sym in _supervisors:
+            symbol_paused[sym] = bool(getattr(_supervisors[sym], "_symbol_paused", False))
+
     return jsonify({
         "version": COINW_WEBHOOK_VERSION,
         "supervisor_version": COINW_SUPERVISOR_VERSION,
         "trading_paused": trading_paused,
+        "symbol_paused": symbol_paused,
         "pipelines": pipelines,
         "open_in_progress": in_progress,
         "deploy_safe": not any(in_progress.values()),
@@ -195,6 +206,17 @@ def admin_resume():
 
     resume_all_trading()
     return jsonify({"ok": True, "trading_paused": False})
+
+
+@app.route('/admin/resume/<symbol>', methods=['POST'])
+def admin_resume_symbol(symbol):
+    """解除单个品种的审计失败暂停(见position_supervisor_coinw.py::
+    _pause_trading顶部注释——2026-09-14起审计失败只暂停本品种，不再
+    牵连全局，对应这里单独解除)。"""
+    supervisor = get_supervisor(symbol)
+    supervisor._symbol_paused = False
+    logger.info(f"[{symbol}] 已手动解除本品种交易暂停")
+    return jsonify({"ok": True, "symbol": symbol, "symbol_paused": False})
 
 
 @app.route('/admin/clear/<symbol>', methods=['POST'])

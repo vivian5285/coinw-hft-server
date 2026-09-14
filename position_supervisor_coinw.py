@@ -337,8 +337,20 @@ class PositionSupervisorCoinW:
         global trading_paused
 
         if trading_paused:
-            logger.warning("交易暂停中，拒绝开仓")
+            logger.warning("交易暂停中(全局管理员暂停)，拒绝开仓")
             return {"ok": False, "error": "trading_paused"}
+
+        # 2026-09-14修复(实盘复现：XRPUSDT一笔tp_slice审计drift触发
+        # "交易暂停: 督察失败"，从22:32一直卡到第二天凌晨，期间SOL/XRP/
+        # BNB/XAU/XPD等其它所有品种的新开仓全部被这个跟它们毫无关系的
+        # 审计失败挡在外面——根源是_pause_trading()原来改的是模块级全局
+        # trading_paused，一个品种审计出问题就殃及全部品种，且没有任何
+        # 自动恢复机制，只能靠人工调/admin/resume才能解开，中间这段时间
+        # 造成了大量"漏单"。改成只暂停出问题的这一个品种，不牵连其它
+        # 品种；见_pause_trading()。
+        if getattr(self, "_symbol_paused", False):
+            logger.warning(f"[{self.symbol}] 交易暂停中(本品种督察失败)，拒绝开仓")
+            return {"ok": False, "error": "symbol_paused"}
 
         # TradFi品种周末停开仓（底层现实市场休市，7×24永续仍在挂单，滑点/
         # 手续费不划算）——只挡新开仓，已有仓位/智能再入的平仓管理不受影响。
@@ -1056,6 +1068,16 @@ class PositionSupervisorCoinW:
             per_piece_qty = (total_qty / total_pieces) if total_pieces > 0 else 0.0
             tp1_pieces = round(total_pieces * 0.10)
             tp2_pieces = round(total_pieces * 0.20)
+            # 2026-09-14修复(实盘复现XRPUSDT一笔tp_slice审计误判触发全局
+            # 暂停)：_run_audit()读facts["contract_unit"]时此前一直硬编码
+            # 0.01(注释写着"CoinW ETH 1张=0.01 ETH")，但每个品种的真实
+            # 1张换算成币量完全不同(比如这笔XRP实盘是80.0 XRP=8.0张，
+            # 1张=10 XRP，不是0.01)——审计的取整容差算错了尺度，10%/20%
+            # 取整产生的正常drift被误判成真实异常，触发不必要的交易暂停。
+            # 这里直接用这笔仓位自己刚算出来的per_piece_qty，每个品种、
+            # 每次开仓都用当下真实值，不再猜一个全品种通用常数。
+            if per_piece_qty > 0:
+                self.pipeline.data["contract_unit"] = per_piece_qty
 
             if signal.tp1 > 0:
                 if tp1_pieces > 0:
@@ -1963,7 +1985,12 @@ class PositionSupervisorCoinW:
             "hard_sl_px": self.pipeline.data.get("hard_sl_px", 0),
             "hard_sl_live": True,
             "tier": signal.tier,
-            "contract_unit": 0.01,  # CoinW ETH 1张=0.01 ETH，供 TP 切片审计吸收整张取整
+            # 2026-09-14修复(实盘复现XRPUSDT审计误判触发全局暂停，详见
+            # _place_defense_orders顶部注释)：不再硬编码ETH的0.01，改用
+            # 这笔仓位自己在_place_defense_orders里刚算出来的真实
+            # per_piece_qty(存在pipeline.data["contract_unit"])；没有的
+            # 品种(理论上不该发生，但保留兜底避免崩溃)退回旧的0.01。
+            "contract_unit": float(self.pipeline.data.get("contract_unit") or 0.01),
         }
 
         result = audit_open_bundle(facts)
@@ -1996,12 +2023,24 @@ class PositionSupervisorCoinW:
     # ==================== 暂停 ====================
 
     def _pause_trading(self, reason: str):
-        """暂停交易"""
-        global trading_paused
-        trading_paused = True
-        logger.warning(f"交易暂停: {reason}")
+        """暂停交易(仅本品种)。
 
-        self._dingtalk.send_alert(f"交易暂停: {reason}")
+        2026-09-14修复：这里此前改的是模块级全局trading_paused，一个
+        品种的审计失败(比如CoinW按"张"取整产生的正常TP切片drift被误判)
+        会连带把所有其它品种的新开仓一起挡住，而且没有任何自动恢复，
+        只能靠人工调/admin/resume——实盘复现过一次从晚上10点半卡到
+        第二天凌晨，中间大量品种的TV信号被这条跟它们无关的暂停拒收，
+        造成"漏单"。改成只标记本品种(self._symbol_paused)，不牵连
+        其它品种；对应的解除见/admin/resume/<symbol>。全局管理员级别
+        的暂停(pause_all_trading/resume_all_trading，/admin/pause端点)
+        不受这次改动影响，仍然是显式的全局熔断开关。"""
+        self._symbol_paused = True
+        logger.warning(f"[{self.symbol}] 交易暂停(仅本品种): {reason}")
+
+        self._dingtalk.send_alert(
+            f"[{self.symbol}] 交易暂停(仅本品种，其它品种不受影响): {reason} "
+            f"→ 需要调用 /admin/resume/{self.symbol} 手动恢复"
+        )
 
     # ==================== 启动恢复 ====================
 
@@ -2227,6 +2266,7 @@ class PositionSupervisorCoinW:
             "symbol": self.symbol,
             "pipeline": self.pipeline.phase.value,
             "trading_paused": trading_paused,
+            "symbol_paused": bool(getattr(self, "_symbol_paused", False)),
             "monitoring": self._monitoring,
             "radar": self.radar.get_state().activated,
             "position_id": self.pipeline.data.get("position_id", ""),
