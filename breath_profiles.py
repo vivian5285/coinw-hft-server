@@ -99,24 +99,30 @@ BREATH_ETH: Dict[str, Any] = {
 # 56样本) + 币安(1973根合成/61.6天/286样本) 池化，共343个回调样本。
 # 池化回调分布：P50=2.45×ATR，P75=3.56×ATR，P90=5.07×ATR。实盘ATR仍取
 # CoinW自己最新值(不用币安的绝对ATR)。
+# BNB —— 2026-09-19重新校准：宝贝核对TV警报截图反馈周期从45分钟改成了
+# 65分钟，2026-09-12那版(池化45分钟数据)已经不对应实际信号周期，作废。
+# 跟币安B系统同一批真实币安5m K线合成65分钟K线重测(91.0天2016根合成
+# K线、382个摆动点、314个回调样本)：中位数回调2.61×ATR、75分位
+# 3.68×ATR、90分位4.89×ATR，两边数值完全一致(同一批数据算的)。min/max
+# 比例沿用BNB自己45分钟那版的比例(3.9/5.4=0.722)。
 BREATH_BNB: Dict[str, Any] = {
     "name": "BNB",
     "initial_sl_atr": 0.0,
     "fee_cover_pct": 0.0008,
     "stop_exec_buffer": 0.3,
     "early_be_atr": 0.0,
-    "step_trigger_atr": 0.92,   # 0.375×breath_tp12
-    "step_advance_atr": 0.60,   # 0.65×step_trigger
+    "step_trigger_atr": 0.98,   # 0.375×breath_tp12
+    "step_advance_atr": 0.64,   # 0.65×step_trigger
     "phase_switch_atr": 3.0,
     "tp1_atr": 1.35,
     "tp1_floor_atr": 0.0,
     "tp2_atr": 2.5,
     "tp2_floor_atr": 0.0,
-    "breath_tp12": 2.45,  # 池化中位数回调(2.45)
-    "breath_tp23": 3.56,  # 池化75分位回调(3.56)
+    "breath_tp12": 2.61,  # 实测中位数回调(2.61)
+    "breath_tp23": 3.68,  # 实测75分位回调(3.68)
     "phase2_trail_mult": 1.0,
-    "min_mult": 3.9,      # 0.72×max_mult（沿用币安BNB自己的min/max比例）
-    "max_mult": 5.4,      # 覆盖池化90分位回调(5.07)以上
+    "min_mult": 3.8,      # 0.722×max_mult（沿用BNB自己的min/max比例）
+    "max_mult": 5.2,      # 覆盖实测90分位回调(4.89)以上
     "ratio_floor": RATIO_FLOOR,
     "ratio_ceiling": RATIO_CEILING,
     "tick_size": 0.01,
@@ -124,31 +130,30 @@ BREATH_BNB: Dict[str, Any] = {
     "exit_score": 2,
 }
 
-# OPENAI —— 2026-09-13重新校准：宝贝把TV那边OPENAI的alert周期从120分钟
-# 改成了45分钟(跟BNB/XPD/XAU/XPT/XRP/SOL统一，实盘目前只剩SNDK还是75
-# 分钟)，原120分钟那版池化校准(P50=2.17×ATR)已经不对应实际信号周期，
-# 作废。跟币安B系统同一批真实币安15m K线合成45分钟K线重测(91.1天2916
-# 根合成K线、543个真实摆动点识别回调样本)：中位数回调2.51×ATR、75分位
-# 3.65×ATR、90分位5.77×ATR，ATR%=1.48%，两边数值完全一致(同一批数据算
-# 的)。min/max比例沿用OPENAI自己120分钟那版的比例(4.2/5.3=0.79)。
+# OPENAI —— 2026-09-19重新校准：宝贝核对TV警报截图反馈周期从45分钟
+# 改成了65分钟，2026-09-13那版已经不对应实际信号周期，作废。跟币安B
+# 系统同一批真实币安5m K线合成65分钟K线重测(91.0天2016根合成K线、374个
+# 摆动点、279个回调样本)：中位数回调2.39×ATR、75分位3.32×ATR、90分位
+# 5.39×ATR，两边数值完全一致(同一批数据算的)。min/max比例沿用OPENAI
+# 自己45分钟那版的比例(4.8/6.1=0.79)。
 BREATH_OPENAI: Dict[str, Any] = {
     "name": "OPENAI",
     "initial_sl_atr": 0.0,
     "fee_cover_pct": 0.0008,
     "stop_exec_buffer": 0.3,
     "early_be_atr": 0.0,
-    "step_trigger_atr": 0.94,   # 0.375×breath_tp12
-    "step_advance_atr": 0.61,   # 0.65×step_trigger
+    "step_trigger_atr": 0.90,   # 0.375×breath_tp12
+    "step_advance_atr": 0.59,   # 0.65×step_trigger
     "phase_switch_atr": 3.0,
     "tp1_atr": 1.35,
     "tp1_floor_atr": 0.0,
     "tp2_atr": 2.5,
     "tp2_floor_atr": 0.0,
-    "breath_tp12": 2.51,  # 实测中位数回调(2.51)
-    "breath_tp23": 3.65,  # 实测75分位回调(3.65)
+    "breath_tp12": 2.39,  # 实测中位数回调(2.39)
+    "breath_tp23": 3.32,  # 实测75分位回调(3.32)
     "phase2_trail_mult": 1.0,
-    "min_mult": 4.8,      # 0.79×max_mult（沿用OPENAI自己的min/max比例）
-    "max_mult": 6.1,      # 覆盖实测90分位回调(5.77)以上
+    "min_mult": 4.5,      # 0.79×max_mult（沿用OPENAI自己的min/max比例）
+    "max_mult": 5.7,      # 覆盖实测90分位回调(5.39)以上
     "ratio_floor": RATIO_FLOOR,
     "ratio_ceiling": RATIO_CEILING,
     "tick_size": 0.01,
@@ -156,28 +161,33 @@ BREATH_OPENAI: Dict[str, Any] = {
     "exit_score": 2,
 }
 
-# SNDK 基线 —— 2026-09-12三次校准：真实TV周期75分钟，CoinW(299根/15.5天/
-# 51样本) + 币安(1191根合成/62.0天/196样本) 池化，共247个回调样本。
-# 池化回调分布：P50=2.36×ATR，P75=3.90×ATR，P90=5.86×ATR。实盘ATR仍取
-# CoinW自己最新值。
+# SNDK —— 2026-09-19重新校准：宝贝核对TV警报截图反馈周期从75分钟改成
+# 了91分钟(不能被5/15/30整除，只能用1分钟原始K线合成)，2026-09-12那版
+# 已经不对应实际信号周期，作废。跟币安B系统同一批真实币安1m K线合成
+# 91分钟K线重测(61.2天969根合成K线、191个摆动点、141个回调样本，样本数
+# 偏少，91分钟周期本身K线密度低，后续可以随数据积累再校准一次)：中位数
+# 回调2.23×ATR、75分位4.17×ATR、90分位5.89×ATR——数值上跟旧的75分钟那版
+# (P50=2.36 P75=3.90 P90=5.86)非常接近，91分钟对75分钟只是适度延长，
+# 没有出现异常跳变，实测结果可信。两边数值完全一致(同一批数据算的)。
+# min/max比例沿用SNDK自己75分钟那版的比例(4.5/6.2=0.726)。
 BREATH_SNDK: Dict[str, Any] = {
     "name": "SNDK",
     "initial_sl_atr": 0.0,
     "fee_cover_pct": 0.0008,
     "stop_exec_buffer": 0.3,
     "early_be_atr": 0.0,
-    "step_trigger_atr": 0.88,   # 0.375×breath_tp12
-    "step_advance_atr": 0.57,   # 0.65×step_trigger
+    "step_trigger_atr": 0.84,   # 0.375×breath_tp12
+    "step_advance_atr": 0.55,   # 0.65×step_trigger
     "phase_switch_atr": 3.0,
     "tp1_atr": 1.35,
     "tp1_floor_atr": 0.0,
     "tp2_atr": 2.5,
     "tp2_floor_atr": 0.0,
-    "breath_tp12": 2.36,  # 池化中位数回调(2.36)
-    "breath_tp23": 3.90,  # 池化75分位回调(3.90)
+    "breath_tp12": 2.23,  # 实测中位数回调(2.23)
+    "breath_tp23": 4.17,  # 实测75分位回调(4.17)
     "phase2_trail_mult": 1.0,
-    "min_mult": 4.5,      # 0.72×max_mult（沿用币安SNDK自己的min/max比例）
-    "max_mult": 6.2,      # 覆盖池化90分位回调(5.86)以上
+    "min_mult": 4.5,      # 0.726×max_mult（沿用SNDK自己的min/max比例）
+    "max_mult": 6.2,      # 覆盖实测90分位回调(5.89)以上
     "ratio_floor": RATIO_FLOOR,
     "ratio_ceiling": RATIO_CEILING,
     "tick_size": 0.01,
@@ -185,33 +195,71 @@ BREATH_SNDK: Dict[str, Any] = {
     "exit_score": 2,
 }
 
-# XPD 基线（钯金）—— 2026-09-12三次校准：真实TV周期45分钟，CoinW(499根/
-# 15.6天/73样本) + 币安(1973根合成/61.6天/287样本) 池化，共360个回调
-# 样本。池化回调分布：P50=2.46×ATR，P75=3.68×ATR，P90=5.86×ATR。实盘
-# ATR仍取CoinW自己最新值。
+# XPD（钯金）—— 2026-09-19重新校准：宝贝核对TV警报截图反馈周期从45
+# 分钟改成了49分钟(不能被5/15/30整除，只能用1分钟原始K线合成)，
+# 2026-09-12那版已经不对应实际信号周期，作废。跟币安B系统同一批真实
+# 币安1m K线合成49分钟K线重测(60.7天1783根合成K线、337个摆动点、254个
+# 回调样本)：中位数回调2.40×ATR、75分位3.65×ATR、90分位5.71×ATR，两边
+# 数值完全一致(同一批数据算的)。min/max比例沿用XPD自己45分钟那版的
+# 比例(4.9/6.2=0.79)。
 BREATH_XPD: Dict[str, Any] = {
     "name": "XPD",
     "initial_sl_atr": 0.0,
     "fee_cover_pct": 0.0008,
     "stop_exec_buffer": 0.3,
     "early_be_atr": 0.0,
-    "step_trigger_atr": 0.92,   # 0.375×breath_tp12
-    "step_advance_atr": 0.60,   # 0.65×step_trigger
+    "step_trigger_atr": 0.90,   # 0.375×breath_tp12
+    "step_advance_atr": 0.59,   # 0.65×step_trigger
     "phase_switch_atr": 3.0,
     "tp1_atr": 1.35,
     "tp1_floor_atr": 0.0,
     "tp2_atr": 2.5,
     "tp2_floor_atr": 0.0,
-    "breath_tp12": 2.46,  # 池化中位数回调(2.46)
-    "breath_tp23": 3.68,  # 池化75分位回调(3.68)
+    "breath_tp12": 2.40,  # 实测中位数回调(2.40)
+    "breath_tp23": 3.65,  # 实测75分位回调(3.65)
     "phase2_trail_mult": 1.0,
-    "min_mult": 4.9,      # 0.79×max_mult（沿用币安XPD自己的min/max比例）
-    "max_mult": 6.2,      # 覆盖池化90分位回调(5.86)以上
+    "min_mult": 4.7,      # 0.79×max_mult（沿用XPD自己的min/max比例）
+    "max_mult": 6.0,      # 覆盖实测90分位回调(5.71)以上
     "ratio_floor": RATIO_FLOOR,
     "ratio_ceiling": RATIO_CEILING,
     "tick_size": 0.01,
     "entry_score": 3,
     "exit_score": 2,
+}
+
+
+# XAU（黄金）—— 2026-09-19新增专属档：排查"雷达动态系数需要优化"这个
+# 反馈时发现XAU此前压根没有自己的呼吸档，_BY_SYMBOL里没登记，一直静默
+# 回退用BREATH_ETH(未知品种回退ETH)——黄金的ATR%量级/波动特征跟ETH完全
+# 不是一回事，这是个既存缺口，不是本次改动引入的。跟币安B系统同一批
+# 真实币安5m K线合成50分钟K线校准(90.8天2616根合成K线、511个摆动点、
+# 392个回调样本)：中位数回调2.69×ATR、75分位3.97×ATR、90分位6.03×ATR，
+# 两边数值完全一致(同一批数据算的)。全新品种没有自己的历史min/max
+# 比例可循，借用币安B系统XAU自己45分钟那版的比例(4.8/6.5=0.738，币安
+# 那边同样是2026-09-19这批一起重新校准的)。
+BREATH_XAU: Dict[str, Any] = {
+    "name": "XAU",
+    "initial_sl_atr": 0.0,
+    "fee_cover_pct": 0.0008,
+    "stop_exec_buffer": 0.5,
+    "early_be_atr": 0.0,
+    "step_trigger_atr": 1.01,   # 0.375×breath_tp12
+    "step_advance_atr": 0.66,   # 0.65×step_trigger
+    "phase_switch_atr": 3.0,
+    "tp1_atr": 1.35,
+    "tp1_floor_atr": 0.0,
+    "tp2_atr": 2.5,
+    "tp2_floor_atr": 0.0,
+    "breath_tp12": 2.69,  # 实测中位数回调(2.69)
+    "breath_tp23": 3.97,  # 实测75分位回调(3.97)
+    "phase2_trail_mult": 1.0,
+    "min_mult": 4.7,      # 0.738×max_mult（借用币安B系统XAU的min/max比例）
+    "max_mult": 6.3,      # 覆盖实测90分位回调(6.03)以上
+    "ratio_floor": RATIO_FLOOR,
+    "ratio_ceiling": RATIO_CEILING,
+    "tick_size": 0.01,
+    "entry_score": 1,
+    "exit_score": 1,
 }
 
 
@@ -320,6 +368,7 @@ _BY_SYMBOL: Dict[str, Dict[str, Any]] = {
     "OPENAI": BREATH_OPENAI,
     "SNDK": BREATH_SNDK,
     "XPD": BREATH_XPD,
+    "XAU": BREATH_XAU,  # 2026-09-19新增：此前一直静默回退BREATH_ETH，见上方顶部注释
     "XPT": BREATH_XPT,
     "XRP": BREATH_XRP,
     "SOL": BREATH_SOL,
