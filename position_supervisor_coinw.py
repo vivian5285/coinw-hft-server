@@ -1554,6 +1554,59 @@ class PositionSupervisorCoinW:
 
         logger.info(f"雷达止损更新: {new_sl}")
 
+    def _journal_path(self, kind: str) -> str:
+        """2026-09-19新增(本周问题总结item6"控制面板显示每笔平仓原因")：
+        品种隔离journal路径，跟币安B系统position_supervisor_binance.py::
+        _journal_path同一套命名/思路(两仓库保持结构一致)。目前只用
+        kind="close"这一种，先不做币安那边tv/open/exchange的全套。"""
+        return f"logs/coinw_{kind}_journal_{self.symbol}.jsonl"
+
+    def _append_journal(self, path: str, record: dict) -> None:
+        try:
+            d = os.path.dirname(path)
+            if d:
+                os.makedirs(d, exist_ok=True)
+            record = dict(record)
+            record.setdefault("symbol", self.symbol)
+            record["ts"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except Exception as e:
+            logger.debug(f"[{self.symbol}] journal写入跳过: {e}")
+
+    def _iter_journal_entries(self, kind: str) -> list:
+        """按时间正序读取本品种journal。单条解析失败跳过，不中断整体。"""
+        path = self._journal_path(kind)
+        if not os.path.exists(path):
+            return []
+        entries = []
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entries.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+        except Exception:
+            return entries
+        return entries
+
+    def _journal_close(self, exit_side: str, exit_entry: float, exit_px: float,
+                        exit_source: str, tier: str = "") -> None:
+        """每次平仓落一条"close"kind journal——exit_source此前只进了
+        _safe_alert告警文案，从没被持久化成可查询的结构化记录。纯记录，
+        不影响任何交易决策，跟币安B系统_journal_close同一份设计。"""
+        self._append_journal(self._journal_path("close"), {
+            "side": exit_side,
+            "entry_px": float(exit_entry or 0),
+            "exit_px": float(exit_px or 0),
+            "exit_source": exit_source or "",
+            "tier": tier or "",
+        })
+
     def _resolve_exit_source_coinw(self, curr_px: float) -> str:
         """2026-09-15新增：离场原因分类，简化版对齐币安
         position_supervisor_binance.py::_resolve_exit_source的优先级
@@ -1606,6 +1659,15 @@ class PositionSupervisorCoinW:
         exit_entry = float(self.pipeline.data.get("entry") or 0)
         # 必须在radar.reset()/pipeline.reset_idle()清空状态之前算出分类
         exit_source = self._resolve_exit_source_coinw(curr_px)
+        # 2026-09-19新增(本周问题总结item6)：不管是TV平仓还是止损出局，
+        # 只要这确实是一笔真实持仓的收尾(entry>0)，都落一条journal——
+        # 跟_last_exit只记录"非TV平仓"不同，控制面板要看到每一笔的原因，
+        # 包括TV自己平掉的那些(exit_source=tv_close)。
+        if exit_side in ("LONG", "SHORT") and exit_entry > 0:
+            self._journal_close(
+                exit_side, exit_entry, float(curr_px or 0), exit_source,
+                tier=str(self.pipeline.data.get("tier") or ""),
+            )
 
         # 停止监控
         self._monitoring = False

@@ -272,6 +272,63 @@ def admin_cancel_chase_watch():
 
 # ==================== Console管理页 ====================
 
+def _recent_exit_history_coinw(limit=40):
+    """2026-09-19新增(本周问题总结item6"控制面板显示每笔平仓原因")：
+    跨ACTIVE_SYMBOLS逐品种读各自的close journal(position_supervisor_
+    coinw.py::_journal_close新增)，合并按时间倒序取最近limit条。只需要
+    真实supervisor实例才有journal可读，还没收到过信号的品种直接跳过——
+    跟_journal_close本身一样纯记录，读取失败不该拖垮整个/console/status。"""
+    rows = []
+    for sym in ACTIVE_SYMBOLS:
+        sup = _supervisors.get(sym)
+        if sup is None:
+            continue
+        try:
+            entries = sup._iter_journal_entries("close")
+        except Exception as e:
+            logger.debug(f"[{sym}] 平仓journal读取跳过: {e}")
+            continue
+        for e in entries:
+            rows.append({
+                "symbol": sym,
+                "ts": e.get("ts"),
+                "side": e.get("side"),
+                "entry_px": e.get("entry_px"),
+                "exit_px": e.get("exit_px"),
+                "exit_source": e.get("exit_source") or "",
+                "tier": e.get("tier") or "",
+            })
+    rows.sort(key=lambda r: str(r.get("ts") or ""), reverse=True)
+    return rows[:limit]
+
+
+@app.route('/console/status', methods=['GET'])
+def console_status():
+    """Console管理页轮询的状态接口——此前console_index()的loadStatus()
+    一直在fetch这个路径，但从未真正注册过(纯前端404，页面一直卡在
+    "检查中..."、流水线表格永远空)，2026-09-19排查item6"控制面板显示
+    每笔平仓原因"时顺手发现并补上。顺带把recent_exits也接进来。"""
+    from position_supervisor_coinw import COINW_SUPERVISOR_VERSION, trading_paused
+    from pipeline_ledger import get_pipeline
+
+    pipelines = {}
+    for sym in ACTIVE_SYMBOLS:
+        p = get_pipeline(sym, "coinw")
+        pipelines[sym] = {
+            "phase": p.phase.value,
+            "side": p.data.get("side"),
+            "qty": p.data.get("qty"),
+            "entry": p.data.get("entry"),
+        }
+    return jsonify({
+        "version": COINW_WEBHOOK_VERSION,
+        "supervisor_version": COINW_SUPERVISOR_VERSION,
+        "trading_paused": trading_paused,
+        "pipelines": pipelines,
+        "recent_exits": _recent_exit_history_coinw(),
+    })
+
+
 @app.route('/console', methods=['GET'])
 def console_index():
     """Console管理页"""
@@ -366,6 +423,23 @@ def console_index():
             </div>
 
             <div class="card">
+                <h2>最近平仓原因</h2>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>品种</th>
+                            <th>时间</th>
+                            <th>方向</th>
+                            <th>开仓价</th>
+                            <th>平仓价</th>
+                            <th>原因</th>
+                        </tr>
+                    </thead>
+                    <tbody id="recent_exits"></tbody>
+                </table>
+            </div>
+
+            <div class="card">
                 <h2>控制</h2>
                 <button class="btn" onclick="pauseAll()">暂停交易</button>
                 <button class="btn success" onclick="resumeAll()">恢复交易</button>
@@ -373,6 +447,10 @@ def console_index():
         </div>
 
         <script>
+            const EXIT_SOURCE_LABELS = {
+                tv_close: 'TV平仓', vps_hard_sl: 'VPS综合硬止损',
+                radar_be: '雷达保本/跟踪止损', manual: '人工/未分类',
+            };
             async function loadStatus() {
                 const resp = await fetch('/console/status');
                 const data = await resp.json();
@@ -392,6 +470,22 @@ def console_index():
                             <td>${p.qty || '-'}</td>
                             <td>${p.entry || '-'}</td>
                             <td><button class="btn danger" onclick="clearPos('${sym}')">清仓</button></td>
+                        </tr>
+                    `;
+                }
+
+                const exitsBody = document.getElementById('recent_exits');
+                exitsBody.innerHTML = '';
+                for (const e of (data.recent_exits || [])) {
+                    const label = EXIT_SOURCE_LABELS[e.exit_source] || e.exit_source || '-';
+                    exitsBody.innerHTML += `
+                        <tr>
+                            <td>${e.symbol}</td>
+                            <td>${e.ts || '-'}</td>
+                            <td>${e.side || '-'}</td>
+                            <td>${e.entry_px || '-'}</td>
+                            <td>${e.exit_px || '-'}</td>
+                            <td>${label}</td>
                         </tr>
                     `;
                 }
