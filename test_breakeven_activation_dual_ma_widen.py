@@ -89,8 +89,13 @@ def _breakeven(side, entry, symbol="XPT"):
 
 
 PURE_BREAKEVEN_SHORT = _breakeven("SHORT", ENTRY)  # 1789.44
-GATE_DIST_SHORT = abs(ACTIVATION_PX - ENTRY)  # 2.4
-WIDENED_SHORT = round(PURE_BREAKEVEN_SHORT + RETAIN_FRAC * GATE_DIST_SHORT, 2)  # 1790.64
+# 2026-09-20起：_activation_gate_price()的公式从(TP1+TP2)/2中点改成
+# entry沿盈利方向推进TP1进度(0.8×)/ATR(按tier)双触发的更近者(见
+# breath_stop.py::RADAR_GATE_*顶部注释)，gate_dist不再等于
+# |ACTIVATION_PX-ENTRY|这个旧中点算法——下面用到gate_dist的用例改成在
+# _activate_radar()真正跑完后，直接问雷达自己实际用的激活线
+# (s.radar._activation_gate_price())动态算，不再在这里硬编码一份跟
+# 生产公式脱节的独立算法。
 
 
 class TestActivationWidenModeGate(unittest.TestCase):
@@ -111,12 +116,16 @@ class TestActivationWidenModeGate(unittest.TestCase):
 class TestActivationWidenBMode(unittest.TestCase):
     def test_first_open_widens_beyond_pure_breakeven(self):
         """复现XPT实盘场景：止损从纯保本1789.44在此基础上再让出
-        0.5×gate_dist(2.4)=1.2，加宽到1790.64，而不是贴着保本被正常
-        回踩打穿。"""
+        0.5×gate_dist，加宽到比纯保本更松，而不是贴着保本被正常回踩
+        打穿。gate_dist取雷达自己实际算出的激活线(2026-09-20起是TP1
+        进度/ATR双触发，不再是旧的(TP1+TP2)/2中点)。"""
         s = _mk_supervisor()
         s._activate_radar(ACTIVATION_PX)
         self.assertTrue(s.radar.get_state().activated)
-        self.assertAlmostEqual(s.radar.get_state().current_sl, WIDENED_SHORT, places=2)
+        gate_px = s.radar._activation_gate_price()
+        gate_dist = abs(gate_px - ENTRY)
+        expected = round(PURE_BREAKEVEN_SHORT + RETAIN_FRAC * gate_dist, 2)
+        self.assertAlmostEqual(s.radar.get_state().current_sl, expected, places=2)
         self.assertGreater(s.radar.get_state().current_sl, PURE_BREAKEVEN_SHORT)  # SHORT：更松=更高
 
     def test_bnb_style_large_atr_gate_still_widens_beyond_breakeven(self):
@@ -125,18 +134,24 @@ class TestActivationWidenBMode(unittest.TestCase):
         点再跟纯保本比较)在这种情形下会因为两个公式互不相关而巧合地
         退化成纯保本(形同虚设，10小时内两账户各复现5次)。第三版必须
         在纯保本基础上做加减法，因此不管gate_dist多大，永远比纯保本
-        更松(LONG更低=更松)。"""
+        更松(LONG更低=更松)。gate_dist取雷达自己实际算出的激活线
+        (2026-09-20起是TP1进度/ATR双触发，不再是旧的(TP1+TP2)/2中点)。"""
         entry = 722.20
         atr = 2.6766
-        gate_px = entry + atr  # TP1=TP2=entry+atr，令(TP1+TP2)/2恰好等于entry+atr
+        # tp1=tp2=entry+atr只是用来构造一个"激活线离entry很远"的场景，
+        # 不代表雷达实际会用到的激活线数值(那个由_activation_gate_price
+        # 自己按新公式算，下面动态取)。
+        tp_construction = entry + atr
         s = _mk_supervisor(symbol="BNB", side="LONG", entry=entry,
-                            tp1_px=gate_px, tp2_px=gate_px, hard_sl_px=entry - 5.0)
+                            tp1_px=tp_construction, tp2_px=tp_construction,
+                            hard_sl_px=entry - 5.0)
         s.radar.set_atr(atr)
 
-        s._activate_radar(gate_px)
+        s._activate_radar(tp_construction)
 
         self.assertTrue(s.radar.get_state().activated)
         pure_breakeven = _breakeven("LONG", entry, symbol="BNB")
+        gate_px = s.radar._activation_gate_price()
         gate_dist = abs(gate_px - entry)
         expected = round(pure_breakeven - RETAIN_FRAC * gate_dist, 2)
         self.assertAlmostEqual(s.radar.get_state().current_sl, expected, places=2)
@@ -144,7 +159,6 @@ class TestActivationWidenBMode(unittest.TestCase):
             s.radar.get_state().current_sl, pure_breakeven,
             "第二版公式在这种大ATR/小手续费场景下会退化成纯保本，第三版必须真的比纯保本更松(LONG更低)",
         )
-        self.assertGreater(gate_px - s.radar.get_state().current_sl, atr)
 
     def test_reentry_not_widened_stays_pure_breakeven(self):
         s = _mk_supervisor()
@@ -167,13 +181,16 @@ class TestActivationWidenBMode(unittest.TestCase):
     def test_long_side_mirrors_short_logic(self):
         tp1 = ENTRY + 2.0
         tp2 = ENTRY + 2.8
-        gate_px = (tp1 + tp2) / 2.0  # ENTRY+2.4，跟SHORT夹具的gate_dist对称
+        # 仅用于_activate_radar(curr_px)参数，不代表实际激活线(那个由
+        # _activation_gate_price自己按新公式算，下面动态取)。
+        curr_px = (tp1 + tp2) / 2.0
         s = _mk_supervisor(side="LONG", entry=ENTRY, tp1_px=tp1, tp2_px=tp2,
                             hard_sl_px=ENTRY - 5.0)
 
-        s._activate_radar(gate_px)
+        s._activate_radar(curr_px)
 
         breakeven = _breakeven("LONG", ENTRY)
+        gate_px = s.radar._activation_gate_price()
         gate_dist = abs(gate_px - ENTRY)
         expected = round(breakeven - RETAIN_FRAC * gate_dist, 2)
         self.assertAlmostEqual(s.radar.get_state().current_sl, expected, places=2)

@@ -50,6 +50,22 @@ TV_STOP_FLOOR_FRAC = 0.65
 PRE_TP1_TP1_DIST_FRAC = 0.65
 PRE_TP1_BREATH_FLOOR_FRAC = 0.65
 
+# 2026-09-20新增：首次开仓的雷达激活线，从"(TP1+TP2)/2中点"改成对齐
+# 币安B系统v2.3的"TP1推进/ATR"双触发(谁先到用谁)——宝贝反馈"CoinW的
+# 雷达激活比币安晚，已经到了TP2止盈位还没激活雷达锁住利润"，两边一对
+# 比就是这个原因：币安首次开仓激活线在entry到TP1这段距离的80%处(或
+# 1.5~2.5×ATR，按开仓档位强弱取更近的那条)，CoinW却要等到TP1和TP2的
+# 中点(明显更晚、往往已经过了TP1)。移植的是币安reentry_profiles.py::
+# radar_gate_price_from_tps的核心两条腿(TP1进度腿+ATR腿，取min)——不
+# 移植mega_strong(持仓期多维度一致确认超强趋势升级锚点)和per-symbol
+# 收益率腿这两个更细的refinement，CoinW目前没有对应的"超强趋势"识别
+# 基础设施，且这两条对我们现在5个焦点品种(BNB/XPD/SNDK/OPENAI/XAU)在
+# 币安那边也都没配置return_pct，影响有限，以后真需要再单独加。重入
+# 开仓(reentry_count>=1)=TP2这条两边本来就一致，不受影响。
+RADAR_GATE_TP1_PROGRESS = 0.8  # entry到TP1距离的这个比例，谁先到用谁
+RADAR_GATE_ATR_MULT_BY_TIER = {"0": 1.5, "1": 1.8, "2": 2.5}  # 弱/中/强，同币安RADAR_GATE_ATR_MULT_BY_TIER
+RADAR_GATE_ATR_MULT_DEFAULT = 1.8  # tier缺失/无法识别时的兜底(=mid档)
+
 
 # ==================== 币安 breath_stop.py 原样移植的纯函数 ====================
 
@@ -430,19 +446,48 @@ class BreathStop:
         with self._lock:
             self._atr = float(atr or 0)
 
-    def arm(self, tp1_price: float, tp2_price: float, direction: str = "LONG"):
-        """开仓后立即调用，记下 TP1/TP2 与方向，供 should_activate 算激活线。"""
+    def arm(self, tp1_price: float, tp2_price: float, direction: str = "LONG",
+            entry_price: float = 0.0, tier: str = ""):
+        """开仓后立即调用，记下 TP1/TP2/方向/entry/tier，供 should_activate
+        算激活线。entry_price/tier 2026-09-20新增，只用于首次开仓的TP1
+        进度/ATR双触发门槛计算(见_activation_gate_price)，不影响其它既有
+        字段语义——旧调用方(不传这两个新参数)行为完全不变，直接退回
+        TP1/TP2距离全部缺失时的TP2兜底分支。ATR腿复用既有的set_atr()
+        (self._atr)，不单独再引入一个字段——调用方本来就该在arm()前后
+        调set_atr()，两者保持同一个数据源，不会出现"忘了传新参数导致
+        ATR腿静默失效"这类问题。"""
         with self._lock:
             self._state.tp1_price = float(tp1_price or 0)
             self._state.tp2_price = float(tp2_price or 0)
             self._state.direction = str(direction or "LONG").upper()
+            if entry_price:
+                self._state.entry_price = float(entry_price or 0)
+            if tier:
+                self._state.tier = str(tier)
 
     def _activation_gate_price(self) -> float:
-        """激活线：首次开仓=(TP1+TP2)/2 中点，重入开仓(reentry_count>=1)=TP2。"""
+        """激活线：首次开仓=entry沿盈利方向推进min(0.8×|TP1-entry|,
+        ATR_MULT×ATR)的距离(2026-09-20起对齐币安B系统v2.3公式，TP1进度
+        腿/ATR腿谁先到用谁，不再是(TP1+TP2)/2中点——见上方RADAR_GATE_*
+        常量顶部注释)，重入开仓(reentry_count>=1)=TP2(不变)。entry/ATR
+        缺失时(旧调用方没传，或TP1本身缺失)优雅退化回旧的中点/TP2兜底，
+        不会因为新字段没值就返回0让雷达永远激活不了。"""
         tp1 = self._state.tp1_price
         tp2 = self._state.tp2_price
         if self._state.reentry_count >= 1:
             return tp2
+        entry = self._state.entry_price
+        atr = self._atr
+        direction = self._state.direction
+        if tp1 > 0 and entry > 0:
+            tp1_side_ok = (direction == "LONG" and tp1 > entry) or (direction == "SHORT" and tp1 < entry)
+            dist_tp1 = RADAR_GATE_TP1_PROGRESS * abs(tp1 - entry) if tp1_side_ok else float("inf")
+            atr_mult = RADAR_GATE_ATR_MULT_BY_TIER.get(str(self._state.tier), RADAR_GATE_ATR_MULT_DEFAULT)
+            dist_atr = atr_mult * atr if atr > 0 else float("inf")
+            dist = min(dist_tp1, dist_atr)
+            if dist > 0 and dist != float("inf"):
+                return entry + dist if direction == "LONG" else entry - dist
+        # 退化路径：entry/ATR缺失(旧调用方)或TP1方向失效——沿用原有中点/TP2兜底
         if tp1 > 0 and tp2 > 0:
             return (tp1 + tp2) / 2.0
         return tp2  # TP1 缺失时退化为 TP2

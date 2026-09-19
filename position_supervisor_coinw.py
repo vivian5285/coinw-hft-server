@@ -1246,11 +1246,17 @@ class PositionSupervisorCoinW:
                     logger.warning(f"TP2跳过: 仓位仅{total_pieces}张，20%不足1张最小单位")
                     self.pipeline.data["tp2"] = {"px": signal.tp2, "pieces": 0, "qty": 0.0}
 
-            # 3) 雷达初始化（休眠状态）——武装TP1/TP2价格供should_activate算
-            # 激活线((TP1+TP2)/2中点)，不依赖TP1/TP2是否真的成交
+            # 3) 雷达初始化（休眠状态）——武装TP1/TP2/entry/ATR/tier供
+            # should_activate算激活线(2026-09-20起改成entry沿盈利方向
+            # 推进min(0.8×TP1距离, ATR_MULT×ATR)，不再是(TP1+TP2)中点，
+            # 见breath_stop.py::_activation_gate_price顶部注释)，不依赖
+            # TP1/TP2是否真的成交
             self.radar.set_atr(signal.atr)
             self.radar.reset()
-            self.radar.arm(tp1_price=signal.tp1, tp2_price=signal.tp2, direction=direction)
+            self.radar.arm(
+                tp1_price=signal.tp1, tp2_price=signal.tp2, direction=direction,
+                entry_price=entry_price, tier=str(signal.tier),
+            )
             self.radar.set_reentry_count(1 if getattr(self, "_is_reentry_open", False) else 0)
 
             logger.info(f"防线就绪: SL={hard_sl_price}, TP1={signal.tp1}, TP2={signal.tp2}")
@@ -2757,9 +2763,16 @@ class PositionSupervisorCoinW:
         _sgn = 1 if side == "LONG" else -1
         tp1_est = tp1_px or (entry + _sgn * _t1a * atr if atr > 0 else 0.0)
         tp2_est = tp2_px or (entry + _sgn * _t2a * atr if atr > 0 else 0.0)
-        self.radar.arm(tp1_price=tp1_est, tp2_price=(tp2_est or entry), direction=side)
+        self.radar.arm(
+            tp1_price=tp1_est, tp2_price=(tp2_est or entry), direction=side,
+            entry_price=entry, tier=str(self.pipeline.data.get("tier") or ""),
+        )
         px = float(self._get_current_price() or entry)
-        gate = ((tp1_est + tp2_est) / 2.0) if (tp1_est and tp2_est) else (tp2_est or entry)
+        # 2026-09-20起激活线公式改了(见breath_stop.py::_activation_gate_
+        # price顶部注释)，这里直接问雷达自己刚arm()好的门槛，不再自己
+        # 重复算一遍(TP1+TP2)/2——避免这条重启对账路径跟雷达内部用的
+        # 公式各算各的、悄悄跑偏。
+        gate = self.radar._activation_gate_price()
         # 2026-09-13修复(BNB实盘复现)：原来只靠"现价有没有过激活线(用tp1_est/
         # tp2_est现算的gate)"这一条判断"重启前雷达是不是已经激活过"——雷达真的
         # 已经激活过、把交易所止损从开仓时的hard_sl移到了盈利区间(比如
