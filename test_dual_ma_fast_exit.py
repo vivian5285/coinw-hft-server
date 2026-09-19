@@ -56,9 +56,10 @@ class _FakePipeline:
 
 
 class _FakeRadarState:
-    def __init__(self, current_sl=200.0, initial_atr=2.0):
+    def __init__(self, current_sl=200.0, initial_atr=2.0, tp1_price=0.0):
         self.current_sl = current_sl
         self.initial_atr = initial_atr
+        self.tp1_price = tp1_price
 
 
 def _mk_supervisor(symbol="OPENAI", side="SHORT"):
@@ -207,6 +208,62 @@ class TestDualMaFastExit(unittest.TestCase):
 
     def _sym_or(self, default):
         return default
+
+
+class TestSlowLenIs30(unittest.TestCase):
+    def test_constants_are_8_and_30(self):
+        """2026-09-19：宝贝反馈8/20慢线太短，正常回撤就能打穿——改成
+        8/30。"""
+        self.assertEqual(psc.DUAL_MA_EXIT_FAST_LEN, 8)
+        self.assertEqual(psc.DUAL_MA_EXIT_SLOW_LEN, 30)
+
+
+class TestProfitProgressGate(unittest.TestCase):
+    """2026-09-19新增(宝贝反馈"本周系统问题总结")：DUAL_MA_EXIT不该开仓
+    /雷达刚激活就立刻评判平仓——TV自己已经决定了这笔交易，硬止损才是
+    真正的安全网；双均线的职责是保护已经取得的利润，只有浮盈真正越过
+    TP1、朝TP2/TP3推进之后才轮到它说了算。"""
+
+    def test_gate_blocks_before_tp1_even_with_confirmed_break(self):
+        """SHORT持仓，TP1=80，现价90(还没到TP1，浮盈不够) → 即使双均线
+        真实放量确认破位，也不该强平。"""
+        s = _mk_supervisor(side="SHORT")
+        s.radar.get_state.return_value = _FakeRadarState(tp1_price=80.0)
+        bars = _make_bars(decline_n=40, rally_n=10, surge=True)
+        s._fetch_dual_ma_exit_klines = MagicMock(return_value=bars)
+        close_px = bars[-1][4]
+        self.assertGreater(close_px, 80.0, "close必须还没到TP1，测试前提")
+        s._maybe_fast_exit_on_dual_ma_break(close_px)
+        s._clear_position.assert_not_called()
+        s._update_radar_sl.assert_not_called()
+
+    def test_gate_opens_once_past_tp1(self):
+        """SHORT持仓，TP1=95，现价(=破位K线收盘价)已经跌破TP1(浮盈已经
+        越过TP1) → 恢复原有行为，真实放量确认破位时照常清仓。"""
+        s = _mk_supervisor(side="SHORT")
+        bars = _make_bars(decline_n=40, rally_n=10, surge=True)
+        close_px = bars[-1][4]
+        s.radar.get_state.return_value = _FakeRadarState(tp1_price=close_px + 1.0)
+        s._fetch_dual_ma_exit_klines = MagicMock(return_value=bars)
+        s._maybe_fast_exit_on_dual_ma_break(close_px)
+        s._clear_position.assert_called_once()
+
+    def test_gate_defaults_open_when_tp1_missing(self):
+        """TP1数据不可得(0)时默认放行，不静默关掉这层保护——覆盖既有
+        用例默认行为不变。"""
+        s = _mk_supervisor(side="SHORT")
+        s.radar.get_state.return_value = _FakeRadarState(tp1_price=0.0)
+        bars = _make_bars(decline_n=40, rally_n=10, surge=True)
+        s._fetch_dual_ma_exit_klines = MagicMock(return_value=bars)
+        s._maybe_fast_exit_on_dual_ma_break(bars[-1][4])
+        s._clear_position.assert_called_once()
+
+    def test_gate_helper_long_side_mirrors_short(self):
+        """LONG持仓：现价站上TP1才算越过。"""
+        s = _mk_supervisor(side="LONG")
+        s.radar.get_state.return_value = _FakeRadarState(tp1_price=110.0)
+        self.assertFalse(s._dual_ma_exit_profit_gate_open(105.0))
+        self.assertTrue(s._dual_ma_exit_profit_gate_open(110.5))
 
 
 if __name__ == "__main__":

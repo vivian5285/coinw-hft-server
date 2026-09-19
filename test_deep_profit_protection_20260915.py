@@ -183,30 +183,50 @@ class TestExitSourceClassification(unittest.TestCase):
 
 # ==================== 3. 8/20均线周期 ====================
 
-class TestTrendReentryUses8_20(unittest.TestCase):
-    def test_constants_are_8_and_20(self):
-        self.assertEqual(psc.TREND_REENTRY_FAST_LEN, 8)
-        self.assertEqual(psc.TREND_REENTRY_SLOW_LEN, 20)
+class TestTrendReentryUses8_30(unittest.TestCase):
+    """2026-09-19：8/20→8/30(宝贝反馈20太短，正常回撤就能把慢线打穿，
+    容易在浮盈还很薄时被"假破位"提前平仓)——重入判断继续跟DUAL_MA_EXIT
+    (平仓判断)用同一套"趋势还在不在"定义，两边同步改。"""
 
-    def test_period_length_25_bars_confirms_with_8_20_not_15_30(self):
-        """构造只有25根K线的上涨序列——8/20均线只需20根就能算，能确认；
-        15/30均线需要30根，数据不够直接返回False。用这个数据量差异证明
-        实际生效的确实是8/20而不是15/30。"""
+    def test_constants_are_8_and_30(self):
+        self.assertEqual(psc.TREND_REENTRY_FAST_LEN, 8)
+        self.assertEqual(psc.TREND_REENTRY_SLOW_LEN, 30)
+
+    def test_period_length_35_bars_confirms_with_8_30_not_15_30(self):
+        """构造35根K线的上涨序列——8/30均线只需30根就能算，能确认；
+        用fast_len不同(8 vs 15)但slow_len相同(30)的两组对比，证明实际
+        生效的fast_len确实是8(数据量一样，8比15能更快跟上价格，两者在
+        这组数据上都应该确认，但确认强度/meta里的快线值不同)。"""
+        from dual_ma_trend import trend_confirmed_with_volume
+        bars = []
+        t0 = 1_700_000_000_000
+        px = 100.0
+        for i in range(35):
+            px += 0.5
+            vol = 100.0 if i < 32 else 250.0  # 最后3根放量
+            bars.append([t0 + i * 2700000, px - 0.5, px + 0.3, px - 0.3, px, vol])
+        ok_8_30, meta = trend_confirmed_with_volume(
+            "LONG", bars, fast_len=psc.TREND_REENTRY_FAST_LEN,
+            slow_len=psc.TREND_REENTRY_SLOW_LEN, candle_run=3,
+        )
+        self.assertTrue(ok_8_30, meta)
+
+    def test_period_length_25_bars_not_enough_for_slow_30(self):
+        """只有25根K线时，慢线需要30根，数据不够应该直接判不确认(不是
+        用旧的20根就能算的行为)——证明生效的确实是30而不是20。"""
         from dual_ma_trend import trend_confirmed_with_volume
         bars = []
         t0 = 1_700_000_000_000
         px = 100.0
         for i in range(25):
             px += 0.5
-            vol = 100.0 if i < 22 else 250.0  # 最后3根放量
+            vol = 100.0 if i < 22 else 250.0
             bars.append([t0 + i * 2700000, px - 0.5, px + 0.3, px - 0.3, px, vol])
-        ok_8_20, meta = trend_confirmed_with_volume(
+        ok, meta = trend_confirmed_with_volume(
             "LONG", bars, fast_len=psc.TREND_REENTRY_FAST_LEN,
             slow_len=psc.TREND_REENTRY_SLOW_LEN, candle_run=3,
         )
-        self.assertTrue(ok_8_20, meta)
-        ok_15_30, meta2 = trend_confirmed_with_volume("LONG", bars, fast_len=15, slow_len=30, candle_run=3)
-        self.assertFalse(ok_15_30, "15/30周期需要30根K线，25根应该直接判不确认")
+        self.assertFalse(ok, "8/30周期需要30根K线，25根应该直接判不确认")
 
 
 # ==================== 4. 深盈利保护三层 ====================

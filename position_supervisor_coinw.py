@@ -83,8 +83,10 @@ TREND_REENTRY_ENABLED = os.getenv("TREND_REENTRY_ENABLED", "1").lower() in ("1",
 # 2026-09-15：15/30→8/20，跟DUAL_MA_EXIT(平仓判断"趋势还在不在")用
 # 同一套均线定义，不再是"开仓抄TV的15/30、平仓用引擎自己的8/20"两套
 # 并存。
+# 2026-09-19再改：宝贝反馈8/20慢线太短，正常回撤就能打穿——改成8/30，
+# 跟DUAL_MA_EXIT_SLOW_LEN同步改(两者本来就该用同一套"趋势还在不在"定义)。
 TREND_REENTRY_FAST_LEN = int(os.getenv("TREND_REENTRY_FAST_LEN", "8"))
-TREND_REENTRY_SLOW_LEN = int(os.getenv("TREND_REENTRY_SLOW_LEN", "20"))
+TREND_REENTRY_SLOW_LEN = int(os.getenv("TREND_REENTRY_SLOW_LEN", "30"))
 TREND_REENTRY_MA_TYPE = os.getenv("TREND_REENTRY_MA_TYPE", "SMA")
 # 2026-09-15：30→45分钟(宝贝原话明确指定45分钟双均线，同时把确认口径
 # 从单纯dual_ma_trend_ok换成trend_confirmed_with_volume——见
@@ -152,9 +154,15 @@ TV_EXIT_STALL_TIGHT_ATR = float(os.getenv("TV_EXIT_STALL_TIGHT_ATR", "0.3"))
 # 走完了就别等ATR慢慢追"。真实放量确认破位时直接清仓；量能没确认(疑似
 # 假突破)时不强平，只把止损适度收紧到破位K线收盘价附近，给行情留时间
 # 验证是否真反转。
+# 2026-09-19再补充(宝贝反馈"本周系统问题总结")：不该开仓/雷达刚激活就
+# 立刻评判平仓——TV自己已经决定了这笔交易，硬止损才是真正的安全网；双
+# 均线的职责是"保护已经取得的利润"，应该等浮盈真正越过TP1、朝TP2/TP3
+# 推进之后，才让双均线破位的判断说了算(不管是强平还是收紧)，见下面
+# _dual_ma_exit_profit_gate_open()。慢线也同步20→30(理由同上，太短容易
+# 被正常回撤打穿)。
 DUAL_MA_EXIT_ENABLED = os.getenv("DUAL_MA_EXIT", "1").lower() in ("1", "true", "yes")
 DUAL_MA_EXIT_FAST_LEN = 8
-DUAL_MA_EXIT_SLOW_LEN = 20
+DUAL_MA_EXIT_SLOW_LEN = 30
 DUAL_MA_EXIT_KLINE_LIMIT = 80
 DUAL_MA_EXIT_REFRESH_SEC = 300.0
 DUAL_MA_EXIT_SOFT_TIGHTEN_BUFFER_ATR = 0.3
@@ -2094,6 +2102,23 @@ class PositionSupervisorCoinW:
                 f"确认会直接清仓)"
             )
 
+    def _dual_ma_exit_profit_gate_open(self, current_price: float) -> bool:
+        """2026-09-19新增：DUAL_MA_EXIT只在浮盈已经"越过TP1"之后才生效
+        ——TV自己已经决定了这笔交易，硬止损才是真正的安全网；双均线的
+        职责是保护已经取得的利润，不该开仓/雷达刚激活就立刻评判平仓，
+        需要先给一点呼吸空间。TP1数据不可得时默认放行(不静默关掉这层
+        保护)。"""
+        side = str(self.pipeline.data.get("side") or "").upper()
+        if side not in ("LONG", "SHORT"):
+            return True
+        st = self.radar.get_state()
+        tp1 = float(getattr(st, "tp1_price", 0) or 0)
+        if tp1 <= 0:
+            return True
+        if side == "LONG":
+            return current_price >= tp1
+        return current_price <= tp1
+
     def _maybe_fast_exit_on_dual_ma_break(self, current_price: float):
         """双均线破位快速平仓——见上方DUAL_MA_EXIT_*常量顶部注释。跟
         _apply_reversal_lock同一个位置调用、同一种"自己处理副作用、不
@@ -2104,6 +2129,8 @@ class PositionSupervisorCoinW:
             return
         side = str(self.pipeline.data.get("side") or "").upper()
         if side not in ("LONG", "SHORT"):
+            return
+        if not self._dual_ma_exit_profit_gate_open(current_price):
             return
         now = time.time()
         last_check = float(getattr(self, "_dual_ma_exit_last_check_ts", 0) or 0)
