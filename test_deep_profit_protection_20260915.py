@@ -314,8 +314,9 @@ class TestTvExitStallTighten(unittest.TestCase):
         s._maybe_tighten_on_tv_exit_stall(103.0)
         self.assertEqual(s.radar.get_state().current_sl, 100.5)
 
-        # 模拟滞涨已经过了3个TV周期(BNB=45分钟)
-        s._tv_exit_stall_since_ts = time.time() - 45 * 60 * 3 - 10
+        # 模拟滞涨已经过了3个TV周期(BNB=65分钟，2026-09-19核对TV截图
+        # 重新校准，旧版45分钟已过期)
+        s._tv_exit_stall_since_ts = time.time() - 65 * 60 * 3 - 10
         s._maybe_tighten_on_tv_exit_stall(103.0)
 
         expected = round(103.0 - 2.0 * 0.3, 2)

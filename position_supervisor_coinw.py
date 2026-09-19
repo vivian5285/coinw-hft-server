@@ -169,11 +169,14 @@ DUAL_MA_EXIT_SOFT_TIGHTEN_BUFFER_ATR = 0.3
 DUAL_MA_EXIT_NATIVE_BASE_MIN = 15  # CoinW原生支持15/120，45/75靠15合成(×3/×5)
 # 每个品种自己真实的TV周期——同一份数值跟币安B系统
 # (radar_reentry_mixin.py::DUAL_MA_EXIT_INTERVAL_MIN)保持一致。
-# 2026-09-13：OPENAI从120分钟改成45分钟(宝贝把TV alert周期改了，跟其余
-# 品种统一，实盘目前只剩SNDK还是75分钟)。
+# 2026-09-19核对TV警报截图重新校准：宝贝反馈"有的品种的时间周期有做
+# 改变"——2026-09-13那版(BNB/XPD/OPENAI/XAU=45分钟, SNDK=75分钟)已经
+# 跟TV实际在用的周期对不上，直接拿今天的真实截图数字校正。
 DUAL_MA_EXIT_INTERVAL_MIN = {
-    "BNB": 45, "XPD": 45, "SNDK": 75, "OPENAI": 45, "XAU": 45, "XPT": 45,
-    "XRP": 45, "SOL": 45,
+    "BNB": 65, "XPD": 49, "SNDK": 91, "OPENAI": 65, "XAU": 50,
+    # 下面几个当前已暂停(不在ACTIVE_SYMBOLS白名单)，没有最新TV截图
+    # 数据，暂时保留2026-09-13那版旧值——恢复交易前需要重新核对。
+    "XPT": 45, "XRP": 45, "SOL": 45,
 }
 DUAL_MA_EXIT_DEFAULT_INTERVAL_MIN = 45
 
@@ -2007,18 +2010,31 @@ class PositionSupervisorCoinW:
 
     _COINW_NATIVE_GRAN = {1, 3, 5, 15, 30, 60, 120, 240, 360, 480, 1440, 10080}
 
-    def _synth_klines_via_coinw_15m(self, interval_min: int, limit: int) -> list:
-        """CoinW原生只支持15/120分钟等固定枚举，45/75分钟(CoinW和币安B
-        系统这几个焦点品种真实用的TV周期)靠CoinW自己的15分钟K线合成
-        (×3/×5)。跟_synth_150同一套(open取首根/high取窗口最高/low取
-        窗口最低/close取末根/volume求和)，只是把固定的f=5换成按周期算
-        出来的通用倍数。只在_get_risk_klines()币安公开K线也拉不到时
-        才会被调用到，是"兜底的兜底"。"""
-        factor = interval_min // 15
+    def _coinw_native_source_period(self, interval_min: int) -> int:
+        """从CoinW原生粒度集合里，挑能整除目标周期、且尽量粗的那个当
+        合成源周期——跟binance_klines.py::resolve_source_interval同一
+        个思路(2026-09-19新增，配合当天把DUAL_MA_EXIT_INTERVAL_MIN从
+        旧的45/75重新校准成49/50/65/91这些真实TV周期后，原来写死的
+        "只处理45/75"特例已经不够用——这些新周期没有一个是15的整数倍，
+        必须像币安那边一样按能整除的最粗原生粒度动态挑源周期，不能再
+        硬编码只认45/75)。找不到能整除的(理论上不会，1永远整除任何
+        整数分钟数)才退化到1分钟。"""
+        for g in sorted(self._COINW_NATIVE_GRAN, reverse=True):
+            if g < interval_min and interval_min % g == 0:
+                return g
+        return 1
+
+    def _synth_klines_via_coinw_native(self, interval_min: int, limit: int) -> list:
+        """CoinW原生K线合成任意目标周期——挑_coinw_native_source_period()
+        选出的最粗能整除源周期，按窗口桶合并(open取首根/high取窗口
+        最高/low取窗口最低/close取末根/volume求和)。只在_get_risk_
+        klines()币安公开K线也拉不到时才会被调用到，是"兜底的兜底"。"""
+        src = self._coinw_native_source_period(interval_min)
+        factor = interval_min // src
         if factor <= 0:
             return []
         try:
-            raw = self.client.get_klines(self.symbol, 15, limit * factor + factor)
+            raw = self.client.get_klines(self.symbol, src, limit * factor + factor)
         except Exception:
             return []
         if not raw or len(raw) < factor:
@@ -2073,8 +2089,8 @@ class PositionSupervisorCoinW:
                 return self.client.get_klines(self.symbol, interval_min, limit)
             except Exception:
                 return []
-        if interval_min in (45, 75):
-            return self._synth_klines_via_coinw_15m(interval_min, limit)
+        if interval_min > 0:
+            return self._synth_klines_via_coinw_native(interval_min, limit)
         logger.warning(f"[{self.symbol}] 风险K线：兜底也无法处理的周期{interval_min}m，返回空")
         return []
 

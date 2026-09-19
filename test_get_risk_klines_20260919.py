@@ -95,22 +95,37 @@ class TestGetRiskKlinesFallback(unittest.TestCase):
         s.client.get_klines.assert_called_once_with("XAU", 60, 400)
         self.assertEqual(out, native_bars)
 
-    def test_binance_empty_45m_falls_back_to_15m_synthesis(self):
+    def test_binance_empty_45m_falls_back_to_native_synthesis(self):
         """核心回归——45分钟这类CoinW非原生粒度：币安拉不到时，不能
-        直接返回空，要落到CoinW自己15分钟K线合成这条二级兜底。"""
+        直接返回空，要落到CoinW自己K线合成这条二级兜底(2026-09-19起
+        改成通用的_synth_klines_via_coinw_native，不再局限于旧的
+        45/75两个硬编码特例)。"""
         s = _mk_supervisor(symbol="OPENAI")
-        s._synth_klines_via_coinw_15m = MagicMock(return_value=[[9, 9, 9, 9, 9, 9]])
+        s._synth_klines_via_coinw_native = MagicMock(return_value=[[9, 9, 9, 9, 9, 9]])
         with patch("binance_klines.get_bars", return_value=[]):
             out = s._get_risk_klines(45, 60)
-        s._synth_klines_via_coinw_15m.assert_called_once_with(45, 60)
+        s._synth_klines_via_coinw_native.assert_called_once_with(45, 60)
         self.assertEqual(out, [[9, 9, 9, 9, 9, 9]])
 
-    def test_both_binance_and_coinw_fallback_unavailable_returns_empty(self):
-        """币安拉不到 + 非原生/非45/75的怪异周期 → 安全返回空列表，
-        不崩溃。"""
+    def test_binance_empty_non_15_multiple_period_also_falls_back(self):
+        """2026-09-19新增：宝贝当前真实TV周期(49/50/65/91分钟)没有一个
+        是15的整数倍——旧代码"只认45/75"的特例会让这些周期币安拉不到
+        时直接返回空(等于CoinW自己完全没有兜底)。改成通用合成后，任意
+        周期都该落到兜底，不再是"怪异周期"。"""
         s = _mk_supervisor(symbol="OPENAI")
+        s._synth_klines_via_coinw_native = MagicMock(return_value=[[7, 7, 7, 7, 7, 7]])
         with patch("binance_klines.get_bars", return_value=[]):
-            out = s._get_risk_klines(50, 60)
+            out = s._get_risk_klines(65, 60)
+        s._synth_klines_via_coinw_native.assert_called_once_with(65, 60)
+        self.assertEqual(out, [[7, 7, 7, 7, 7, 7]])
+
+    def test_both_binance_and_coinw_client_unavailable_returns_empty(self):
+        """币安拉不到 + CoinW自己的client.get_klines也失败(而不是"周期
+        识别不了") → 安全返回空列表，不崩溃。"""
+        s = _mk_supervisor(symbol="OPENAI")
+        s.client.get_klines = MagicMock(side_effect=RuntimeError("boom"))
+        with patch("binance_klines.get_bars", return_value=[]):
+            out = s._get_risk_klines(65, 60)
         self.assertEqual(out, [])
 
 
@@ -152,6 +167,53 @@ class TestTrendReentry45mDeadFetchRegression(unittest.TestCase):
             out = s._get_risk_klines(45, 60)
         self.assertEqual(len(out), 60)
         s.client.get_klines.assert_not_called()
+
+
+class TestCoinwNativeSourcePeriodRealPeriods(unittest.TestCase):
+    """2026-09-19：宝贝核对TV截图重新校准的真实周期——49(XPD)/50(XAU)/
+    65(BNB/OPENAI)/91(SNDK)——没有一个是15的整数倍，旧代码"只认45/75"
+    的硬编码特例完全覆盖不到。验证_coinw_native_source_period()对这些
+    真实值都能正确挑出能整除的最粗原生源周期，不会退化成什么都拉不到。"""
+
+    def test_65_picks_5m_source(self):
+        s = _mk_supervisor(symbol="BNB")
+        self.assertEqual(s._coinw_native_source_period(65), 5)
+
+    def test_50_picks_5m_source(self):
+        s = _mk_supervisor(symbol="XAU")
+        self.assertEqual(s._coinw_native_source_period(50), 5)
+
+    def test_49_falls_back_to_1m_source(self):
+        """49=7×7，原生集合里除了1没有别的能整除——退化到1分钟，仍然
+        能合成，只是源K线用量更大。"""
+        s = _mk_supervisor(symbol="XPD")
+        self.assertEqual(s._coinw_native_source_period(49), 1)
+
+    def test_91_falls_back_to_1m_source(self):
+        """91=7×13，同上退化到1分钟。"""
+        s = _mk_supervisor(symbol="SNDK")
+        self.assertEqual(s._coinw_native_source_period(91), 1)
+
+    def test_synth_native_end_to_end_with_65m(self):
+        """端到端：用65分钟(5分钟源×13根一桶)验证合成结果的OHLCV聚合
+        正确——open取窗口首根，high取窗口最高，low取窗口最低，close取
+        窗口末根，volume求和。"""
+        s = _mk_supervisor(symbol="BNB")
+        t0 = 1_700_000_000_000
+        raw = [
+            [t0 + i * 5 * 60000, 100.0 + i, 101.0 + i, 99.0 + i, 100.5 + i, 10.0]
+            for i in range(26)  # 2个完整65分钟桶(各13根5分钟)
+        ]
+        s.client.get_klines = MagicMock(return_value=raw)
+        out = s._synth_klines_via_coinw_native(65, 2)
+        self.assertEqual(len(out), 2)
+        first_bucket = raw[0:13]
+        self.assertEqual(out[0][0], first_bucket[0][0])   # t=首根
+        self.assertAlmostEqual(out[0][1], first_bucket[0][1])   # open=首根
+        self.assertAlmostEqual(out[0][2], max(c[2] for c in first_bucket))  # high
+        self.assertAlmostEqual(out[0][3], min(c[3] for c in first_bucket))  # low
+        self.assertAlmostEqual(out[0][4], first_bucket[-1][4])  # close=末根
+        self.assertAlmostEqual(out[0][5], sum(c[5] for c in first_bucket))  # volume求和
 
 
 if __name__ == "__main__":

@@ -29,6 +29,15 @@ import position_supervisor_coinw as psc  # noqa: E402
 
 
 class TestOrphanedLivePositions(unittest.TestCase):
+    def setUp(self):
+        # 检测到孤儿仓位时会调dingtalk.send_alert发告警——本地/CI环境
+        # 如果.env恰好配了真实TELEGRAM_BOT_TOKEN(python-dotenv会往上层
+        # 目录找)，不mock的话会真的发起网络请求，慢则拖到10s超时，快则
+        # 意外真发一条告警消息。测试必须在任何环境下都不碰真实网络。
+        patcher = patch("dingtalk.send_alert")
+        self.mock_send_alert = patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_paused_symbol_with_real_position_is_orphaned(self):
         """核心回归：ETH(2026-09-15暂停)有真实非零仓位、但不在
         ACTIVE_SYMBOLS里 → 必须被识别为需要补建/唤醒supervisor的孤儿

@@ -165,39 +165,43 @@ class TestDualMaFastExit(unittest.TestCase):
             mock_bn.assert_not_called()
         s.client.get_klines.assert_not_called()
 
-    def test_synthesizes_45m_from_15m_for_openai(self):
-        """2026-09-13起：OPENAI从120分钟改成45分钟，不再原生直取，改用
-        15分钟合成(跟BNB/XPD/XAU/XPT/XRP/SOL同一套)。
-        2026-09-19：_fetch_dual_ma_exit_klines()现在经_get_risk_klines()
-        统一入口，币安公开K线优先——这里mock binance_klines.get_bars
-        返回空列表，强制走到CoinW自己15分钟合成这条兜底路径，验证的还是
-        这条兜底逻辑本身(不是新的主路径，主路径见
-        test_get_risk_klines_20260919.py)。"""
+    def test_synthesizes_65m_from_5m_for_openai(self):
+        """2026-09-19核对TV截图重新校准：OPENAI从45分钟改成65分钟(旧版
+        45分钟已过期)——65不是CoinW原生粒度，也不是15的整数倍，通用合成
+        (_synth_klines_via_coinw_native)会挑能整除65的最粗原生源周期
+        =5分钟(65/5=13)。
+        _fetch_dual_ma_exit_klines()经_get_risk_klines()统一入口，币安
+        公开K线优先——这里mock binance_klines.get_bars返回空列表，强制
+        走到CoinW自己K线合成这条兜底路径，验证的还是这条兜底逻辑本身
+        (不是新的主路径，主路径见test_get_risk_klines_20260919.py)。"""
         s = _mk_supervisor(symbol="OPENAI")
-        bars = _make_bars(decline_n=50, rally_n=0, period_min=15)
+        bars = _make_bars(decline_n=450, rally_n=0, period_min=5)
         s.client.get_klines = MagicMock(return_value=bars)
         with patch("binance_klines.get_bars", return_value=[]):
             s._maybe_fast_exit_on_dual_ma_break(bars[-1][4])
         args, kwargs = s.client.get_klines.call_args
-        self.assertEqual(args[1], 15)  # 用15分钟原生base
+        self.assertEqual(args[1], 5)  # 用5分钟原生base(65/5=13)
 
-    def test_synthesizes_45m_from_15m_for_bnb(self):
+    def test_synthesizes_65m_from_5m_for_bnb(self):
+        """BNB同OPENAI，2026-09-19校准后也是65分钟。"""
         s = _mk_supervisor(symbol="BNB")
-        bars = _make_bars(decline_n=50, rally_n=0, period_min=15)
+        bars = _make_bars(decline_n=450, rally_n=0, period_min=5)
         s.client.get_klines = MagicMock(return_value=bars)
         with patch("binance_klines.get_bars", return_value=[]):
             s._maybe_fast_exit_on_dual_ma_break(bars[-1][4])
         args, kwargs = s.client.get_klines.call_args
-        self.assertEqual(args[1], 15)  # 用15分钟原生base
+        self.assertEqual(args[1], 5)
 
-    def test_synthesizes_75m_from_15m_for_sndk(self):
+    def test_synthesizes_91m_from_1m_for_sndk(self):
+        """SNDK 2026-09-19校准后是91分钟(=7×13)，不是CoinW任何原生粒度
+        的整数倍，通用合成退化到1分钟源(91/1=91)。"""
         s = _mk_supervisor(symbol="SNDK")
-        bars = _make_bars(decline_n=80, rally_n=0, period_min=15)
+        bars = _make_bars(decline_n=3200, rally_n=0, period_min=1)
         s.client.get_klines = MagicMock(return_value=bars)
         with patch("binance_klines.get_bars", return_value=[]):
             s._maybe_fast_exit_on_dual_ma_break(bars[-1][4])
         args, kwargs = s.client.get_klines.call_args
-        self.assertEqual(args[1], 15)
+        self.assertEqual(args[1], 1)
 
     def test_klines_fetch_failure_is_safe_noop(self):
         s = _mk_supervisor()
