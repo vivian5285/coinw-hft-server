@@ -23,7 +23,7 @@ import os
 import sys
 import time
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -65,6 +65,17 @@ def _mk_supervisor(symbol="ETH"):
 
 
 class TestMaybeTrendReentry(unittest.TestCase):
+    """2026-09-19：_maybe_trend_reentry()内部K线拉取现在经_get_risk_
+    klines()统一入口，币安公开K线优先——这里全类级patch binance_klines.
+    get_bars返回空列表，强制落到CoinW自己的get_klines(本文件所有用例
+    早就mock好的)这条兜底路径，不影响任何用例本身要验证的趋势重入
+    逻辑(该逻辑只关心K线内容本身，不关心K线来源)。"""
+
+    def setUp(self):
+        patcher = patch("binance_klines.get_bars", return_value=[])
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_no_tv_history_returns_none(self):
         """从没见过TV给过方向——没什么好评估的，直接放行给原有
         both_flat逻辑，不该触发任何开仓尝试。"""

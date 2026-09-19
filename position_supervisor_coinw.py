@@ -791,7 +791,7 @@ class PositionSupervisorCoinW:
         parts = []
         for tf, code, n in (("30m", 30, 400), ("60m", 60, 400), ("4h", 240, 200)):
             try:
-                bars = self.client.get_klines(self.symbol, code, n)
+                bars = self._get_risk_klines(code, n)
             except Exception:
                 bars = []
             if not bars or len(bars) < 25:
@@ -1144,7 +1144,7 @@ class PositionSupervisorCoinW:
             # TV那边用的图表周期，VPS自主判断，周期choice见atr_scenario.py
             # 模块docstring）。
             _need_bars = STRUCT_LOOKBACK_BARS + ATR_PERIOD + 10
-            klines = self.client.get_klines(self.symbol, interval_min=30, limit=_need_bars)
+            klines = self._get_risk_klines(30, _need_bars)
             hard_sl_price, hard_sl_meta, ok, err = calc_smart_hard_stop_price(
                 side=direction,
                 entry_price=entry_price,
@@ -1661,7 +1661,7 @@ class PositionSupervisorCoinW:
                         return
                 if self._reentry_count >= REENTRY_MAX:
                     return
-                bars = self.client.get_klines(self.symbol, 60, 400)
+                bars = self._get_risk_klines(60, 400)
                 px = float(self._get_current_price() or 0)
                 if bars and px > 0:
                     ok, reason = reentry_gate(
@@ -1714,7 +1714,7 @@ class PositionSupervisorCoinW:
     def _climax_check(self, side: str, price: float):
         """进场前：(veto, warn, detail)。"""
         try:
-            bars = self.client.get_klines(self.symbol, 60, 400)
+            bars = self._get_risk_klines(60, 400)
             if not bars:
                 return False, False, "no_bars"
             from market_overlays import climax_check
@@ -1740,7 +1740,7 @@ class PositionSupervisorCoinW:
         if mfe < REVLOCK_MIN_PROFIT_ATR * atr:
             return
         try:
-            raw4h = self.client.get_klines(self.symbol, 240, 120)
+            raw4h = self._get_risk_klines(240, 120)
         except Exception:
             return
         if not raw4h or len(raw4h) < 20:
@@ -1935,24 +1935,20 @@ class PositionSupervisorCoinW:
         self.radar.seed_stop(new_sl)
         self._update_radar_sl(new_sl)
 
-    def _fetch_dual_ma_exit_klines(self) -> list:
-        """双均线破位检查专用取K线——品种自己真实TV周期，CoinW原生只支持
-        15/120分钟等固定枚举，45/75分钟(BNB/XPD/XAU/XPT=45，SNDK=75)靠
-        15分钟合成(×3/×5)，OPENAI=120分钟原生直接拉，不用合成。合成逻辑
-        跟_synth_150同一套(open取首根/high取窗口最高/low取窗口最低/close
-        取末根/volume求和)，只是把固定的f=5换成按品种查表的通用倍数。"""
-        interval_min = DUAL_MA_EXIT_INTERVAL_MIN.get(self.symbol, DUAL_MA_EXIT_DEFAULT_INTERVAL_MIN)
-        if interval_min == DUAL_MA_EXIT_NATIVE_BASE_MIN or interval_min not in (45, 75):
-            try:
-                return self.client.get_klines(self.symbol, interval_min, DUAL_MA_EXIT_KLINE_LIMIT)
-            except Exception:
-                return []
-        factor = interval_min // DUAL_MA_EXIT_NATIVE_BASE_MIN
+    _COINW_NATIVE_GRAN = {1, 3, 5, 15, 30, 60, 120, 240, 360, 480, 1440, 10080}
+
+    def _synth_klines_via_coinw_15m(self, interval_min: int, limit: int) -> list:
+        """CoinW原生只支持15/120分钟等固定枚举，45/75分钟(CoinW和币安B
+        系统这几个焦点品种真实用的TV周期)靠CoinW自己的15分钟K线合成
+        (×3/×5)。跟_synth_150同一套(open取首根/high取窗口最高/low取
+        窗口最低/close取末根/volume求和)，只是把固定的f=5换成按周期算
+        出来的通用倍数。只在_get_risk_klines()币安公开K线也拉不到时
+        才会被调用到，是"兜底的兜底"。"""
+        factor = interval_min // 15
+        if factor <= 0:
+            return []
         try:
-            raw = self.client.get_klines(
-                self.symbol, DUAL_MA_EXIT_NATIVE_BASE_MIN,
-                DUAL_MA_EXIT_KLINE_LIMIT * factor + factor,
-            )
+            raw = self.client.get_klines(self.symbol, 15, limit * factor + factor)
         except Exception:
             return []
         if not raw or len(raw) < factor:
@@ -1964,6 +1960,60 @@ class PositionSupervisorCoinW:
             out.append([ch[0][0], ch[0][1], max(c[2] for c in ch),
                         min(c[3] for c in ch), ch[-1][4], sum(c[5] for c in ch)])
         return out
+
+    def _get_risk_klines(self, interval_min: int, limit: int) -> list:
+        """2026-09-19新增：所有"风险计算"类K线(综合硬止损/双均线破位/
+        反转锁利/趋势确认重入/追单多周期确认/突发反转K线)统一改成优先
+        拉币安公开K线，CoinW自己的K线只做兜底——CoinW自己的行情深度比
+        币安薄，偶尔一笔稍大的单子就能在CoinW自己的K线上制造一个"假
+        摆动点"，算出来的止损/趋势判断跟币安同一笔信号对不上号(实盘
+        复现：OPENAI/XPD/XAU止损距离两边对不上，XPD一度贴着entry几个
+        点就被CoinW自己打平，币安同一笔信号算出来的止损宽了好几倍)。
+        只换这一层"算风险参数用的K线"，仓位查询/下单/止盈止损这些
+        执行类操作完全不变，还是CoinW自己的coinw_client.py——跟宝贝
+        早就确认过的"币赢那边自己查仓位还是归CoinW自己管"一致。
+
+        顺带修复一个当前就在生效的bug：_maybe_trend_reentry此前直接用
+        self.client.get_klines(self.symbol, 45或75, ...)拉K线，但
+        CoinW原生get_klines只支持{1,3,5,15,30,60,120,240,360,480,
+        1440,10080}这些粒度，45/75根本不在其中——这个调用从
+        TREND_REENTRY_KLINE_INTERVAL_MIN改成45分钟那天起就一直在默默
+        拉空列表，"趋势确认多次重入"+"TV心跳追回快速通道"这两个机制
+        在CoinW上从未真正跑起来过。币安公开K线接口原生支持任意周期
+        合成，这次改造自然带着把这个也修好。
+        """
+        interval_min = int(interval_min or 0)
+        limit = int(limit or 0)
+        try:
+            from binance_klines import get_bars
+            binance_symbol = f"{self.symbol}USDT"
+            bars = get_bars(binance_symbol, f"{interval_min}m", limit=limit)
+        except Exception as e:
+            logger.debug(f"[{self.symbol}] 风险K线：币安公开K线拉取异常 {e}")
+            bars = []
+        if bars:
+            return [[b["t"], b["o"], b["h"], b["l"], b["c"], b["v"]] for b in bars]
+
+        logger.warning(
+            f"[{self.symbol}] 风险K线：币安公开K线拉取失败/为空(周期{interval_min}m)，"
+            f"退回CoinW自己的K线兜底"
+        )
+        if interval_min in self._COINW_NATIVE_GRAN:
+            try:
+                return self.client.get_klines(self.symbol, interval_min, limit)
+            except Exception:
+                return []
+        if interval_min in (45, 75):
+            return self._synth_klines_via_coinw_15m(interval_min, limit)
+        logger.warning(f"[{self.symbol}] 风险K线：兜底也无法处理的周期{interval_min}m，返回空")
+        return []
+
+    def _fetch_dual_ma_exit_klines(self) -> list:
+        """双均线破位检查专用取K线——品种自己真实TV周期，经
+        _get_risk_klines()统一入口(币安公开K线优先，CoinW自己的K线
+        兜底)。"""
+        interval_min = DUAL_MA_EXIT_INTERVAL_MIN.get(self.symbol, DUAL_MA_EXIT_DEFAULT_INTERVAL_MIN)
+        return self._get_risk_klines(interval_min, DUAL_MA_EXIT_KLINE_LIMIT)
 
     def _maybe_fast_lock_on_impulse_candle(self, current_price: float):
         """突发放量反转K线快速锁保本——见上方IMPULSE_EXIT_*常量顶部注释。
@@ -2239,9 +2289,7 @@ class PositionSupervisorCoinW:
         self._trend_reentry_next_try_ts = now + TREND_REENTRY_COOLDOWN_SEC
 
         try:
-            bars = self.client.get_klines(
-                self.symbol, TREND_REENTRY_KLINE_INTERVAL_MIN, TREND_REENTRY_KLINE_LIMIT,
-            )
+            bars = self._get_risk_klines(TREND_REENTRY_KLINE_INTERVAL_MIN, TREND_REENTRY_KLINE_LIMIT)
         except Exception as e:
             logger.debug(f"自主重入拉K线失败: {e}")
             return {"ok": True, "status": "heartbeat", "state": "trend_reentry_kline_failed"}
@@ -2437,9 +2485,9 @@ class PositionSupervisorCoinW:
     # ==================== 启动恢复 ====================
 
     def _recompute_atr_150m(self) -> float:
-        """重启后 TV 锁定的 ATR 已丢，用币赢 60m 原生 K线重算 ATR(14) 兜底（≈59m TV 周期）。"""
+        """重启后 TV 锁定的 ATR 已丢，用 60m K线重算 ATR(14) 兜底（≈59m TV 周期）。"""
         try:
-            bars = self.client.get_klines(self.symbol, 60, 400)
+            bars = self._get_risk_klines(60, 400)
             if len(bars) < 16:
                 return 0.0
             trs = []

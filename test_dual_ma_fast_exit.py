@@ -20,7 +20,7 @@ import os
 import sys
 import time
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -159,16 +159,24 @@ class TestDualMaFastExit(unittest.TestCase):
         s = _mk_supervisor()
         s._dual_ma_exit_last_check_ts = time.time()
         s.client.get_klines = MagicMock()
-        s._maybe_fast_exit_on_dual_ma_break(90.0)
+        with patch("binance_klines.get_bars") as mock_bn:
+            s._maybe_fast_exit_on_dual_ma_break(90.0)
+            mock_bn.assert_not_called()
         s.client.get_klines.assert_not_called()
 
     def test_synthesizes_45m_from_15m_for_openai(self):
         """2026-09-13起：OPENAI从120分钟改成45分钟，不再原生直取，改用
-        15分钟合成(跟BNB/XPD/XAU/XPT/XRP/SOL同一套)。"""
+        15分钟合成(跟BNB/XPD/XAU/XPT/XRP/SOL同一套)。
+        2026-09-19：_fetch_dual_ma_exit_klines()现在经_get_risk_klines()
+        统一入口，币安公开K线优先——这里mock binance_klines.get_bars
+        返回空列表，强制走到CoinW自己15分钟合成这条兜底路径，验证的还是
+        这条兜底逻辑本身(不是新的主路径，主路径见
+        test_get_risk_klines_20260919.py)。"""
         s = _mk_supervisor(symbol="OPENAI")
         bars = _make_bars(decline_n=50, rally_n=0, period_min=15)
         s.client.get_klines = MagicMock(return_value=bars)
-        s._maybe_fast_exit_on_dual_ma_break(bars[-1][4])
+        with patch("binance_klines.get_bars", return_value=[]):
+            s._maybe_fast_exit_on_dual_ma_break(bars[-1][4])
         args, kwargs = s.client.get_klines.call_args
         self.assertEqual(args[1], 15)  # 用15分钟原生base
 
@@ -176,7 +184,8 @@ class TestDualMaFastExit(unittest.TestCase):
         s = _mk_supervisor(symbol="BNB")
         bars = _make_bars(decline_n=50, rally_n=0, period_min=15)
         s.client.get_klines = MagicMock(return_value=bars)
-        s._maybe_fast_exit_on_dual_ma_break(bars[-1][4])
+        with patch("binance_klines.get_bars", return_value=[]):
+            s._maybe_fast_exit_on_dual_ma_break(bars[-1][4])
         args, kwargs = s.client.get_klines.call_args
         self.assertEqual(args[1], 15)  # 用15分钟原生base
 
@@ -184,14 +193,16 @@ class TestDualMaFastExit(unittest.TestCase):
         s = _mk_supervisor(symbol="SNDK")
         bars = _make_bars(decline_n=80, rally_n=0, period_min=15)
         s.client.get_klines = MagicMock(return_value=bars)
-        s._maybe_fast_exit_on_dual_ma_break(bars[-1][4])
+        with patch("binance_klines.get_bars", return_value=[]):
+            s._maybe_fast_exit_on_dual_ma_break(bars[-1][4])
         args, kwargs = s.client.get_klines.call_args
         self.assertEqual(args[1], 15)
 
     def test_klines_fetch_failure_is_safe_noop(self):
         s = _mk_supervisor()
         s.client.get_klines = MagicMock(side_effect=RuntimeError("boom"))
-        s._maybe_fast_exit_on_dual_ma_break(90.0)
+        with patch("binance_klines.get_bars", return_value=[]):
+            s._maybe_fast_exit_on_dual_ma_break(90.0)
         s._clear_position.assert_not_called()
 
     def _sym_or(self, default):
