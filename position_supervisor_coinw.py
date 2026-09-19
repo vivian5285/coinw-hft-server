@@ -2771,6 +2771,49 @@ def block_catchup(symbol: str = "ETH", seconds: float = None):
     return sup._catchup_blocked_until
 
 
+def _symbols_with_orphaned_live_positions() -> list:
+    """2026-09-19新增(本周问题总结item5"手动补单自动配置硬止损+雷达")：
+    找出不在ACTIVE_SYMBOLS白名单、但交易所上真实有非零仓位的品种——
+    跟币安B系统同一天的_symbols_with_orphaned_live_positions()同一个
+    思路移植过来(见radar_reentry_mixin.py同名函数注释)：白名单只该决定
+    "接不接受TV新开仓/平仓信号"，不该决定"要不要继续照看交易所上真实
+    存在的仓位"。宝贝手动开/补一笔暂停品种的仓位时，这里能让引擎自己
+    发现并接管(补齐综合硬止损+雷达跟踪)，不用等宝贝手动干预。
+
+    用一次账户级批量REST(coinw_client.get_all_positions，跟watchdog/
+    housekeep同一套节流缓存机制)找全部持仓，不逐品种查。"""
+    from coinw_client import coinw_client
+    from symbol_config import SymbolConfig
+    try:
+        rows = coinw_client.get_all_positions(force=True)
+    except Exception as e:
+        logger.error(f"🚨 [孤儿仓位扫描] 账户级持仓核对失败，跳过: {e}")
+        return []
+    if not rows:
+        return []
+    whitelisted = set(ACTIVE_SYMBOLS)
+    known = set(SymbolConfig.SYMBOL_MAP.keys())
+    orphaned = []
+    for sym, row in rows.items():
+        sym = str(sym or "").upper()
+        if not sym or sym in whitelisted or sym not in known:
+            continue
+        try:
+            amt = abs(float(row.get("quantity", 0) or row.get("positionAmt", 0) or 0))
+        except (TypeError, ValueError):
+            continue
+        if amt <= 0:
+            continue
+        orphaned.append(sym)
+    if orphaned:
+        logger.warning(
+            f"🆘 [孤儿仓位扫描] 发现{len(orphaned)}个不在ACTIVE_SYMBOLS、但交易所"
+            f"仍有真实仓位的品种，补建/唤醒supervisor恢复哨兵/雷达/硬止损维护"
+            f"(TV信号仍拒收，不受影响): {orphaned}"
+        )
+    return orphaned
+
+
 def recover_all_on_start():
     """引擎启动时对所有活跃品种做一次在场持仓恢复。"""
     # 2026-09-12修复：此前硬编码只恢复"ETH"一个品种——BNB当时已经在
@@ -2779,7 +2822,12 @@ def recover_all_on_start():
     # 风险缺口。现在跟其它5处品种清单一样改用symbol_config.ACTIVE_SYMBOLS
     # 统一权威来源。
     from app import get_supervisor
-    for sym in ACTIVE_SYMBOLS:
+    # 2026-09-19新增：白名单外但交易所真有仓位的品种一并补上，见
+    # _symbols_with_orphaned_live_positions()顶部注释。
+    symbols = list(ACTIVE_SYMBOLS) + [
+        s for s in _symbols_with_orphaned_live_positions() if s not in ACTIVE_SYMBOLS
+    ]
+    for sym in symbols:
         try:
             get_supervisor(sym).recover_on_start()
         except Exception as e:

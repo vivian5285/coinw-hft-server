@@ -490,7 +490,9 @@ def _start_housekeeping():
             recover_all_on_start()
         except Exception as e:
             logger.error(f"启动恢复异常: {e}")
-        from position_supervisor_coinw import housekeep, HOUSEKEEP_SEC
+        from position_supervisor_coinw import (
+            housekeep, HOUSEKEEP_SEC, _symbols_with_orphaned_live_positions,
+        )
         while True:
             time.sleep(HOUSEKEEP_SEC)
             # 2026-09-12修复：此前只巡检硬编码的"ETH"一个品种，BNB/XAU/BTC
@@ -498,7 +500,22 @@ def _start_housekeeping():
             # watchdog停跳重启这三重保护——现在按ACTIVE_SYMBOLS逐个巡检，
             # 单品种异常不中断其它品种（housekeep内部try/except只吞自己的
             # 异常，这里再包一层双保险）。
-            for sym in ACTIVE_SYMBOLS:
+            # 2026-09-19新增(本周问题总结item5)：每轮同时扫一遍白名单外但
+            # 交易所真有仓位的品种(宝贝手动开/补的暂停品种仓位)，一并
+            # housekeep——housekeep本身对symbol无感知(不查ACTIVE_SYMBOLS)，
+            # 只要sup._monitoring是False就会recover_on_start()接管，天然
+            # 支持任意品种，不用改housekeep这个函数本身。这一步是周期性
+            # 的(不像币安B系统那套orphan-recovery只在启动时扫一次)，宝贝
+            # 手动开仓不需要重启引擎也能在下一轮巡检内被自动接管。
+            symbols = list(ACTIVE_SYMBOLS)
+            try:
+                symbols += [
+                    s for s in _symbols_with_orphaned_live_positions()
+                    if s not in ACTIVE_SYMBOLS
+                ]
+            except Exception as e:
+                logger.error(f"孤儿仓位扫描异常(不影响白名单品种巡检): {e}")
+            for sym in symbols:
                 try:
                     housekeep(sym)
                 except Exception as e:
