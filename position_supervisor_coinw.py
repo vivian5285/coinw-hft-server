@@ -917,6 +917,30 @@ class PositionSupervisorCoinW:
 
     _MIN_ORDER_ETH = 0.011  # < 1 张(0.01 ETH)的残量无法再挂单，视为已完成
 
+    def _entry_residual_floor(self, qty: float) -> float:
+        """2026-09-19修复(实盘复现XAUUSDT)：_MIN_ORDER_ETH是ETH时代遗留
+        的绝对量(0.011)，当品种自己的下单量(qty，比如XAU这次仅
+        0.009135，金价太高导致基础货币数量天然很小)本身就小于这个绝对
+        量时，_wait_fill()里"want_qty - _MIN_ORDER_ETH"会算出负数，
+        "have>=负数"对have=0也恒成立——刚挂单还没等任何成交，第一次
+        轮询就被判定"①成交(被动限价,0滑点)"，之后按"已经开仓成功"的
+        分支往下走，查真实持仓却"持仓未找到"，整个开仓流程当场报错
+        中止，真正挂在交易所上的限价单反而没人管，一分钟后才被
+        housekeep当孤儿单撤掉——这笔TV信号完全没开成仓，这正是"CoinW
+        经常漏开单"的一个实锤根因。
+        改成"绝对量跟相对量取更小者"：min(_MIN_ORDER_ETH, qty×10%)，
+        用调用方传入的原始qty(不是会不断缩水的remaining)算，ETH等大
+        额下单场景数值上更保守(不会变得更松)，XAU这类基础货币数量天生
+        很小的品种就不会再出现"残量阈值比整笔下单量还大"这种荒谬结果。
+        """
+        try:
+            q = float(qty or 0)
+        except (TypeError, ValueError):
+            q = 0.0
+        if q <= 0:
+            return self._MIN_ORDER_ETH
+        return min(self._MIN_ORDER_ETH, q * 0.1)
+
     def _pos_qty(self) -> float:
         """当前实盘持仓的标的货币数量（强制 REST，绕缓存）。"""
         pos = self.client.get_position(self.symbol, prefer_ws=False, force_rest=True)
@@ -944,10 +968,14 @@ class PositionSupervisorCoinW:
 
     def _wait_fill(self, action: str, tv_price: float, deadline: float, want_qty: float):
         """轮询到成交 / deadline / 逆向放弃。返回 (状态, 已成交量)。"""
+        floor = self._entry_residual_floor(want_qty)
         while time.time() < deadline:
             time.sleep(ENTRY_POLL_SEC)
             have = self._pos_qty()
-            if have >= want_qty - self._MIN_ORDER_ETH:
+            # have>0是硬性前提——2026-09-19修复：残量阈值floor不能让
+            # have=0(压根没成交)也被判定成"filled"，见_entry_residual_
+            # floor顶部注释。
+            if have > 0 and have >= want_qty - floor:
                 return "filled", have
             if self._adverse_gap_pct(action, tv_price) > ENTRY_ABORT_PCT:
                 return "abort", have
@@ -999,7 +1027,11 @@ class PositionSupervisorCoinW:
 
         # 阶段2：让利到滑点上限的可成交限价（强趋势档用短窗）
         mk_deadline = (t0 + ENTRY_STRONG_MARKETABLE_SEC) if strong else (t0 + ENTRY_MARKETABLE_SEC)
-        if remaining >= self._MIN_ORDER_ETH:
+        # 2026-09-19修复：用_entry_residual_floor(qty)(相对原始下单量的
+        # 阈值)替代绝对量_MIN_ORDER_ETH——XAU这类基础货币数量天生很小的
+        # 品种，原来的0.011绝对量比整笔下单量还大，见_entry_residual_
+        # floor顶部注释。
+        if remaining >= self._entry_residual_floor(qty):
             px2 = round(tvp * (1.0 + ENTRY_SLIP_CAP_PCT), 2) if side_u == "LONG" \
                 else round(tvp * (1.0 - ENTRY_SLIP_CAP_PCT), 2)
             logger.info(f"[开仓阶梯] ②可成交限价 {side_u} {remaining:.6f} @{px2} "
@@ -1019,7 +1051,7 @@ class PositionSupervisorCoinW:
             self._cancel_open_limits()
 
         # 阶段3：市价兜底（仅剩余量）
-        if remaining < self._MIN_ORDER_ETH:
+        if remaining < self._entry_residual_floor(qty):
             return {"ok": True, "via": "limit_all"}
         if self._adverse_gap_pct(action, tvp) > ENTRY_ABORT_PCT:
             return {"ok": False, "via": "market_fallback", "aborted": True,
