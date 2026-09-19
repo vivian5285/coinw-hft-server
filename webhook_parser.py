@@ -32,6 +32,20 @@ VALID_ACTIONS = {"LONG", "SHORT", "CLOSE", "CLOSE_QUICK_EXIT", "CLOSE_RSI_EXIT",
 # 曾经各自独立硬编码同款清单——已改用同一权威来源）。
 VALID_SYMBOLS = set(ACTIVE_SYMBOLS)
 
+# 2026-09-15新增：离场原因分类，跟币安webhook_parser.py同名常量的值保持
+# 一致(命名对齐，方便两边对照日志)。CoinW此前只有_intentional_close这
+# 一个二元标记，重入判断对"雷达保本出局"和"综合硬止损出局"一视同仁——
+# 综合硬止损出局本该永久禁止重入(跟币安can_smart_reenter同一条规则)，
+# CoinW目前没做这个区分，是个真实的正确性缺口，不只是标签缺失。先只加
+# 重入判断真正用得上的这5个，不照搬币安全部11个——币安的TP3/QUICK/RSI/
+# TV_PROTECT这几个是TV CLOSE信号自带的更细分类，CoinW的_intentional_
+# close目前不区分这些子类型，硬加会是没有数据支撑的空字段。
+EXIT_SOURCE_RADAR_BE = "radar_be"
+EXIT_SOURCE_VPS_HARD_SL = "vps_hard_sl"
+EXIT_SOURCE_SL_INITIAL = "sl_initial"
+EXIT_SOURCE_TV_CLOSE = "tv_close"
+EXIT_SOURCE_MANUAL = "manual"
+
 
 @dataclass
 class ParsedSignal:

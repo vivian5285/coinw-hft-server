@@ -80,8 +80,11 @@ REENTRY_HARD_SL_ATR = float(os.getenv("REENTRY_HARD_SL_ATR", "2.0"))
 # watcher，只在VPS自己刚被止损出局、价格没跑远时生效)是两套独立机制，
 # 互不冲突：这套只在"两边都空"且TV最后方向有据可查时触发。
 TREND_REENTRY_ENABLED = os.getenv("TREND_REENTRY_ENABLED", "1").lower() in ("1", "true", "yes")
-TREND_REENTRY_FAST_LEN = int(os.getenv("TREND_REENTRY_FAST_LEN", "15"))
-TREND_REENTRY_SLOW_LEN = int(os.getenv("TREND_REENTRY_SLOW_LEN", "30"))
+# 2026-09-15：15/30→8/20，跟DUAL_MA_EXIT(平仓判断"趋势还在不在")用
+# 同一套均线定义，不再是"开仓抄TV的15/30、平仓用引擎自己的8/20"两套
+# 并存。
+TREND_REENTRY_FAST_LEN = int(os.getenv("TREND_REENTRY_FAST_LEN", "8"))
+TREND_REENTRY_SLOW_LEN = int(os.getenv("TREND_REENTRY_SLOW_LEN", "20"))
 TREND_REENTRY_MA_TYPE = os.getenv("TREND_REENTRY_MA_TYPE", "SMA")
 # 2026-09-15：30→45分钟(宝贝原话明确指定45分钟双均线，同时把确认口径
 # 从单纯dual_ma_trend_ok换成trend_confirmed_with_volume——见
@@ -104,9 +107,39 @@ CLIMAX_VETO_ENABLED = os.getenv("CLIMAX_VETO", "1").lower() in ("1", "true", "ye
 CLIMAX_ATR_MULT = float(os.getenv("CLIMAX_ATR_MULT", "3.0"))
 OVEREXT_ATR_MULT = float(os.getenv("OVEREXT_ATR_MULT", "4.0"))
 REVLOCK_ENABLED = os.getenv("REVLOCK", "1").lower() in ("1", "true", "yes")
-REVLOCK_BODY_ATR = float(os.getenv("REVLOCK_BODY_ATR", "1.1"))
-REVLOCK_VOL_MULT = float(os.getenv("REVLOCK_VOL_MULT", "1.4"))
-REVLOCK_MIN_PROFIT_ATR = float(os.getenv("REVLOCK_MIN_PROFIT_ATR", "0.8"))  # 至少这么多浮盈才收保本
+# 2026-09-15对齐币安：判据形状从"实体/ATR"改成"实体/振幅"(body_ratio)，
+# 常量改用币安当天事故复盘校准过的值——见market_overlays.py::
+# reversal_candle同日期注释。
+REVLOCK_BODY_RATIO = float(os.getenv("REVLOCK_BODY_RATIO", "0.55"))
+REVLOCK_VOL_MULT = float(os.getenv("REVLOCK_VOL_MULT", "1.15"))
+REVLOCK_MIN_PROFIT_ATR = float(os.getenv("REVLOCK_MIN_PROFIT_ATR", "1.0"))  # 至少这么多浮盈才收保本
+
+# ==================== 深盈利保护三层(2026-09-15移植自币安radar_reentry_
+# mixin.py，适配CoinW数据模型) ====================
+# 宝贝反馈CoinW深盈利仓位保护比币安薄——IMPULSE_EXIT/DUAL_MA_EXIT/REVLOCK
+# 三层是"趋势判断"驱动的防线，下面这三层是纯粹"已经赚了多少/回吐了多少/
+# TV还认不认这笔仓位"驱动的棘轮，互相独立，谁锁得更紧生效谁的，调用顺序
+#不影响最终结果。跟币安一样只朝有利方向棘轮，绝不主动平仓(只收紧止损)。
+#
+# 1) 大赢家利润地板：不依赖任何K线/指标，纯粹按"峰值浮盈是initial_atr的
+#    多少倍"判断，零REST成本，可以每tick都算。
+BIG_WIN_ATR_THRESHOLD = float(os.getenv("BIG_WIN_ATR_THRESHOLD", "3.0"))
+BIG_WIN_RETAIN_FRAC = float(os.getenv("BIG_WIN_RETAIN_FRAC", "0.65"))
+#
+# 2) 利润回吐刹车：按品种从breath_profiles.py::giveback_brake读参数，
+#    没配置的品种直接不生效(默认关闭)。跟币安B系统当前状态如实对齐——
+#    BNB/XPD/SNDK/OPENAI/XAU这5个焦点品种在币安B系统自己的专属档案里
+#    目前也没有giveback_brake(该字段只在币安A系统旧档案里按品种回测
+#    启用/不启用，比如XAU就因回测证明"提前收紧反而砍断真实趋势"而故意
+#    不加)——这里移植的是机制本身，不是凭空发明币安都没有的新校准数值。
+#
+# 3) TV僵局收紧：TV心跳已转FLAT(判定TV已经平掉这笔仓位)但我们还在持有、
+#    且价格滞涨够久，收紧止损。简化版——跳过币安才有的"深度盈利耐心模式
+#    让位"分支(CoinW没有这个概念)，统一收紧到现价±TV_EXIT_STALL_TIGHT_ATR。
+TV_EXIT_STALL_ENABLED = os.getenv("TV_EXIT_STALL", "1").lower() in ("1", "true", "yes")
+TV_EXIT_STALL_MIN_PEAK_ATR = float(os.getenv("TV_EXIT_STALL_MIN_PEAK_ATR", "0.5"))
+TV_EXIT_STALL_BARS = int(os.getenv("TV_EXIT_STALL_BARS", "3"))
+TV_EXIT_STALL_TIGHT_ATR = float(os.getenv("TV_EXIT_STALL_TIGHT_ATR", "0.3"))
 
 # 2026-09-13新增(宝贝拍板，跟币安B系统同步实施)："双均线破位快速平仓"。
 # 背景：币安B系统OPENAI靠ATR跟踪止损雷达在反弹时被打出，同一时刻CoinW的
@@ -268,6 +301,15 @@ class PositionSupervisorCoinW:
         self._trend_reentry_next_try_ts = 0.0  # 冷却：同方向下次允许再评估的时间
         # 2026-09-15新增：趋势确认重入每日次数上限，{"date": "YYYY-MM-DD", "count": N}
         self._trend_reentry_daily = {"date": "", "count": 0}
+        # 2026-09-15新增：TV僵局收紧刹车用——_handle_heartbeat每次收到
+        # 心跳都会同步这个字段(不止_last_nonflat_hb_side)，记的是"TV
+        # 现在这一刻"的方向(含FLAT)，跟_last_nonflat_hb_side(只记非FLAT
+        # 方向、FLAT时不更新)语义不同，两个字段都要保留。
+        self._tv_heartbeat_side = ""
+        self._tv_exit_stall_since_ts = 0.0
+        self._tv_exit_stall_best_seen = 0.0
+        self._big_win_alerted_best = 0.0
+        self._giveback_brake_alerted_best = 0.0
 
         # 初始化模块
         self._init_modules()
@@ -591,6 +633,10 @@ class PositionSupervisorCoinW:
             return {"ok": True, "status": "heartbeat", "catchup": "disabled"}
 
         hb_side = (signal.side or "FLAT").upper()
+        # 2026-09-15新增：TV僵局收紧刹车用，记"TV现在这一刻"的方向(含
+        # FLAT)——跟下面_last_nonflat_hb_side(只记非FLAT、FLAT时不更新)
+        # 是两个不同语义的字段，都要维护。
+        self._tv_heartbeat_side = hb_side
         raw = signal.raw or {}
         try:
             hb_entry = float(raw.get("entry") or raw.get("entry_price") or signal.price or 0)
@@ -1205,7 +1251,7 @@ class PositionSupervisorCoinW:
 
                 if not pos or float(pos.get("positionAmt") or pos.get("quantity") or 0) == 0:
                     # 仓位归零
-                    self._on_position_zero()
+                    self._on_position_zero(curr_px=float(current_price or 0))
                     break
 
                 # 2) 检查TP成交——仅用于账本记录/日志核对，不再作为雷达激活
@@ -1288,6 +1334,22 @@ class PositionSupervisorCoinW:
                         self._apply_reversal_lock(current_price)
                     except Exception as _e:
                         logger.debug(f"反转锁利异常: {_e}")
+
+                # 5.6~5.8) 深盈利保护三层(2026-09-15移植自币安)：大赢家
+                # 利润地板/利润回吐刹车/TV僵局收紧。三个都只朝有利方向
+                # 棘轮止损，互相独立，谁锁得更紧生效谁的。
+                try:
+                    self._maybe_lock_profit_on_big_win(current_price)
+                except Exception as _e:
+                    logger.debug(f"大赢家利润地板异常: {_e}")
+                try:
+                    self._maybe_tighten_on_profit_giveback(current_price)
+                except Exception as _e:
+                    logger.debug(f"利润回吐刹车异常: {_e}")
+                try:
+                    self._maybe_tighten_on_tv_exit_stall(current_price)
+                except Exception as _e:
+                    logger.debug(f"TV僵局收紧异常: {_e}")
 
                 # 每 ~60s 打一条监控存活/状态日志（冒烟/复盘可见）
                 if self._naked_tick % 15 == 0:
@@ -1452,7 +1514,49 @@ class PositionSupervisorCoinW:
 
         logger.info(f"雷达止损更新: {new_sl}")
 
-    def _on_position_zero(self):
+    def _resolve_exit_source_coinw(self, curr_px: float) -> str:
+        """2026-09-15新增：离场原因分类，简化版对齐币安
+        position_supervisor_binance.py::_resolve_exit_source的优先级
+        思路(TV平仓 > 硬止损 > 雷达保本 > 其余)，适配CoinW自己的数据
+        模型。必须在self.radar.reset()/self.pipeline.reset_idle()**之前**
+        调用——这两步会清空雷达状态和pipeline.data，晚了就读不到了。
+
+        不细分sl_initial/sl_breakeven(CoinW没有breakeven_phase这个字段)，
+        统一归到radar_be——够用于下面的重入门槛判断即可。TP3/QUICK/RSI/
+        TV_PROTECT这几个币安独有的TV CLOSE细分类，CoinW的_intentional_
+        close不区分子类型，先不加没有数据支撑的空字段。
+        """
+        from webhook_parser import (
+            EXIT_SOURCE_TV_CLOSE, EXIT_SOURCE_VPS_HARD_SL,
+            EXIT_SOURCE_RADAR_BE, EXIT_SOURCE_MANUAL,
+        )
+        if self._intentional_close:
+            return EXIT_SOURCE_TV_CLOSE
+
+        px = float(curr_px or 0)
+        if px <= 0:
+            return EXIT_SOURCE_MANUAL
+
+        hard_sl_px = float(self.pipeline.data.get("hard_sl_px") or 0)
+        if hard_sl_px > 0:
+            tol = max(2.5, hard_sl_px * 0.002)
+            if abs(px - hard_sl_px) <= tol:
+                return EXIT_SOURCE_VPS_HARD_SL
+
+        try:
+            st = self.radar.get_state()
+        except Exception:
+            st = None
+        if st is not None and bool(getattr(st, "activated", False)):
+            radar_sl = float(getattr(st, "current_sl", 0) or 0)
+            if radar_sl > 0:
+                tol = max(2.5, radar_sl * 0.002)
+                if abs(px - radar_sl) <= tol:
+                    return EXIT_SOURCE_RADAR_BE
+
+        return EXIT_SOURCE_MANUAL
+
+    def _on_position_zero(self, curr_px: float = 0.0):
         """仓位归零"""
         logger.info(f"仓位归零: {self.symbol}")
 
@@ -1460,6 +1564,8 @@ class PositionSupervisorCoinW:
         stopped_out = not self._intentional_close
         exit_side = str(self.pipeline.data.get("side") or "").upper()
         exit_entry = float(self.pipeline.data.get("entry") or 0)
+        # 必须在radar.reset()/pipeline.reset_idle()清空状态之前算出分类
+        exit_source = self._resolve_exit_source_coinw(curr_px)
 
         # 停止监控
         self._monitoring = False
@@ -1478,13 +1584,21 @@ class PositionSupervisorCoinW:
 
         if stopped_out and exit_side in ("LONG", "SHORT") and exit_entry > 0:
             self._last_exit = {
-                "side": exit_side, "entry": exit_entry, "reason": "stop",
+                "side": exit_side, "entry": exit_entry, "reason": exit_source,
                 "tier": str(self.pipeline.data.get("tier") or ""), "ts": time.time(),
             }
             self._cooldown_until = time.time() + COOLDOWN_SEC
-            logger.warning(f"止损出局 {exit_side}@{exit_entry}；冷却 {COOLDOWN_SEC:.0f}s"
+            logger.warning(f"止损出局 {exit_side}@{exit_entry} source={exit_source}；"
+                           f"冷却 {COOLDOWN_SEC:.0f}s"
                            f"{'，启动再入看守' if REENTRY_ENABLED else ''}")
-            if REENTRY_ENABLED and self._reentry_count < REENTRY_MAX:
+            # 2026-09-15新增：综合硬止损出局永久禁止重入，跟币安
+            # can_smart_reenter的"exit_source in (vps_hard_sl,hard_sl) →
+            # 永久拒绝"规则对齐——此前CoinW对雷达保本出局/硬止损出局一视
+            # 同仁都允许重入，是个真实的正确性缺口。
+            from webhook_parser import EXIT_SOURCE_VPS_HARD_SL
+            if exit_source == EXIT_SOURCE_VPS_HARD_SL:
+                logger.info(f"[{self.symbol}] 综合硬止损出局，不启动重入看守")
+            elif REENTRY_ENABLED and self._reentry_count < REENTRY_MAX:
                 self._start_reentry_watcher()
         self._intentional_close = False
 
@@ -1604,7 +1718,7 @@ class PositionSupervisorCoinW:
             return
         self._revlock_bar_ts = last_closed_ts
         from market_overlays import reversal_candle
-        hit, det = reversal_candle(raw4h, side, cfg={"body_atr_mult": REVLOCK_BODY_ATR,
+        hit, det = reversal_candle(raw4h, side, cfg={"body_ratio": REVLOCK_BODY_RATIO,
                                                      "vol_mult": REVLOCK_VOL_MULT})
         if not hit:
             return
@@ -1623,6 +1737,171 @@ class PositionSupervisorCoinW:
             self.radar.seed_stop(new_sl)
             self._update_radar_sl(new_sl)
             self._safe_alert(f"反转锁利：4h逆向放量反转({det})，止损收到保本 {new_sl}")
+
+    # ==================== 深盈利保护三层(2026-09-15移植自币安) ====================
+
+    def _maybe_lock_profit_on_big_win(self, current_price: float):
+        """大赢家利润地板——见BIG_WIN_ATR_THRESHOLD/BIG_WIN_RETAIN_FRAC
+        顶部注释。不依赖任何K线/指标信号，纯粹按"峰值浮盈是initial_atr的
+        多少倍"判断，零额外REST成本，可以每tick都算。"""
+        if not BIG_WIN_ATR_THRESHOLD or not BIG_WIN_RETAIN_FRAC:
+            return
+        st = self.radar.get_state()
+        side = str(self.pipeline.data.get("side") or "").upper()
+        entry = float(self.pipeline.data.get("entry") or 0)
+        atr = float(st.initial_atr or getattr(self.radar, "_atr", 0) or 0)
+        if side not in ("LONG", "SHORT") or entry <= 0 or atr <= 0:
+            return
+        best = float(st.best_price or 0) or entry
+        peak_profit = abs(best - entry)
+        peak_profit_atr = peak_profit / atr
+        if peak_profit_atr < BIG_WIN_ATR_THRESHOLD:
+            return
+
+        retain_profit = peak_profit * BIG_WIN_RETAIN_FRAC
+        cur = float(st.current_sl or 0)
+        if side == "LONG":
+            floor_px = entry + retain_profit
+            improved = floor_px > cur
+        else:
+            floor_px = entry - retain_profit
+            improved = cur <= 0 or floor_px < cur
+        if not improved:
+            return
+        new_sl = round(floor_px, 2)
+
+        if abs(self._big_win_alerted_best - best) > 1e-9:
+            self._big_win_alerted_best = best
+            self._safe_alert(
+                f"大赢家利润地板触发：峰值浮盈{peak_profit_atr:.2f}×ATR"
+                f"(≥{BIG_WIN_ATR_THRESHOLD:.1f}倍门槛) → 止损顶至保住峰值"
+                f"{BIG_WIN_RETAIN_FRAC*100:.0f}% {cur}→{new_sl}"
+            )
+        self.radar.seed_stop(new_sl)
+        self._update_radar_sl(new_sl)
+
+    def _maybe_tighten_on_profit_giveback(self, current_price: float):
+        """利润回吐刹车——见常量顶部注释。按品种从breath_profiles.py::
+        giveback_brake读参数，没配置的品种(目前BNB/XPD/SNDK/OPENAI/XAU
+        都没有)直接原样跳过。"""
+        from breath_profiles import get_breath_profile
+        profile = get_breath_profile(self.symbol)
+        cfg = profile.get("giveback_brake") if isinstance(profile, dict) else None
+        if not isinstance(cfg, dict):
+            return
+        min_peak_atr = float(cfg.get("min_peak_atr") or 0)
+        trigger_frac = float(cfg.get("trigger_frac") or 0)
+        retain_frac = float(cfg.get("retain_frac") or 0)
+        if min_peak_atr <= 0 or trigger_frac <= 0 or retain_frac <= 0:
+            return
+
+        st = self.radar.get_state()
+        side = str(self.pipeline.data.get("side") or "").upper()
+        entry = float(self.pipeline.data.get("entry") or 0)
+        atr = float(st.initial_atr or getattr(self.radar, "_atr", 0) or 0)
+        if side not in ("LONG", "SHORT") or entry <= 0 or atr <= 0:
+            return
+        best = float(st.best_price or 0) or entry
+        px = float(current_price or 0) or best
+
+        peak_profit = (best - entry) if side == "LONG" else (entry - best)
+        if peak_profit <= 0 or peak_profit / atr < min_peak_atr:
+            return
+        current_profit = (px - entry) if side == "LONG" else (entry - px)
+        giveback = peak_profit - current_profit
+        if giveback <= 0 or giveback / peak_profit < trigger_frac:
+            return
+
+        retain_profit = peak_profit * retain_frac
+        cur = float(st.current_sl or 0)
+        if side == "LONG":
+            floor_px = entry + retain_profit
+            improved = floor_px > cur
+        else:
+            floor_px = entry - retain_profit
+            improved = cur <= 0 or floor_px < cur
+        if not improved:
+            return
+        new_sl = round(floor_px, 2)
+
+        if abs(self._giveback_brake_alerted_best - best) > 1e-9:
+            self._giveback_brake_alerted_best = best
+            giveback_frac_now = giveback / peak_profit
+            self._safe_alert(
+                f"利润回吐刹车触发：峰值浮盈{peak_profit/atr:.2f}×ATR已回吐"
+                f"{giveback_frac_now*100:.0f}%(≥{trigger_frac*100:.0f}%门槛) → "
+                f"止损顶至保住峰值{retain_frac*100:.0f}% {cur}→{new_sl}"
+            )
+        self.radar.seed_stop(new_sl)
+        self._update_radar_sl(new_sl)
+
+    def _maybe_tighten_on_tv_exit_stall(self, current_price: float):
+        """TV僵局收紧——见TV_EXIT_STALL_*常量顶部注释。简化版：跳过币安
+        才有的"深度盈利耐心模式让位"分支(CoinW没有这个概念)，达到滞涨
+        条件统一收紧到现价±TV_EXIT_STALL_TIGHT_ATR。"""
+        if not TV_EXIT_STALL_ENABLED:
+            return
+        if str(self._tv_heartbeat_side or "FLAT").upper() != "FLAT":
+            # TV心跳还在跟我们同方向(或压根还没收到过心跳)，没有"TV已
+            # 平仓"这个前提，滞涨计时器归零，不触发。
+            self._tv_exit_stall_since_ts = 0.0
+            return
+
+        side = str(self.pipeline.data.get("side") or "").upper()
+        entry = float(self.pipeline.data.get("entry") or 0)
+        if side not in ("LONG", "SHORT") or entry <= 0:
+            return
+        # 心跳曾经非FLAT时记的方向必须等于这段持仓自己的方向，才能把
+        # "心跳现在是FLAT"解读成"TV已经平掉了我们这一笔"——CoinW没有
+        # last_tv_signal这个字段，用_last_nonflat_hb_side代替同一个判断。
+        if str(self._last_nonflat_hb_side or "").upper() != side:
+            return
+
+        st = self.radar.get_state()
+        atr = float(st.initial_atr or getattr(self.radar, "_atr", 0) or 0)
+        if atr <= 0:
+            return
+        best = float(st.best_price or 0) or entry
+        peak_profit = (best - entry) if side == "LONG" else (entry - best)
+        if peak_profit <= 0 or peak_profit / atr < TV_EXIT_STALL_MIN_PEAK_ATR:
+            return
+
+        now = time.time()
+        if abs(self._tv_exit_stall_best_seen - best) > 1e-9:
+            # best比上次检查又创了新高/新低，还没真滞涨，计时器归零重开
+            self._tv_exit_stall_best_seen = best
+            self._tv_exit_stall_since_ts = now
+            return
+        since = float(self._tv_exit_stall_since_ts or 0)
+        if since <= 0:
+            self._tv_exit_stall_since_ts = now
+            return
+
+        tv_tf_min = DUAL_MA_EXIT_INTERVAL_MIN.get(self.symbol, DUAL_MA_EXIT_DEFAULT_INTERVAL_MIN)
+        stall_window_sec = tv_tf_min * 60 * TV_EXIT_STALL_BARS
+        if now - since < stall_window_sec:
+            return
+
+        px = float(current_price or 0) or best
+        tight_dist = atr * TV_EXIT_STALL_TIGHT_ATR
+        cur = float(st.current_sl or 0)
+        if side == "LONG":
+            floor_px = px - tight_dist
+            improved = floor_px > cur
+        else:
+            floor_px = px + tight_dist
+            improved = cur <= 0 or floor_px < cur
+        if not improved:
+            return
+        new_sl = round(floor_px, 2)
+
+        self._safe_alert(
+            f"TV僵局收紧触发：TV心跳已转FLAT，峰值浮盈{peak_profit/atr:.2f}×ATR后"
+            f"滞涨超过{TV_EXIT_STALL_BARS}个TV周期 → 止损收紧至现价±"
+            f"{TV_EXIT_STALL_TIGHT_ATR}×ATR {cur}→{new_sl}"
+        )
+        self.radar.seed_stop(new_sl)
+        self._update_radar_sl(new_sl)
 
     def _fetch_dual_ma_exit_klines(self) -> list:
         """双均线破位检查专用取K线——品种自己真实TV周期，CoinW原生只支持

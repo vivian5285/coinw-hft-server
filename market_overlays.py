@@ -82,29 +82,35 @@ def reversal_candle(bars_4h: List[list], side: str,
                     cfg: Optional[Dict] = None) -> Tuple[bool, str]:
     """
     最后一根【已收盘】4h 是否为逆向放量反转K线：
-      多单 -> 大阴线（实体 > body_atr×ATR4h）且成交量 > vol_mult×近20根均量
+      多单 -> 大阴线（实体/振幅比 body_ratio ≥ 门槛）且成交量 > vol_mult×近20根均量
       空单 -> 对称大阳线
     返回 (hit, detail)。调用方自己保证只在新 4h 收盘后调用一次。
+
+    2026-09-15对齐币安：决定性K线判据从"实体/ATR"改成"实体/振幅"
+    (body_ratio=abs(c-o)/max(h-l,1e-9))——这正是本仓库自己的IMPULSE_EXIT
+    (_maybe_fast_lock_on_impulse_candle)已经在用的同一种判据形状，只是
+    这里应用在4H周期而不是TV周期K线上。此前CoinW单独用"实体/ATR"、
+    币安用"实体/振幅"，两套独立公式、非巧合数值偏差；两边这次统一到
+    同一种形状+币安当天事故复盘校准过的常量(0.55/1.15)。
     """
-    c = {"body_atr_mult": 1.1, "vol_mult": 1.4, "atr_n": 14, "vol_n": 20}
+    c = {"body_ratio": 0.55, "vol_mult": 1.15, "atr_n": 14, "vol_n": 20}
     if cfg:
         c.update(cfg)
     if len(bars_4h) < max(c["atr_n"], c["vol_n"]) + 3:
         return False, "insufficient"
     b = bars_4h[-2] if len(bars_4h) >= 2 else bars_4h[-1]  # 最后一根已收盘
-    atr = _atr(bars_4h[:-1], c["atr_n"])
-    if atr <= 0:
-        return False, "atr0"
     body = abs(b[4] - b[1])
+    rng = max(b[2] - b[3], 1e-9)
     vols = [x[5] for x in bars_4h[-1 - c["vol_n"]:-1]]
     avg_v = sum(vols) / len(vols) if vols else 0.0
     bearish = b[4] < b[1]
     side = str(side or "").upper()
 
-    big = body > c["body_atr_mult"] * atr
+    body_ratio = body / rng
+    big = body_ratio >= c["body_ratio"]
     heavy = avg_v > 0 and b[5] > c["vol_mult"] * avg_v
     if side == "LONG" and bearish and big and heavy:
-        return True, f"bear_body={body/atr:.1f}xATR vol={b[5]/avg_v:.1f}x"
+        return True, f"bear_body_ratio={body_ratio:.2f} vol={b[5]/avg_v:.1f}x"
     if side == "SHORT" and (not bearish) and big and heavy:
-        return True, f"bull_body={body/atr:.1f}xATR vol={b[5]/avg_v:.1f}x"
+        return True, f"bull_body_ratio={body_ratio:.2f} vol={b[5]/avg_v:.1f}x"
     return False, "no"
