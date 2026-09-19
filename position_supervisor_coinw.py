@@ -2834,13 +2834,17 @@ def block_catchup(symbol: str = "ETH", seconds: float = None):
 
 
 def _symbols_with_orphaned_live_positions() -> list:
-    """2026-09-19新增(本周问题总结item5"手动补单自动配置硬止损+雷达")：
-    找出不在ACTIVE_SYMBOLS白名单、但交易所上真实有非零仓位的品种——
-    跟币安B系统同一天的_symbols_with_orphaned_live_positions()同一个
-    思路移植过来(见radar_reentry_mixin.py同名函数注释)：白名单只该决定
-    "接不接受TV新开仓/平仓信号"，不该决定"要不要继续照看交易所上真实
-    存在的仓位"。宝贝手动开/补一笔暂停品种的仓位时，这里能让引擎自己
-    发现并接管(补齐综合硬止损+雷达跟踪)，不用等宝贝手动干预。
+    """检测(不接管)不在ACTIVE_SYMBOLS白名单、但交易所上真实有非零仓位
+    的品种。
+
+    2026-09-19新增，同日內即被宝贝叫停自动接管(实盘复现：ZEC/ETH等宝贝
+    自己手工开的非白名单仓位，一补建supervisor就被硬止损/雷达碰到，
+    今天被强平了好几次)。宝贝原话："我自己手工开的其他品种不要管我的，
+    不要平仓我的……白名单内的走系统健康开仓和雷达、硬止损，白名单外的
+    我自己知道设置止盈止损"。这个函数现在只做**检测+返回列表**，不再
+    被拿去补建supervisor(那样会让硬止损/雷达/催单等所有机制碰到这笔
+    仓位)——调用方(recover_all_on_start/app.py housekeep巡检)只把结果
+    用来发一条告警，提醒宝贝自己去管，不会实际接管。
 
     用一次账户级批量REST(coinw_client.get_all_positions，跟watchdog/
     housekeep同一套节流缓存机制)找全部持仓，不逐品种查。"""
@@ -2869,10 +2873,20 @@ def _symbols_with_orphaned_live_positions() -> list:
         orphaned.append(sym)
     if orphaned:
         logger.warning(
-            f"🆘 [孤儿仓位扫描] 发现{len(orphaned)}个不在ACTIVE_SYMBOLS、但交易所"
-            f"仍有真实仓位的品种，补建/唤醒supervisor恢复哨兵/雷达/硬止损维护"
-            f"(TV信号仍拒收，不受影响): {orphaned}"
+            f"⚠️ [孤儿仓位扫描] 发现{len(orphaned)}个不在ACTIVE_SYMBOLS、但交易所"
+            f"仍有真实仓位的品种(不再自动接管，仅告警，由宝贝自己管理止盈"
+            f"止损): {orphaned}"
         )
+        try:
+            from dingtalk import send_alert
+            send_alert(
+                f"⚠️ 白名单外发现仓位(VPS不再接管): {orphaned}。这些仓位不在"
+                f"当前ACTIVE_SYMBOLS里，VPS不会再自动建supervisor接管硬止损/"
+                f"雷达/强平逻辑——如果是你自己手工开的，请自行管理止盈止损；"
+                f"如果是遗留的旧仓位，请人工核查。"
+            )
+        except Exception as e:
+            logger.debug(f"白名单外仓位告警发送跳过: {e}")
     return orphaned
 
 
@@ -2884,12 +2898,15 @@ def recover_all_on_start():
     # 风险缺口。现在跟其它5处品种清单一样改用symbol_config.ACTIVE_SYMBOLS
     # 统一权威来源。
     from app import get_supervisor
-    # 2026-09-19新增：白名单外但交易所真有仓位的品种一并补上，见
-    # _symbols_with_orphaned_live_positions()顶部注释。
-    symbols = list(ACTIVE_SYMBOLS) + [
-        s for s in _symbols_with_orphaned_live_positions() if s not in ACTIVE_SYMBOLS
-    ]
-    for sym in symbols:
+    # 2026-09-19：白名单外品种只检测+告警，不再补建supervisor接管——见
+    # _symbols_with_orphaned_live_positions()顶部注释(同一天被宝贝叫停)。
+    # 检测本身出意外(非函数内部已处理的REST失败，而是更底层的bug)也
+    # 不该拖垮白名单品种自己的启动恢复。
+    try:
+        _symbols_with_orphaned_live_positions()
+    except Exception as e:
+        logger.error(f"孤儿仓位检测异常(不影响白名单品种启动恢复): {e}")
+    for sym in ACTIVE_SYMBOLS:
         try:
             get_supervisor(sym).recover_on_start()
         except Exception as e:
