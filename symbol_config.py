@@ -45,8 +45,12 @@ from typing import Dict, List, Optional
 # webhook_parser.py::VALID_SYMBOLS新开仓入口，已有仓位(如SOL当时还有
 # 持仓)交给引擎自己的硬止损/雷达管到自然平仓，不强制清仓——跟币安
 # 0deff95既定语义一致。
+# 2026-09-20：宝贝要求把MU重新加回来(usdt永续合约)，币安B系统+CoinW都
+# 新增，周期91分钟。核实过CoinW公开行情接口(/v1/perpumPublic/ticker?
+# instrument=MU)，contract_id=219，真实挂着USDT永续合约
+# (name=MUUSDT, fair_price≈1005.72, max_leverage=200)。
 ACTIVE_SYMBOLS: List[str] = [
-    "XAU", "BNB", "OPENAI", "SNDK", "XPD",
+    "XAU", "BNB", "OPENAI", "SNDK", "XPD", "MU",
     # "ETH", "BTC", "XPT", "XRP", "SOL",  # 2026-09-15暂停，恢复直接取消注释
 ]
 
@@ -66,6 +70,7 @@ class SymbolConfig:
         "XPT": "XPT",
         "XRP": "XRP",
         "SOL": "SOL",
+        "MU": "MU",
     }
 
     # 品种精度（见上方class docstring：当前未被实际下单路径读取）
@@ -80,6 +85,7 @@ class SymbolConfig:
         "XPT": 2,
         "XRP": 4,
         "SOL": 2,
+        "MU": 2,
     }
 
     QTY_PRECISION = {
@@ -93,6 +99,7 @@ class SymbolConfig:
         "XPT": 4,
         "XRP": 4,
         "SOL": 4,
+        "MU": 4,
     }
 
     # 默认杠杆
@@ -110,6 +117,7 @@ class SymbolConfig:
         "XPT": 1.0,
         "XRP": 1.0,
         "SOL": 1.0,
+        "MU": 1.0,
     }
 
     @classmethod

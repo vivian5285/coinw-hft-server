@@ -185,6 +185,7 @@ DUAL_MA_EXIT_NATIVE_BASE_MIN = 15  # CoinW原生支持15/120，45/75靠15合成(
 # 跟TV实际在用的周期对不上，直接拿今天的真实截图数字校正。
 DUAL_MA_EXIT_INTERVAL_MIN = {
     "BNB": 65, "XPD": 49, "SNDK": 91, "OPENAI": 65, "XAU": 50,
+    "MU": 91,  # 2026-09-20新增：重新上线，TV周期91分钟
     # 下面几个当前已暂停(不在ACTIVE_SYMBOLS白名单)，没有最新TV截图
     # 数据，暂时保留2026-09-13那版旧值——恢复交易前需要重新核对。
     "XPT": 45, "XRP": 45, "SOL": 45,

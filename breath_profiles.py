@@ -362,6 +362,38 @@ BREATH_SOL: Dict[str, Any] = {
     "exit_score": 2,
 }
 
+# MU —— 2026-09-20新增品种首次校准：宝贝要求把MU的usdt永续合约上线
+# CoinW（币安B系统同批上线），"时间周期雷达系数统一用币安的91分钟"。
+# 跟币安B系统同一批真实币安1m K线合成91分钟K线重测(81.2天1285根合成
+# K线、243个摆动点、188个回调样本)：中位数回调2.42×ATR、75分位3.87×ATR、
+# 90分位5.68×ATR，两边数值完全一致(同一批数据算的，同SNDK/XPD惯例——
+# CoinW自己盘口history比币安浅，直接池化用币安这份)。min/max比例沿用
+# 币安B系统MU自己的比例(4.3/6.0=0.717)。
+BREATH_MU: Dict[str, Any] = {
+    "name": "MU",
+    "initial_sl_atr": 0.0,
+    "fee_cover_pct": 0.0008,
+    "stop_exec_buffer": 0.3,
+    "early_be_atr": 0.0,
+    "step_trigger_atr": 0.91,   # 0.375×breath_tp12
+    "step_advance_atr": 0.59,   # 0.65×step_trigger
+    "phase_switch_atr": 3.0,
+    "tp1_atr": 1.35,
+    "tp1_floor_atr": 0.0,
+    "tp2_atr": 2.5,
+    "tp2_floor_atr": 0.0,
+    "breath_tp12": 2.42,  # 实测中位数回调(2.42)
+    "breath_tp23": 3.87,  # 实测75分位回调(3.87)
+    "phase2_trail_mult": 1.0,
+    "min_mult": 4.3,      # 0.717×max_mult（沿用币安B系统MU的min/max比例）
+    "max_mult": 6.0,      # 覆盖实测90分位回调(5.68)以上
+    "ratio_floor": RATIO_FLOOR,
+    "ratio_ceiling": RATIO_CEILING,
+    "tick_size": 0.01,
+    "entry_score": 3,
+    "exit_score": 2,
+}
+
 _BY_SYMBOL: Dict[str, Dict[str, Any]] = {
     "ETH": BREATH_ETH,
     "BNB": BREATH_BNB,
@@ -372,6 +404,7 @@ _BY_SYMBOL: Dict[str, Dict[str, Any]] = {
     "XPT": BREATH_XPT,
     "XRP": BREATH_XRP,
     "SOL": BREATH_SOL,
+    "MU": BREATH_MU,  # 2026-09-20新增
 }
 
 
