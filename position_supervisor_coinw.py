@@ -1153,7 +1153,7 @@ class PositionSupervisorCoinW:
 
     def _place_defense_orders(self, signal, entry_result: dict) -> bool:
         """设置三层防线"""
-        from atr_scenario import calc_smart_hard_stop_price, STRUCT_LOOKBACK_BARS, ATR_PERIOD
+        from atr_scenario import calc_smart_hard_stop_price, STRUCT_LOOKBACK_BARS, ATR_PERIOD, _atr_last
 
         try:
             position_id = entry_result.get("position_id", "")
@@ -1166,13 +1166,25 @@ class PositionSupervisorCoinW:
             # ATR保护带，取更保守者。klines用VPS自己拉的30m原生K线（不依赖
             # TV那边用的图表周期，VPS自主判断，周期choice见atr_scenario.py
             # 模块docstring）。
+            # 2026-09-20新增breath_atr：MU/XPD/XAU实盘复现止损距entry仅
+            # 0.1~0.2%(tight模式无下限，30分钟ATR/结构位本身比品种真实
+            # 呼吸周期短很多)，额外拉一次品种自己原生TV周期的K线算ATR，
+            # 传给calc_smart_hard_stop_price做tight模式下限参考——拉取
+            # 失败时传None，函数内部退回用30分钟K线自己的ATR做下限。
             _need_bars = STRUCT_LOOKBACK_BARS + ATR_PERIOD + 10
             klines = self._get_risk_klines(30, _need_bars)
+            breath_atr = None
+            try:
+                breath_bars = self._fetch_dual_ma_exit_klines()
+                breath_atr = _atr_last(breath_bars or [], ATR_PERIOD) or None
+            except Exception as e:
+                logger.debug(f"[{self.symbol}] 综合硬止损：呼吸周期ATR拉取失败(退回30m自算下限): {e}")
             hard_sl_price, hard_sl_meta, ok, err = calc_smart_hard_stop_price(
                 side=direction,
                 entry_price=entry_price,
                 klines=klines,
                 tier=signal.tier,
+                breath_atr=breath_atr,
             )
 
             if not ok:
