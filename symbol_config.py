@@ -21,6 +21,7 @@ AccountThrottle 同一个模式，见2026-08-10对齐检查memory）。这里仍
 
 from __future__ import annotations
 
+import os
 from typing import Dict, List, Optional
 
 # 真正的"活跃品种"唯一权威清单——2026-09-12新增，取代此前散落在
@@ -49,10 +50,20 @@ from typing import Dict, List, Optional
 # 新增，周期91分钟。核实过CoinW公开行情接口(/v1/perpumPublic/ticker?
 # instrument=MU)，contract_id=219，真实挂着USDT永续合约
 # (name=MUUSDT, fair_price≈1005.72, max_leverage=200)。
-ACTIVE_SYMBOLS: List[str] = [
-    "XAU", "BNB", "OPENAI", "SNDK", "XPD", "MU",
-    # "ETH", "BTC", "XPT", "XRP", "SOL",  # 2026-09-15暂停，恢复直接取消注释
-]
+# 2026-09-21：改成env驱动(COINW_ACTIVE_SYMBOLS)，跟币安B系统
+# (BINANCE_SYMBOLS_B)同一套模式——宝贝要在dashboard/binance-dashboard
+# 控制面板里给CoinW也加一份可勾选的白名单开关，不用再改代码+redeploy才
+# 能调整。默认值维持这里代码写的这份(当前基准XAU/BNB/XPD——宝贝同一天
+# 把SNDK/OPENAI/MU暂停，手工自己开单，VPS不再接管，见recover_all_on_
+# start()里_symbols_with_orphaned_live_positions()的白名单外检测+告警
+# 机制，同一套2026-09-19起已经生效的既定语义)。
+_ACTIVE_SYMBOLS_DEFAULT = "XAU,BNB,XPD"
+_active_symbols_raw = os.getenv("COINW_ACTIVE_SYMBOLS", "").strip()
+ACTIVE_SYMBOLS: List[str] = (
+    [s.strip().upper() for s in _active_symbols_raw.split(",") if s.strip()]
+    if _active_symbols_raw
+    else _ACTIVE_SYMBOLS_DEFAULT.split(",")
+)
 
 
 class SymbolConfig:
