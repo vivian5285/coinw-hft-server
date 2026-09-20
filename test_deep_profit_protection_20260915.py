@@ -244,8 +244,36 @@ class TestBigWinProfitFloor(unittest.TestCase):
 
         s._maybe_lock_profit_on_big_win(107.0)
 
-        expected_floor = 100.0 + 7.0 * 0.65  # entry + retain_profit
+        # 2026-09-20新增CoinW盘口流动性缓冲(COINW_LIQUIDITY_BUFFER_ATR_MULT
+        # =0.2)：地板线额外让出0.2×ATR，见常量顶部注释。
+        expected_floor = 100.0 + 7.0 * 0.65 - 0.2 * 2.0  # entry + retain_profit - buffer
         self.assertAlmostEqual(s.radar.get_state().current_sl, round(expected_floor, 2), places=2)
+
+    def test_liquidity_buffer_widens_floor_vs_raw_formula(self):
+        """2026-09-20新增：CoinW盘口流动性缓冲专项回归——复现BNBUSDT
+        2026-09-19晚实盘事故(见COINW_LIQUIDITY_BUFFER_ATR_MULT顶部注释)：
+        币安/CoinW两边"大赢家利润地板"公式/系数逐字节一致，但CoinW盘口更
+        薄，反弹时现价比币安多跳了几分钱，正好踩过原本只差0.07的地板线
+        被打出。这里验证地板线现在确实比"裸公式"(不留缓冲)更松，SHORT
+        方向地板更高(更远离价格)。"""
+        s = _mk_supervisor(side="SHORT", entry=764.05)
+        s.radar.arm(tp1_price=756.89, tp2_price=749.72, direction="SHORT")
+        s.radar.set_atr(4.7766)
+        s.radar.activate(entry_price=764.05, tp2_price=749.72, direction="SHORT")
+        s.radar._state.best_price = 747.38
+        s.radar._state.initial_atr = 4.7766
+        s.radar._state.current_sl = 780.0
+
+        s._maybe_lock_profit_on_big_win(747.38)
+
+        peak_profit = 764.05 - 747.38
+        raw_floor = 764.05 - peak_profit * 0.65  # 不留缓冲的裸公式
+        buffered_floor = round(raw_floor + 0.2 * 4.7766, 2)  # SHORT：缓冲让地板更高=更松
+        self.assertAlmostEqual(s.radar.get_state().current_sl, buffered_floor, places=2)
+        self.assertGreater(
+            s.radar.get_state().current_sl, round(raw_floor, 2),
+            "留了缓冲的地板必须比裸公式的地板更松(SHORT=数值更高，离现价更远)",
+        )
 
     def test_below_threshold_no_change(self):
         s = _mk_supervisor(side="LONG", entry=100.0)

@@ -127,6 +127,17 @@ REVLOCK_MIN_PROFIT_ATR = float(os.getenv("REVLOCK_MIN_PROFIT_ATR", "1.0"))  # �
 #    多少倍"判断，零REST成本，可以每tick都算。
 BIG_WIN_ATR_THRESHOLD = float(os.getenv("BIG_WIN_ATR_THRESHOLD", "3.0"))
 BIG_WIN_RETAIN_FRAC = float(os.getenv("BIG_WIN_RETAIN_FRAC", "0.65"))
+# 2026-09-20新增：CoinW盘口深度流动性缓冲。宝贝实盘复现(BNBUSDT
+# 2026-09-19晚)：这条地板公式(系数/门槛/ATR来源)跟币安B系统逐字节一致
+# (两边都直接读TV信号自带的atr，不是各自本地算的)，但两边入场价从一
+# 开始就不是同一个数(764.11 vs 764.12)——TV是分别投递给两个webhook的
+# 两次独立信号，各自后续也各走各的交易所真实盘口。CoinW盘口比币安薄，
+# 这次反弹CoinW自己的现价比币安多跳了几分钱，正好踩过两边只差0.07的
+# 地板线：币安扛住了，CoinW先被打出。不是代码bug(公式/系数/ATR来源都
+# 核对过完全一致)，是两个交易所真实行情噪音的正常差异，在地板线上被
+# 放大成了"一个踩线一个没踩线"。这里专门给CoinW的地板线额外留一点缓冲
+# 去吸收这种盘口噪音，不动币安那边(两边是独立代码库，互不影响)。
+COINW_LIQUIDITY_BUFFER_ATR_MULT = float(os.getenv("COINW_LIQUIDITY_BUFFER_ATR_MULT", "0.2"))
 #
 # 2) 利润回吐刹车：按品种从breath_profiles.py::giveback_brake读参数，
 #    没配置的品种直接不生效(默认关闭)。跟币安B系统当前状态如实对齐——
@@ -1870,12 +1881,16 @@ class PositionSupervisorCoinW:
             return
 
         retain_profit = peak_profit * BIG_WIN_RETAIN_FRAC
+        # 见COINW_LIQUIDITY_BUFFER_ATR_MULT顶部注释(2026-09-20)：地板线
+        # 额外让出一点CoinW自己盘口噪音的缓冲，只朝"更松"方向调，不改变
+        # 门槛/棘轮判断本身。
+        liquidity_buffer = COINW_LIQUIDITY_BUFFER_ATR_MULT * atr
         cur = float(st.current_sl or 0)
         if side == "LONG":
-            floor_px = entry + retain_profit
+            floor_px = entry + retain_profit - liquidity_buffer
             improved = floor_px > cur
         else:
-            floor_px = entry - retain_profit
+            floor_px = entry - retain_profit + liquidity_buffer
             improved = cur <= 0 or floor_px < cur
         if not improved:
             return
