@@ -57,6 +57,11 @@ HEARTBEAT_FLAT_CLOSE = os.getenv("HEARTBEAT_FLAT_CLOSE", "0").lower() in ("1", "
 CATCHUP_BLOCK_SEC = float(os.getenv("CATCHUP_BLOCK_SEC", "1800"))  # 手动平/TV平后多久内不被心跳补开
 STARTUP_RECOVERY_ENABLED = os.getenv("STARTUP_RECOVERY", "1").lower() in ("1", "true", "yes")
 NAKED_GUARD_ENABLED = os.getenv("NAKED_GUARD", "1").lower() in ("1", "true", "yes")
+# 2026-09-21新增：recover_on_start()查"这个仓位有没有已有止损"偶尔跟
+# 交易所侧有竞态(实盘复现4次，XAU/XPD都出现过)，查不到不代表真裸仓，
+# 重试几次再下结论——见recover_on_start()内注释。
+STARTUP_SL_DETECT_RETRIES = int(os.getenv("STARTUP_SL_DETECT_RETRIES", "3"))
+STARTUP_SL_DETECT_RETRY_SEC = float(os.getenv("STARTUP_SL_DETECT_RETRY_SEC", "0.6"))
 
 # ==================== 止损后冷却 + 智能再入 ====================
 COOLDOWN_SEC = float(os.getenv("COOLDOWN_SEC", "1800"))          # 止损后同向 TV 信号冷却
@@ -2723,34 +2728,56 @@ class PositionSupervisorCoinW:
         atr = self._recompute_atr_150m()
         hard_sl = tp1_px = tp2_px = 0.0
         tp1_f = tp2_f = False
-        try:
-            for r in (self.client.get_tp_sl_info(pid) or []):
-                spx = float(r.get("stopProfitPrice") or 0)
-                slx = float(r.get("stopLossPrice") or 0)
-                trg = int(r.get("triggerStatus") or 0) == 1
-                if int(r.get("stopType") or 0) == 1 and spx > 0:
-                    if not tp1_px or abs(spx - entry) < abs(tp1_px - entry):
-                        tp2_px, tp2_f = tp1_px, tp1_f
-                        tp1_px, tp1_f = spx, trg
-                    else:
-                        tp2_px, tp2_f = spx, trg
-                elif slx > 0 and not trg:
-                    hard_sl = slx
-        except Exception as e:
-            logger.warning(f"启动恢复：查TPSL失败 {e}")
-
-        # 2026-09-14新增：addTpsl记录里没查到硬止损，不代表真的裸仓——
-        # 持仓自身还有一个独立的止损标量字段(stopLossPrice，跟addTpsl是
-        # 两套不同的止损系统，见coinw_client.py::get_tp_sl_info顶部注释)，
-        # 先认这个，避免把"用另一套机制挂过止损"的仓位误判成裸仓、重复
-        # 现算一遍。
-        if hard_sl <= 0:
+        # 2026-09-21新增：宝贝实盘复现(过去一周4次，XAU/XPD都出现过)——
+        # 下面这两条查询(addTpsl记录 + 持仓自身stopLossPrice标量)偶尔会
+        # 在重启瞬间跟交易所侧有竞态，明明止损真实挂在交易所上，这一次
+        # 查询却返回"没有"，导致误判裸仓、现算一个全新止损直接覆盖挂
+        # 上——如果雷达之前已经把止损移到盈利区间，这一覆盖会把已经安全
+        # 的仓位重新打回亏损区间的止损，比"真裸仓"更隐蔽也更危险。改成
+        # 查不到时不立刻下结论，间隔重试几次(STARTUP_SL_DETECT_RETRIES)，
+        # 真的连续几次都查不到才认定裸仓、走下面的现算兜底。
+        for _attempt in range(STARTUP_SL_DETECT_RETRIES):
+            hard_sl = tp1_px = tp2_px = 0.0
+            tp1_f = tp2_f = False
             try:
-                scalar_sl = float(pos.get("stopLossPrice") or 0)
-                if scalar_sl > 0:
-                    hard_sl = scalar_sl
-            except (TypeError, ValueError):
-                pass
+                for r in (self.client.get_tp_sl_info(pid) or []):
+                    spx = float(r.get("stopProfitPrice") or 0)
+                    slx = float(r.get("stopLossPrice") or 0)
+                    trg = int(r.get("triggerStatus") or 0) == 1
+                    if int(r.get("stopType") or 0) == 1 and spx > 0:
+                        if not tp1_px or abs(spx - entry) < abs(tp1_px - entry):
+                            tp2_px, tp2_f = tp1_px, tp1_f
+                            tp1_px, tp1_f = spx, trg
+                        else:
+                            tp2_px, tp2_f = spx, trg
+                    elif slx > 0 and not trg:
+                        hard_sl = slx
+            except Exception as e:
+                logger.warning(f"启动恢复：查TPSL失败 {e}")
+
+            # 2026-09-14新增：addTpsl记录里没查到硬止损，不代表真的裸仓——
+            # 持仓自身还有一个独立的止损标量字段(stopLossPrice，跟addTpsl是
+            # 两套不同的止损系统，见coinw_client.py::get_tp_sl_info顶部注释)，
+            # 先认这个，避免把"用另一套机制挂过止损"的仓位误判成裸仓、重复
+            # 现算一遍。每次重试都重新拉一遍持仓(不复用函数开头那次快照)，
+            # 跟重试get_tp_sl_info同一个道理——都是为了绕开同一次竞态。
+            if hard_sl <= 0:
+                try:
+                    _pos_retry = pos if _attempt == 0 else (
+                        self.client.get_position(self.symbol, prefer_ws=False, force_rest=True) or pos
+                    )
+                    scalar_sl = float(_pos_retry.get("stopLossPrice") or 0)
+                    if scalar_sl > 0:
+                        hard_sl = scalar_sl
+                except (TypeError, ValueError):
+                    pass
+
+            if hard_sl > 0:
+                if _attempt > 0:
+                    logger.info(f"启动恢复：第{_attempt + 1}次重试查到已有止损@{hard_sl}，不是真裸仓")
+                break
+            if _attempt < STARTUP_SL_DETECT_RETRIES - 1:
+                time.sleep(STARTUP_SL_DETECT_RETRY_SEC)
 
         # 2026-09-14新增：实盘复现(XAUUSDT/XPTUSDT，宝贝手工在CoinW APP
         # 补开仓位)——两套止损记录都查不到时，此前直接原样记0，形同裸仓
@@ -2759,7 +2786,8 @@ class PositionSupervisorCoinW:
         # 改成：查不到任何已有止损时，现拉真实K线、用综合硬止损公式现算
         # 一个，立刻挂到交易所，不再指望下游"重挂缓存值"这条路补上——
         # 抽成_compute_fresh_hard_stop()共用方法，_handle_heartbeat()的
-        # 裸单守护也复用同一份(见其顶部注释)，不再各自为政。
+        # 裸单守护也复用同一份(见其顶部注释)，不再各自为政。上面重试
+        # STARTUP_SL_DETECT_RETRIES次仍查不到才会走到这里，真裸仓才现算。
         if hard_sl <= 0 and entry > 0:
             hard_sl = self._compute_fresh_hard_stop(
                 side=side, entry=entry, amt=amt, pid=pid, source="启动恢复",
